@@ -394,8 +394,25 @@ namespace storage {
             return pos;
         }
 
-        // msync's only the delta since the last sync() - never the whole
-        // file.
+        // Asks msync to flush only the delta since the last sync(), never
+        // the whole file.
+        //
+        // Be careful what you conclude from that: the range argument bounds
+        // what we *ask* for, not what the filesystem actually writes back.
+        // Measured on btrfs (see bench/probe_inplace_update_cost.cpp), a
+        // MS_SYNC over just the tail still pushed 1171 MiB to the device for
+        // 12.8 MB of logical updates - almost exactly as much as explicitly
+        // syncing the entire file - because MS_SYNC goes through the
+        // filesystem's own file-sync path, which commits the inode's dirty
+        // pages regardless of the range passed here.
+        //
+        // That matters for update(): its in-place patch dirties whatever page
+        // the record lives on, anywhere in the mapping. Under random-access
+        // updates those pages are scattered, and every sync() pays to write
+        // all of them back (plus CoW metadata), even though none of them are
+        // in this range. Sequential access keeps them clustered and cheap.
+        // Narrowing the range is still worth doing, it just is not the
+        // guarantee it looks like.
         void sync() noexcept {
             if (write_offset <= last_synced) return;
             std::size_t aligned_start = last_synced & ~(page_size - 1);

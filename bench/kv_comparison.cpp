@@ -56,15 +56,39 @@
 // patches the record in place, wherever it happens to live - so msync has
 // to flush dirty pages scattered across the whole mapping.
 //
-// That explanation is measured, not assumed. Same update count, same sync
-// count, only the key order changed:
-//     sequential keys:  1.09 ms/sync    919K ops/sec
-//     random keys:     19.33 ms/sync     52K ops/sec   (18x worse)
+// That explanation is measured, not assumed - see
+// probe_inplace_update_cost.cpp. Same update count, same number of flush
+// points, only the key order changed, and the device write counters make
+// the mechanism unambiguous (btrfs, 200k updates, 200 flushes):
 //
-// So it is specifically the scatter, not fsync cost. This is the price of
-// the in-place write that makes get() a pointer return with no replay -
-// which is also why the read row is what it is. Worth knowing before
-// pointing this engine at a write-heavy random-access durable workload.
+//   A seq  + msync(tail, MS_SYNC)     1.11 ms/sync     62 MiB written
+//   B rand + msync(tail, MS_SYNC)    19.46 ms/sync   1171 MiB written
+//   C rand + no msync                 --             ~  1 MiB written
+//   D rand + msync(tail, MS_ASYNC)    --             ~  4 MiB written
+//   E rand + msync(WHOLE, MS_SYNC)   44.22 ms/sync   1348 MiB written
+//
+// Note B: we ask msync to flush only the log tail, yet 1171 MiB reaches the
+// device for 12.8 MB of logical updates - ~90x amplification, and nearly as
+// much as E, which explicitly syncs the entire file. So the range argument
+// does NOT bound what actually gets written back: MS_SYNC goes through
+// btrfs_sync_file, which commits the inode's dirty pages regardless of the
+// range we passed. C and D close the argument - the same scattered dirtying
+// with no synchronous flush costs ~nothing, so the pages themselves are
+// cheap and the cost is entirely in the synchronous commit.
+//
+// The arithmetic checks out: 1171 MiB / 200 flushes = 5.9 MiB per flush. A
+// batch of 1000 random keys dirties 1000 distinct 4K pages (4 MiB) plus
+// btrfs CoW metadata, since a copy-on-write filesystem cannot rewrite a page
+// in place - each dirtied page is relocated with fresh checksums. Sequential
+// keys touch ~16 pages per batch instead: 0.31 MiB per flush, as measured.
+//
+// Two things follow. First, this is the price of the in-place write that
+// makes get() a pointer return with no replay - the same decision that buys
+// the ~100M/s read row. Second, sync()'s own comment ("msync's only the
+// delta since the last sync() - never the whole file") describes an
+// intention the filesystem does not honour: narrowing the range does not
+// narrow the writeback. On a non-CoW filesystem the amplification would
+// likely be smaller, but that has not been measured here.
 
 #include "../storage/storage.hpp"
 

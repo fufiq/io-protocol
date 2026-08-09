@@ -37,7 +37,14 @@
 //   (add -DHAVE_ROCKSDB -lrocksdb for the three-way run)
 //
 // ---------------------------------------------------------------------------
-// MEASURED (500k records, 64B values, batch=1000, NVMe, 98% full, gcc -O3):
+// MEASURED (500k records, 64B values, batch=1000, NVMe, gcc -O3).
+//
+// Absolute numbers drift hard with the state of the filesystem - the runs
+// below are months apart on a disk that went from 98% to 81% full, and every
+// engine got 3-4x faster in between. Compare RATIOS WITHIN a run, never
+// numbers ACROSS runs.
+//
+// BEFORE the log/data split (disk 98% full):
 //
 //   no fsync          ours          lmdb        rocksdb
 //   insert            14.5M/s       0.90M/s     0.46M/s
@@ -47,19 +54,41 @@
 //   fsync per batch   ours          lmdb        rocksdb
 //   insert             354K/s       27.7K/s     64.5K/s
 //   random read        104M/s       2.20M/s     0.44M/s
-//   random update     23.4K/s       17.1K/s     71.2K/s     <-- we LOSE 3x
+//   random update     23.4K/s       17.1K/s     71.2K/s   <-- RocksDB 3.0x ahead
 //
-// The last row is the interesting one and the reason this file exists.
-// Durable random update is the one workload where this design is beaten,
-// and badly: RocksDB is an LSM, so a random update is still a sequential
-// append to a memtable and WAL. Ours writes the WAL record at the tail AND
-// patches the record in place, wherever it happens to live - so msync has
-// to flush dirty pages scattered across the whole mapping.
+// AFTER the split (disk 81% full):
 //
-// That explanation is measured, not assumed - see
-// probe_inplace_update_cost.cpp. Same update count, same number of flush
-// points, only the key order changed, and the device write counters make
-// the mechanism unambiguous (btrfs, 200k updates, 200 flushes):
+//   no fsync          ours          lmdb        rocksdb
+//   insert            8.53M/s       0.98M/s     0.46M/s
+//   random read        112M/s       2.24M/s     0.43M/s
+//   random update     31.9M/s       0.39M/s     0.42M/s
+//
+//   fsync per batch   ours          lmdb        rocksdb
+//   insert             861K/s      101.4K/s     310K/s
+//   random read        113M/s       2.21M/s     0.44M/s
+//   random update      980K/s      49.8K/s      291K/s   <-- ours 3.4x ahead
+//
+// The durable random update row is why this file exists. It used to be the
+// one workload this design lost, and lost badly: an LSM turns a random update
+// into a sequential append, while we appended the WAL record AND patched the
+// record in place, so the per-inode fs commit had to flush dirty pages
+// scattered across the whole mapping. Moving the materialized records into
+// their own file (see storage.hpp) removed the scattered pages from the log's
+// inode entirely. RocksDB went from 3.0x ahead to 3.4x behind, measured
+// against itself in the same runs.
+//
+// What the split COST, and it is visible above: non-durable insert dropped
+// from 14.5M/s to 8.53M/s. A create now writes its payload twice, once to the
+// log and once to the data region. That is the trade, and it only shows up
+// where nothing is being synced - as soon as durability is on, the flush
+// dominates and the second write disappears into the noise.
+//
+// Reads and non-durable updates are unchanged, as expected: neither touches
+// the log.
+//
+// ---------------------------------------------------------------------------
+// The original diagnosis, kept because it is what led to the fix
+// (bench/probe_inplace_update_cost.cpp, btrfs, 200k updates, 200 flushes):
 //
 //   A seq  + msync(tail, MS_SYNC)     1.11 ms/sync     62 MiB written
 //   B rand + msync(tail, MS_SYNC)    19.46 ms/sync   1171 MiB written
@@ -67,28 +96,24 @@
 //   D rand + msync(tail, MS_ASYNC)    --             ~  4 MiB written
 //   E rand + msync(WHOLE, MS_SYNC)   44.22 ms/sync   1348 MiB written
 //
-// Note B: we ask msync to flush only the log tail, yet 1171 MiB reaches the
+// Note B: we asked msync to flush only the log tail, yet 1171 MiB reached the
 // device for 12.8 MB of logical updates - ~90x amplification. C and D show
-// the dirty pages themselves are nearly free; the cost is entirely in the
+// the dirty pages themselves are nearly free; the cost was entirely in the
 // synchronous flush.
 //
 // It is NOT that msync discards the range. The range is honoured for
 // writeback - what is not scoped to it is the filesystem commit MS_SYNC
 // triggers (msync -> vfs_fsync_range -> btrfs_sync_file -> log/transaction
-// commit). Swapping the syscall while keeping the identical range proves it:
+// commit). Swapping the syscall while keeping the identical range proved it:
 //
 //   msync(tail, MS_SYNC)                 3.71 s   1143 MiB
 //   sync_file_range(tail, WRITE|WAIT)    0.04 s     23 MiB   (50x less I/O)
 //   sync_file_range + one fsync at end   0.05 s     39 MiB
 //
-// Copy-on-write is a contributor but not the main term: chattr +C
-// (nodatacow) only moves 1143 -> 745 MiB, while dropping the per-batch
-// commit moves it to 23 MiB.
-//
-// The catch is that sync_file_range alone is not durable - it commits no
-// metadata and issues no device cache flush - so it is not a drop-in
-// replacement for sync(). The usable shape is per-batch range writeback plus
-// one real fsync where durability is actually required.
+// Copy-on-write was a contributor but not the main term: chattr +C
+// (nodatacow) only moved 1143 -> 745 MiB, while dropping the per-batch commit
+// moved it to 23 MiB. Splitting the inodes is what actually fixed it, and it
+// keeps the strong guarantee that sync_file_range cannot give.
 
 #include "../storage/storage.hpp"
 

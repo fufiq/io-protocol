@@ -42,7 +42,7 @@
 //   spec::path       the log     append-only WAL, the source of truth,
 //                                the only thing sync() ever flushes
 //   spec::data_path  the data    materialized record payloads, what
-//                                index[id].data points at and what update()
+//                                index[id] points at and what update()
 //                                patches in place
 //
 // The data file is a CACHE, not a second source of truth: it is never
@@ -53,7 +53,7 @@
 // are reclaimed and faulted in again on demand.
 //
 // durability::shared and durability::replicated are unchanged: one
-// caller-provided region, index[id].data aliases the log payload directly,
+// caller-provided region, the index aliases the log payload directly,
 // no copy. Only local_sync splits.
 
 #include <cstdint>
@@ -205,11 +205,26 @@ namespace storage {
     // log), so one bound genuinely covers both - at the price of reserving
     // 2 * capacity of disk.
     template <durability level_v = durability::shared, fixed_string path_v = fixed_string(""), std::size_t capacity_v = 16ull * 1024 * 1024,
-              fixed_string data_path_v = fixed_string("")>
+              fixed_string data_path_v = fixed_string(""), fixed_string index_path_v = fixed_string("")>
     struct storage_spec {
         static constexpr durability level = level_v;
         static constexpr auto path = path_v;
         static constexpr std::size_t capacity = capacity_v;
+
+        // Empty (the default) leaves the index on the heap, exactly as
+        // before. Naming a path moves it into a file instead - see
+        // index_array below for why that is worth having.
+        static constexpr const char* index_path = index_path_v.value;
+        static constexpr bool index_on_disk = index_path_v.value[0] != '\0';
+
+        // One slot per id ever issued. A record occupies at least
+        // pad8(sizeof(record_header) + 1) == 32 bytes of log, so a
+        // capacity-byte log can never mint more than capacity/32 ids - that
+        // is a real bound, not a guess, and it costs capacity/4 bytes of
+        // index file. recreate() with a hand-picked id beyond it is refused
+        // rather than served, which is the point: an arbitrary id can no
+        // longer turn into an arbitrary allocation.
+        static constexpr std::size_t index_entries = capacity_v / 32;
 
         // Held as a member so the array outlives every use of data_path;
         // an explicit data_path_v wins over the derived name.
@@ -256,7 +271,90 @@ namespace storage {
     template <typename spec = storage_spec<>>
     class storage {
     public:
-        struct index_entry { std::byte* data = nullptr; };
+        // An OFFSET from data_base, not a pointer: a pointer cannot be
+        // stored in a file (the next mmap lands somewhere else), and the
+        // index is a candidate for exactly that - see index_array. 0 means
+        // "no record": a live payload always sits at least one
+        // record_header past the start of its region, so offset 0 is not a
+        // value any live slot can hold.
+        struct index_entry { std::size_t offset = 0; };
+
+        // One slot per id EVER created - dead slots are never reclaimed
+        // (see reserve). That makes the index the one structure whose size
+        // tracks lifetime churn rather than live data, and as a std::vector
+        // it is anonymous memory, which the kernel can only swap, never
+        // evict. spec::index_path backs it with a file instead, so its pages
+        // get written back, go clean, and become reclaimable like every
+        // other region here.
+        //
+        // It is NOT a checkpoint. recover() rebuilds the index from the log
+        // every time and never reads what a previous run left behind; the
+        // file is opened truncated for exactly that reason.
+        class index_array {
+        public:
+            index_array() = default;
+            ~index_array() { close_file(); }
+            index_array(const index_array&) = delete;
+            index_array& operator=(const index_array&) = delete;
+
+            void map_file(const char* path, std::size_t entries) {
+                close_file();
+                int opened = ::open(path, O_RDWR | O_CREAT, 0644);
+                if (opened < 0) return; // stays on the heap - degraded, not broken
+                const std::size_t bytes = entries * sizeof(index_entry);
+                // Truncate then reserve: truncating drops the previous run's
+                // contents, and blocks reserved by posix_fallocate read back
+                // as zeros, so every slot starts dead without touching (and
+                // therefore faulting in) a single page.
+                if (::ftruncate(opened, 0) != 0 || ::posix_fallocate(opened, 0, bytes) != 0) { ::close(opened); return; }
+                void* m = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, opened, 0);
+                if (m == MAP_FAILED) { ::close(opened); return; }
+                slots = (index_entry*)m;
+                fd = opened;
+                file_backed = true;
+                capacity = entries;
+                mapped_bytes = bytes;
+                count = 0;
+            }
+
+            std::size_t size() const noexcept { return count; }
+            index_entry& operator[](std::size_t i) noexcept { return slots[i]; }
+            const index_entry& operator[](std::size_t i) const noexcept { return slots[i]; }
+
+            // Makes slot i addressable, or nullptr if it cannot be. The heap
+            // form grows geometrically as it always did; the file form is
+            // capped by its mapping and says no instead of growing.
+            index_entry* reserve_slot(std::size_t i) {
+                if (file_backed) {
+                    if (i >= capacity) return nullptr;
+                } else if (i >= heap.size()) {
+                    heap.resize(std::max<std::size_t>(i + 1, heap.size() * 2 + 1));
+                    slots = heap.data();
+                    capacity = heap.size();
+                }
+                if (i + 1 > count) count = i + 1;
+                return slots + i;
+            }
+
+            void clear() noexcept {
+                if (file_backed) { if (count) std::memset(slots, 0, count * sizeof(index_entry)); }
+                else { heap.clear(); slots = nullptr; capacity = 0; }
+                count = 0;
+            }
+
+        private:
+            void close_file() noexcept {
+                if (!file_backed) return;
+                ::munmap(slots, mapped_bytes);
+                ::close(fd);
+                slots = nullptr; fd = -1; file_backed = false; capacity = 0; mapped_bytes = 0; count = 0;
+            }
+            index_entry* slots = nullptr;
+            std::size_t count = 0, capacity = 0, mapped_bytes = 0;
+            std::vector<index_entry> heap;
+            int fd = -1;
+            bool file_backed = false;
+        };
 
         // A type-erased view of a record - for generic iteration without
         // knowing T (rebuilding user-space secondary indexes after
@@ -290,6 +388,7 @@ namespace storage {
                 base = shared_base;
                 data_base = shared_base;
             }
+            if constexpr (spec::index_on_disk) index.map_file(spec::index_path, spec::index_entries);
         }
 
         ~storage() {
@@ -307,8 +406,10 @@ namespace storage {
         template <tagged_aggregate T>
         record_id create(const T& value) {
             record_id id = next_id++;
+            index_entry* slot = reserve(id);
+            if (!slot) return 0; // index full - 0 is never a valid record id
             std::byte* logged = write_record<record_op::create>(id, 0, T::tag, std::as_bytes(std::span{&value, 1}));
-            reserve(id).data = materialize(id, T::tag, logged, (uint32_t)sizeof(T));
+            slot->offset = offset_in_data(materialize(id, T::tag, logged, (uint32_t)sizeof(T)));
             live_byte_count += sizeof(T);
             return id;
         }
@@ -318,9 +419,11 @@ namespace storage {
         // bytes become garbage, reclaimed on the next compaction.
         template <tagged_aggregate T>
         record_id recreate(record_id id, const T& value) {
-            if (alive(id)) live_byte_count -= header_of(index[id].data)->len;
+            index_entry* slot = reserve(id);
+            if (!slot) return 0;
+            if (slot->offset) live_byte_count -= header_of(data_base + slot->offset)->len;
             std::byte* logged = write_record<record_op::create>(id, 0, T::tag, std::as_bytes(std::span{&value, 1}));
-            reserve(id).data = materialize(id, T::tag, logged, (uint32_t)sizeof(T));
+            slot->offset = offset_in_data(materialize(id, T::tag, logged, (uint32_t)sizeof(T)));
             live_byte_count += sizeof(T);
             return id;
         }
@@ -335,33 +438,34 @@ namespace storage {
             // `field` (trivially copyable, standard layout); a C-style cast
             // on the computed offset, the same idiom used throughout this
             // file (see header_of()), applied here to a typed field.
-            *(member_value_t<member>*)(index[id].data + off) = value;
+            *(member_value_t<member>*)(record_ptr(id) + off) = value;
         }
 
         void destroy(record_id id) {
             if (!alive(id)) return;
             write_record<record_op::destroy>(id, 0, tag_t{0}, {});
-            live_byte_count -= header_of(index[id].data)->len;
-            index[id].data = nullptr;
+            live_byte_count -= header_of(record_ptr(id))->len;
+            index[id].offset = 0;
         }
 
         template <tagged_aggregate T>
         [[nodiscard]] const T* get(record_id id) const noexcept {
-            return alive(id) ? (const T*)(index[id].data) : nullptr;
+            return alive(id) ? (const T*)(record_ptr(id)) : nullptr;
         }
 
         void for_each_raw(auto&& fn) const requires std::invocable<decltype(fn), raw_view> {
             for (record_id id = 1; id < index.size(); ++id) {
-                if (!index[id].data) continue;
-                const record_header* h = header_of(index[id].data);
-                fn(raw_view{ id, h->tag, std::span<const std::byte>{index[id].data, h->len} });
+                if (!index[id].offset) continue;
+                std::byte* rec = record_ptr(id);
+                const record_header* h = header_of(rec);
+                fn(raw_view{ id, h->tag, std::span<const std::byte>{rec, h->len} });
             }
         }
 
         template <tagged_aggregate T>
         void for_each(auto&& fn) const requires std::invocable<decltype(fn), record_id, const T&> {
             for (record_id id = 1; id < index.size(); ++id) {
-                if (index[id].data) fn(id, *(const T*)(index[id].data));
+                if (index[id].offset) fn(id, *(const T*)(record_ptr(id)));
             }
         }
 
@@ -370,18 +474,21 @@ namespace storage {
         // one method covers every type at once, generically.
         void apply(const record_header& hdr, const std::byte* data) {
             switch (hdr.op) {
-                case record_op::create:
-                    if (alive(hdr.id)) live_byte_count -= header_of(index[hdr.id].data)->len;
-                    reserve(hdr.id).data = materialize(hdr.id, hdr.tag, data, hdr.len);
+                case record_op::create: {
+                    index_entry* slot = reserve(hdr.id);
+                    if (!slot) break; // id beyond a file-backed index's capacity - record refused, not written past the end
+                    if (slot->offset) live_byte_count -= header_of(data_base + slot->offset)->len;
+                    slot->offset = offset_in_data(materialize(hdr.id, hdr.tag, data, hdr.len));
                     live_byte_count += hdr.len;
                     break;
+                }
                 case record_op::update:
-                    if (alive(hdr.id)) std::memcpy(index[hdr.id].data + hdr.offset, data, hdr.len);
+                    if (alive(hdr.id)) std::memcpy(record_ptr(hdr.id) + hdr.offset, data, hdr.len);
                     break;
                 case record_op::destroy:
                     if (alive(hdr.id)) {
-                        live_byte_count -= header_of(index[hdr.id].data)->len;
-                        index[hdr.id].data = nullptr;
+                        live_byte_count -= header_of(record_ptr(hdr.id))->len;
+                        index[hdr.id].offset = 0;
                     }
                     break;
             }
@@ -537,16 +644,17 @@ namespace storage {
         std::vector<std::byte> export_snapshot() const {
             std::size_t needed = 0;
             for (record_id id = 1; id < index.size(); ++id) {
-                if (!index[id].data) continue;
-                needed += pad8(sizeof(record_header) + header_of(index[id].data)->len);
+                if (!index[id].offset) continue;
+                needed += pad8(sizeof(record_header) + header_of(record_ptr(id))->len);
             }
             std::vector<std::byte> scratch(needed);
             std::size_t scratch_offset = 0;
             for (record_id id = 1; id < index.size(); ++id) {
-                if (!index[id].data) continue;
-                const record_header* old_hdr = header_of(index[id].data);
+                if (!index[id].offset) continue;
+                std::byte* rec = record_ptr(id);
+                const record_header* old_hdr = header_of(rec);
                 write_record_at<record_op::create>(scratch.data(), scratch_offset, id, 0, old_hdr->tag,
-                                                    std::span<const std::byte>{index[id].data, old_hdr->len});
+                                                    std::span<const std::byte>{rec, old_hdr->len});
             }
             return scratch;
         }
@@ -622,10 +730,11 @@ namespace storage {
         void snapshot_into(snapshot& out) const {
             out.arena.reserve(out.arena.size() + live_byte_count); // live_byte_count is exact - one pass, no reallocation
             for (record_id id = 1; id < index.size(); ++id) {
-                if (!index[id].data) continue;
-                const record_header* h = header_of(index[id].data);
+                if (!index[id].offset) continue;
+                std::byte* rec = record_ptr(id);
+                const record_header* h = header_of(rec);
                 std::size_t off = out.arena.size();
-                out.arena.insert(out.arena.end(), index[id].data, index[id].data + h->len);
+                out.arena.insert(out.arena.end(), rec, rec + h->len);
                 out.index[id] = arena_ref{ h->tag, off, h->len };
             }
         }
@@ -712,52 +821,85 @@ namespace storage {
         // Shared body of both compact() overloads. scratch_data_base is
         // nullptr exactly when the storage is unsplit.
         void compact_into(std::byte* scratch_base, std::byte* scratch_data_base) {
+            // Slots are rewritten as the loop goes, so the new offsets must be
+            // measured against the region they will end up in, not against
+            // data_base - which is still the OLD region every record is being
+            // read from, and only becomes the new one after the loop.
+            std::byte* const target_data = split_regions ? scratch_data_base : scratch_base;
             std::size_t scratch_offset = 0, scratch_data_offset = 0;
             live_byte_count = 0;
             for (record_id id = 1; id < index.size(); ++id) {
-                if (!index[id].data) continue; // dead record - not carried over
-                const record_header* old_hdr = header_of(index[id].data);
-                std::span<const std::byte> payload{index[id].data, old_hdr->len};
+                if (!index[id].offset) continue; // dead record - not carried over
+                std::byte* old_rec = record_ptr(id);
+                const record_header* old_hdr = header_of(old_rec);
+                std::span<const std::byte> payload{old_rec, old_hdr->len};
                 std::byte* logged = write_record_at<record_op::create>(scratch_base, scratch_offset, id, 0, old_hdr->tag, payload);
+                std::byte* placed = logged;
                 if constexpr (split_regions)
-                    index[id].data = write_record_at<record_op::create>(scratch_data_base, scratch_data_offset, id, 0, old_hdr->tag, payload);
-                else
-                    index[id].data = logged;
+                    placed = write_record_at<record_op::create>(scratch_data_base, scratch_data_offset, id, 0, old_hdr->tag, payload);
+                index[id].offset = (std::size_t)(placed - target_data);
                 live_byte_count += old_hdr->len;
             }
-            base = scratch_base;
+            adopt_region(base, fd, scratch_base);
             write_offset = scratch_offset;
             // last_synced MUST be reset: scratch has never been synced, and
             // the old value (from the previous, larger region) could exceed
             // the new write_offset - sync() would then conclude there's
             // nothing to flush and silently skip the whole compacted region.
             last_synced = 0;
-            if constexpr (split_regions) { data_base = scratch_data_base; data_offset = scratch_data_offset; }
+            if constexpr (split_regions) { adopt_region(data_base, data_fd, scratch_data_base); data_offset = scratch_data_offset; }
+            else data_base = scratch_base;
         }
 
         void finish_compaction_into(std::byte* scratch, std::byte* scratch_data, snapshot& snap) {
+            std::byte* const target_data = split_regions ? scratch_data : scratch;
             std::size_t scratch_offset = 0, scratch_data_offset = 0;
             live_byte_count = 0;
             for (record_id id = 1; id < index.size(); ++id) {
                 auto it = snap.index.find(id);
-                if (it == snap.index.end()) { index[id].data = nullptr; continue; } // died during catch-up
+                if (it == snap.index.end()) { index[id].offset = 0; continue; } // died during catch-up
                 const arena_ref& ref = it->second;
                 std::span<const std::byte> payload{snap.arena.data() + ref.offset, ref.len};
                 std::byte* logged = write_record_at<record_op::create>(scratch, scratch_offset, id, 0, ref.tag, payload);
+                std::byte* placed = logged;
                 if constexpr (split_regions)
-                    index[id].data = write_record_at<record_op::create>(scratch_data, scratch_data_offset, id, 0, ref.tag, payload);
-                else
-                    index[id].data = logged;
+                    placed = write_record_at<record_op::create>(scratch_data, scratch_data_offset, id, 0, ref.tag, payload);
+                index[id].offset = (std::size_t)(placed - target_data);
                 live_byte_count += ref.len;
             }
-            base = scratch;
+            adopt_region(base, fd, scratch);
             write_offset = scratch_offset;
             last_synced = 0;
-            if constexpr (split_regions) { data_base = scratch_data; data_offset = scratch_data_offset; }
+            if constexpr (split_regions) { adopt_region(data_base, data_fd, scratch_data); data_offset = scratch_data_offset; }
+            else data_base = scratch;
         }
 
         bool alive(record_id id) const noexcept {
-            return id < index.size() && index[id].data != nullptr;
+            return id < index.size() && index[id].offset != 0;
+        }
+
+        std::byte* record_ptr(record_id id) const noexcept { return data_base + index[id].offset; }
+        std::size_t offset_in_data(const std::byte* p) const noexcept { return (std::size_t)(p - data_base); }
+
+        // Compaction builds a fresh region and hands it over; this takes it
+        // and releases whatever the storage was using. Before it existed,
+        // base was simply reassigned, so every compaction leaked a mapping
+        // of spec::capacity and its file descriptor - unbounded, once per
+        // compaction, for the life of the process.
+        //
+        // Only a storage that OWNS its regions has anything to release. An
+        // unsplit (shared/replicated) storage never did: the caller passed
+        // the region in and keeps it, so this only rebinds the pointer.
+        //
+        // The incoming region is adopted, not borrowed - ~storage() will
+        // unmap it. The caller may close its file descriptor afterwards (the
+        // mapping keeps the inode alive), but must not unmap it itself.
+        void adopt_region(std::byte*& region, int& region_fd, std::byte* fresh) noexcept {
+            if constexpr (split_regions) {
+                if (region && region != fresh) ::munmap(region, spec::capacity);
+                if (region_fd >= 0) { ::close(region_fd); region_fd = -1; }
+            }
+            region = fresh;
         }
 
         // Grows with the total number of ids ever issued (next_id only
@@ -767,10 +909,14 @@ namespace storage {
         // single-writer id space this storage assumes, worth knowing
         // before assuming index memory tracks occupancy rather than
         // lifetime churn.
-        index_entry& reserve(record_id id) {
-            if (id >= index.size()) index.resize(std::max<std::size_t>(id + 1, index.size() * 2 + 1));
+        // nullptr when the slot cannot be had - only possible for a
+        // file-backed index, whose capacity is fixed at open (see
+        // index_array). Callers refuse the record rather than proceed.
+        index_entry* reserve(record_id id) {
+            index_entry* slot = index.reserve_slot(id);
+            if (!slot) return nullptr;
             next_id = std::max(next_id, id + 1);
-            return index[id];
+            return slot;
         }
 
         // Pointer-to-member-through-a-null-base offset trick: the same
@@ -845,7 +991,7 @@ namespace storage {
         record_id next_id = 1;
         int fd = -1;
         int data_fd = -1;
-        std::vector<index_entry> index;
+        index_array index;
     };
 
     // =====================================================================

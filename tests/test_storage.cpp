@@ -7,6 +7,7 @@
 #include <random>
 #include <string>
 #include <sys/stat.h>
+#include <sys/mman.h>
 
 // No `using namespace storage;` here: the namespace and the class template
 // share the name, so an unqualified `storage::storage<>` would be ambiguous.
@@ -474,6 +475,20 @@ struct split_fixture {
     storage::storage<split_spec>* table = nullptr;
 };
 
+// compact() ADOPTS the region it is given - the storage unmaps it in its
+// destructor - so a split storage must be handed a real mapping of
+// spec::capacity, never a vector's heap bytes.
+struct scratch_region {
+    explicit scratch_region(std::size_t bytes) : size(bytes) {
+        ptr = (std::byte*)::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        REQUIRE(ptr != MAP_FAILED);
+    }
+    std::byte* data() const noexcept { return ptr; }
+    std::size_t bytes() const noexcept { return size; }
+    std::byte* ptr = nullptr;
+    std::size_t size = 0;
+};
+
 std::size_t file_size_of(const char* path) {
     struct ::stat st{};
     return ::stat(path, &st) == 0 ? (std::size_t)st.st_size : 0;
@@ -572,7 +587,7 @@ TEST_CASE("compaction rebuilds both regions and reclaims both") {
     const std::size_t log_before = f.table->current_offset();
     const std::size_t data_before = f.table->data_region_offset();
 
-    std::vector<std::byte> scratch_log(1u << 20), scratch_data(1u << 20);
+    scratch_region scratch_log(split_spec::capacity), scratch_data(split_spec::capacity);
     f.table->compact(scratch_log.data(), scratch_data.data());
 
     CHECK(f.table->live_bytes() == live);
@@ -594,7 +609,7 @@ TEST_CASE("compaction rebuilds both regions and reclaims both") {
 TEST_CASE("updates after compaction land in the new data region, not the old one") {
     split_fixture f;
     record_id id = f.table->create(user{5, 5});
-    std::vector<std::byte> scratch_log(1u << 20), scratch_data(1u << 20);
+    scratch_region scratch_log(split_spec::capacity), scratch_data(split_spec::capacity);
     f.table->compact(scratch_log.data(), scratch_data.data());
 
     f.table->update<&user::balance>(id, 12345);
@@ -603,5 +618,83 @@ TEST_CASE("updates after compaction land in the new data region, not the old one
     // The value must live inside the scratch data region we just handed over.
     const std::byte* v = (const std::byte*)f.table->get<user>(id);
     CHECK(v >= scratch_data.data());
-    CHECK(v + sizeof(user) <= scratch_data.data() + scratch_data.size());
+    CHECK(v + sizeof(user) <= scratch_data.data() + scratch_data.bytes());
+}
+
+// =====================================================================
+// spec::index_path - the index in a file instead of on the heap. The index
+// is one word per id EVER created and never shrinks, so it is the one
+// structure whose footprint follows churn rather than live data; on the
+// heap that is anonymous memory, which can only be swapped.
+// =====================================================================
+namespace {
+using indexed_spec = storage::storage_spec<storage::durability::local_sync, "test_indexed.db",
+                                           4ull * 1024 * 1024, "", "test_indexed.idx">;
+struct indexed_fixture {
+    indexed_fixture() { cleanup(); table = new storage::storage<indexed_spec>(); }
+    ~indexed_fixture() { delete table; cleanup(); }
+    static void cleanup() {
+        std::remove(indexed_spec::path.value);
+        std::remove(indexed_spec::data_path);
+        std::remove(indexed_spec::index_path);
+    }
+    storage::storage<indexed_spec>* table = nullptr;
+};
+} // namespace
+
+TEST_CASE("a file-backed index behaves exactly like the heap one") {
+    CHECK(indexed_spec::index_on_disk);
+    CHECK_FALSE(split_spec::index_on_disk);
+
+    indexed_fixture f;
+    std::vector<record_id> ids;
+    for (int i = 0; i < 100; ++i) ids.push_back(f.table->create(user{(uint64_t)i, (uint32_t)i}));
+    for (int i = 0; i < 100; i += 2) f.table->update<&user::balance>(ids[i], 5000 + i);
+    for (int i = 0; i < 100; i += 5) f.table->destroy(ids[i]);
+
+    CHECK(file_size_of(indexed_spec::index_path) == indexed_spec::index_entries * sizeof(std::size_t));
+
+    for (int i = 0; i < 100; ++i) {
+        if (i % 5 == 0) { CHECK(f.table->get<user>(ids[i]) == nullptr); continue; }
+        const user* u = f.table->get<user>(ids[i]);
+        REQUIRE(u != nullptr);
+        CHECK(u->balance == (i % 2 == 0 ? (uint64_t)(5000 + i) : (uint64_t)i));
+    }
+}
+
+TEST_CASE("a file-backed index survives recover, which rebuilds it from the log") {
+    indexed_fixture f;
+    std::vector<record_id> ids;
+    for (int i = 0; i < 100; ++i) ids.push_back(f.table->create(user{(uint64_t)i, (uint32_t)i}));
+    f.table->update<&user::balance>(ids[7], 999);
+    f.table->destroy(ids[9]);
+    f.table->sync();
+    const std::size_t log_bytes = f.table->current_offset();
+    const std::size_t live_before = f.table->live_bytes();
+
+    delete f.table;
+    f.table = new storage::storage<indexed_spec>();
+    CHECK(f.table->recover(indexed_spec::capacity) == log_bytes);
+    CHECK(f.table->live_bytes() == live_before);
+    CHECK(f.table->get<user>(ids[7])->balance == 999);
+    CHECK(f.table->get<user>(ids[9]) == nullptr);
+    CHECK(f.table->get<user>(ids[42])->balance == 42);
+}
+
+TEST_CASE("a file-backed index refuses an id past its capacity instead of growing") {
+    // The heap index would happily try to allocate for any id a record
+    // claims. A mapping cannot, and that turns an unbounded allocation
+    // driven by a record's id field into a plain refusal.
+    indexed_fixture f;
+    record_id ok = f.table->recreate(indexed_spec::index_entries - 1, user{1, 1});
+    CHECK(ok == indexed_spec::index_entries - 1);
+    CHECK(f.table->get<user>(ok)->balance == 1);
+
+    const std::size_t live_before = f.table->live_bytes();
+    const std::size_t offset_before = f.table->current_offset();
+    CHECK(f.table->recreate(indexed_spec::index_entries, user{2, 2}) == 0);
+    CHECK(f.table->recreate((record_id)1 << 60, user{3, 3}) == 0);
+    // Refused means refused: nothing was appended to the log either.
+    CHECK(f.table->live_bytes() == live_before);
+    CHECK(f.table->current_offset() == offset_before);
 }

@@ -106,10 +106,44 @@ written back, go clean, and are then reclaimable, so the dataset may exceed
 RAM. Anonymous pages can only go to swap.
 
 `durability::shared` and `durability::replicated` are unchanged - one
-caller-provided region, `index[id].data` aliasing the log payload directly,
-no second copy. `storage<spec>::split_regions` tells you which model you
-have; `data_region_offset()` reports how much of the data region is in use
+caller-provided region, the index aliasing the log payload directly, no
+second copy. `storage<spec>::split_regions` tells you which model you have;
+`data_region_offset()` reports how much of the data region is in use
 (always 0 when unsplit).
+
+### The index, and putting it in a file too
+
+The index is one machine word per id **ever created** - dead slots are never
+reclaimed. It is therefore the one structure whose footprint follows
+lifetime churn rather than live data, and on the heap it is anonymous
+memory, which the kernel can only swap, never evict. A billion ids ever
+issued is 8 GB that never comes back.
+
+A fifth spec parameter moves it into a file, so its pages get written back,
+go clean, and become reclaimable like every other region here:
+
+```cpp
+using accounts_spec = storage::storage_spec<storage::durability::local_sync, "accounts.db",
+                                            64ull * 1024 * 1024,
+                                            "",                    // data path: derived
+                                            "accounts.idx">;       // index in a file
+```
+
+It is **not** a checkpoint. `recover()` still rebuilds the index from the
+log every time and never reads what a previous run left in the file - the
+file is opened truncated for exactly that reason. The only thing it buys is
+that the index stops being unswappable anonymous memory.
+
+Sizing is automatic: `spec::index_entries` is `capacity / 32`, because a
+record occupies at least `pad8(sizeof(record_header) + 1) == 32` bytes of
+log, so a `capacity`-byte log cannot mint more ids than that. The file costs
+`capacity / 4` bytes.
+
+One behavioural difference, and it is an improvement: a mapping cannot grow,
+so `recreate()` with a hand-picked id past `index_entries` - or a record
+whose `id` field is corrupt - is **refused** (returns 0, appends nothing)
+rather than turning into an arbitrarily large allocation. The heap-backed
+index has no such limit and will try.
 
 `T` must satisfy `tagged_aggregate`: trivially copyable, standard layout,
 no padding (`has_unique_object_representations_v`), not a pointer, not
@@ -200,6 +234,16 @@ synchronization). Fast for small storages. `scratch_base` is a region the
 caller has already opened and mapped. Each live record is copied by
 reading its own `len`/`tag` straight from its header - `T` is never
 needed, so this works across any mix of types in the storage at once.
+
+**Compaction adopts the regions you hand it.** The storage unmaps them in
+its destructor, so pass real mappings of `spec::capacity` - not a
+`std::vector`'s bytes - and do not unmap them yourself. Closing the file
+descriptor afterwards is fine and expected; the mapping keeps the inode
+alive. In exchange the storage now releases the region it was using, which
+it previously just dropped on the floor: before this, every compaction
+stranded a `spec::capacity` mapping and its fd, unbounded, for the life of
+the process (`bench/probe_compaction_leak.cpp` measures 2560 MB of address
+space lost over 20 compactions of a 64 MB storage; it is 0 now).
 
 For a `local_sync` storage the signature takes **two** scratch regions -
 `compact(scratch_log, scratch_data)` - because both the log and the data

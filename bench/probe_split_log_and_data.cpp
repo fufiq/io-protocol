@@ -26,6 +26,28 @@
 //   V1 one file      append log + patch in place in that same file, msync tail
 //   V2 two files     append log (fsync) + patch a separate mmap'd data file
 //   V3 log + anon    append log (fsync) + patch ANONYMOUS memory (no data file)
+//   V4 one file, 2 maps   ONE file, but reached through two mappings: a
+//                    MAP_SHARED window used only to append the log, and a
+//                    MAP_PRIVATE view used for the in-place patches. A write
+//                    to a private mapping copies-on-write into anonymous
+//                    memory, so it never dirties the file -- the inode's only
+//                    dirty pages are the log tail, which is what we wanted,
+//                    without a second file and without giving up demand-paging
+//                    of cold records.
+//   V5 one file, pwrite   Same private view for patches, but the log is built
+//                    in a userspace buffer and appended with pwrite(), so the
+//                    file has no writable mapping at all. Durability is a
+//                    plain fdatasync().
+//   V6 V5, dual-write     V5 relies on a MAP_PRIVATE page that has not been
+//                    copied yet reading through to the page cache, so it sees
+//                    the pwrite. Linux does that, but POSIX calls it
+//                    unspecified. V6 removes the dependency: every appended
+//                    record is written BOTH to the pwrite buffer and into the
+//                    private mapping, so the mapping is authoritative for
+//                    everything this process appended and never has to observe
+//                    a file write it did not make itself. This costs one extra
+//                    memcpy per record plus one copy-on-write fault per page of
+//                    log -- the point of measuring it is to find out how much.
 //
 // All three do the same number of updates and the same number of durability
 // points, and all three keep the same guarantee: on return from the flush,
@@ -88,39 +110,69 @@ void run(const char* label, int variant) {
     } else if (variant == 2) {
         log = map_file("p4_log.db", log_bytes, &log_fd);
         data = map_file("p4_data.db", data_bytes, &data_fd);
-    } else {
+    } else if (variant == 3) {
         log = map_file("p4_log.db", log_bytes, &log_fd);
         data = (std::byte*)::mmap(nullptr, data_bytes, PROT_READ | PROT_WRITE,
                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (data == MAP_FAILED) { perror("mmap anon"); exit(1); }
+    } else {
+        // V4/V5: one file, same layout as V1 (records at the front, log after
+        // them). The difference is purely how each region is reached.
+        log = map_file("p4_single.db", log_bytes + data_bytes, &log_fd);
+        // V6 patches AND appends through the private view, so it needs to span
+        // the log region too; V4/V5 only ever touch records there.
+        const size_t private_bytes = variant == 6 ? log_bytes + data_bytes : data_bytes;
+        data = (std::byte*)::mmap(nullptr, private_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE, log_fd, 0);
+        if (data == MAP_FAILED) { perror("mmap private"); exit(1); }
     }
 
     // Materialize all records first (the "create" phase), and get the log to
     // a realistic starting offset.
     size_t log_off = 0;
-    if (variant == 1) log_off = data_bytes; // records occupy the front in V1
-    for (size_t i = 0; i < n; ++i) std::memset(data + i * rec_size, (int)(i & 0xFF), rec_size);
-    ::msync(log, log_bytes, MS_SYNC);
-    if (variant != 1) ::fsync(log_fd);
+    if (variant == 1 || variant >= 4) log_off = data_bytes; // records occupy the front
+    for (size_t i = 0; i < n; ++i) {
+        // V4/V5 must materialize through the SHARED view, so the bytes land in
+        // the file; the private view is left untouched until the measured loop
+        // so that it faults them in from the page cache rather than caching a
+        // stale copy.
+        std::byte* dst = (variant >= 4 ? log : data) + i * rec_size;
+        std::memset(dst, (int)(i & 0xFF), rec_size);
+    }
+    ::msync(log, variant == 1 || variant >= 4 ? log_bytes + data_bytes : log_bytes, MS_SYNC);
+    if (variant == 2 || variant == 3) ::fsync(log_fd);
 
     std::vector<uint64_t> keys(n);
     for (size_t i = 0; i < n; ++i) keys[i] = i;
     std::shuffle(keys.begin(), keys.end(), std::mt19937_64(7)); // the bad case
 
     size_t last_synced = log_off;
+    std::vector<std::byte> log_buffer; // V5 only: batch of appends, flushed with pwrite
+    if (variant >= 5) log_buffer.reserve(batch * log_rec);
     unsigned long long s0 = sectors_written();
     auto t0 = std::chrono::steady_clock::now();
     for (size_t i = 0; i < n; ++i) {
         // 1. append a log record (sequential, in the log region/file)
-        std::memset(log + log_off, (int)(keys[i] & 0xFF), log_rec);
+        if (variant >= 5) {
+            log_buffer.insert(log_buffer.end(), log_rec, (std::byte)(keys[i] & 0xFF));
+            // V6: the private mapping is the authoritative copy of the log too.
+            if (variant == 6) std::memset(data + log_off, (int)(keys[i] & 0xFF), log_rec);
+        } else std::memset(log + log_off, (int)(keys[i] & 0xFF), log_rec);
         log_off += log_rec;
-        // 2. patch the materialized record in place (random page)
+        // 2. patch the materialized record in place (random page). For V4/V5
+        // this write copies-on-write into anonymous memory instead of dirtying
+        // the file, which is the whole point of the private view.
         std::memcpy(data + keys[i] * rec_size, &keys[i], sizeof(keys[i]));
 
         if ((i + 1) % batch == 0) {
-            // Durability point: flush the log only.
-            std::size_t start = last_synced & ~(std::size_t)4095;
-            ::msync(log + start, log_off - start, MS_SYNC);
+            // Durability point: commit the log only.
+            if (variant >= 5) {
+                (void)!::pwrite(log_fd, log_buffer.data(), log_buffer.size(), (off_t)last_synced);
+                log_buffer.clear();
+                ::fdatasync(log_fd);
+            } else {
+                std::size_t start = last_synced & ~(std::size_t)4095;
+                ::msync(log + start, log_off - start, MS_SYNC);
+            }
             last_synced = log_off;
         }
     }
@@ -131,9 +183,9 @@ void run(const char* label, int variant) {
     std::printf("  %-22s %7.3f s  %10.0f ops/s  %8llu MiB written\n",
                 label, s, n / s, (s1 - s0) * 512 / (1024 * 1024));
 
-    if (variant == 3) ::munmap(data, data_bytes);
+    if (variant == 3 || variant >= 4) ::munmap(data, variant == 6 ? log_bytes + data_bytes : data_bytes);
     else if (data_fd >= 0) { ::munmap(data, data_bytes); ::close(data_fd); }
-    ::munmap(log, variant == 1 ? log_bytes + data_bytes : log_bytes);
+    ::munmap(log, variant == 1 || variant >= 4 ? log_bytes + data_bytes : log_bytes);
     ::close(log_fd);
     std::remove("p4_single.db"); std::remove("p4_log.db"); std::remove("p4_data.db");
 }
@@ -143,5 +195,8 @@ int main() {
     run("V1 one file (today)", 1);
     run("V2 log + data file", 2);
     run("V3 log + anon memory", 3);
+    run("V4 one file, 2 mappings", 4);
+    run("V5 one file, pwrite log", 5);
+    run("V6 V5 + dual-write log", 6);
     return 0;
 }

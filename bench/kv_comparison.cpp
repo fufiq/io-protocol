@@ -26,9 +26,45 @@
 // flush per batch of `batch_size` operations. Only compare rows with the
 // same durability label.
 //
+// One more caveat, specific to RocksDB: it is run here with essentially
+// default options (create_if_missing and nothing else). Untuned RocksDB is
+// not RocksDB at its best - no block cache sizing, no bloom filter config,
+// no compaction tuning. Its read numbers below in particular should be read
+// as "out of the box", not "as fast as it goes".
+//
 // Build:
 //   g++ -std=c++23 -O3 -march=native -I.. -llmdb -o kv_comparison bench/kv_comparison.cpp
-//   (add -DHAVE_ROCKSDB -lrocksdb once dev-libs/rocksdb is installed)
+//   (add -DHAVE_ROCKSDB -lrocksdb for the three-way run)
+//
+// ---------------------------------------------------------------------------
+// MEASURED (500k records, 64B values, batch=1000, NVMe, 98% full, gcc -O3):
+//
+//   no fsync          ours          lmdb        rocksdb
+//   insert            14.5M/s       0.90M/s     0.46M/s
+//   random read        101M/s       2.20M/s     0.43M/s
+//   random update     31.1M/s       0.37M/s     0.40M/s
+//
+//   fsync per batch   ours          lmdb        rocksdb
+//   insert             354K/s       27.7K/s     64.5K/s
+//   random read        104M/s       2.20M/s     0.44M/s
+//   random update     23.4K/s       17.1K/s     71.2K/s     <-- we LOSE 3x
+//
+// The last row is the interesting one and the reason this file exists.
+// Durable random update is the one workload where this design is beaten,
+// and badly: RocksDB is an LSM, so a random update is still a sequential
+// append to a memtable and WAL. Ours writes the WAL record at the tail AND
+// patches the record in place, wherever it happens to live - so msync has
+// to flush dirty pages scattered across the whole mapping.
+//
+// That explanation is measured, not assumed. Same update count, same sync
+// count, only the key order changed:
+//     sequential keys:  1.09 ms/sync    919K ops/sec
+//     random keys:     19.33 ms/sync     52K ops/sec   (18x worse)
+//
+// So it is specifically the scatter, not fsync cost. This is the price of
+// the in-place write that makes get() a pointer return with no replay -
+// which is also why the read row is what it is. Worth knowing before
+// pointing this engine at a write-heavy random-access durable workload.
 
 #include "../storage/storage.hpp"
 

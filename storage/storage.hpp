@@ -25,6 +25,36 @@
 // tail can tear), and "stop at the first checksum mismatch" remains sound
 // with no caveats. Changing a value's shape or size (a different T on the
 // same id) goes through recreate(), a distinct operation from update().
+//
+// WHERE THOSE TWO THINGS LIVE, and why it matters:
+//
+// A filesystem commit is per-INODE, not per-range. msync(log_tail, MS_SYNC)
+// honours its range for writeback, but the commit it triggers underneath
+// (msync -> vfs_fsync_range -> the fs's ->fsync) drags every dirty page of
+// that inode into the transaction. So if the in-place copy lives in the same
+// file as the log, every durability point pays for update()'s scattered
+// random patches. Measured on btrfs, 200k random durable updates: 1010 MiB
+// written and 3.0 s, against 40 MiB and 0.2 s once the two are separated
+// (bench/probe_split_log_and_data.cpp).
+//
+// Hence, for durability::local_sync ONLY, a storage owns TWO files:
+//
+//   spec::path       the log     append-only WAL, the source of truth,
+//                                the only thing sync() ever flushes
+//   spec::data_path  the data    materialized record payloads, what
+//                                index[id].data points at and what update()
+//                                patches in place
+//
+// The data file is a CACHE, not a second source of truth: it is never
+// synced, its post-crash contents are never read, and recover() rebuilds it
+// from the log every time. It is a file rather than anonymous memory purely
+// so its pages stay evictable - anonymous pages can only go to swap, which
+// caps the dataset at RAM; file-backed pages get written back, go clean, and
+// are reclaimed and faulted in again on demand.
+//
+// durability::shared and durability::replicated are unchanged: one
+// caller-provided region, index[id].data aliases the log payload directly,
+// no copy. Only local_sync splits.
 
 #include <cstdint>
 #include <cstddef>
@@ -32,6 +62,7 @@
 #include <concepts>
 #include <type_traits>
 #include <span>
+#include <array>
 #include <vector>
 #include <algorithm>
 #include <chrono>
@@ -146,16 +177,44 @@ namespace storage {
     };
     template <std::size_t N> fixed_string(const char (&)[N]) -> fixed_string<N>;
 
+    // "<path>.data" at compile time. The data file's name is DERIVED rather
+    // than required, so that every spec written before the log/data split
+    // keeps compiling and keeps meaning the same thing - naming a second
+    // path is opt-in (data_path_v below), not a new obligation.
+    template <fixed_string log_path>
+    consteval auto with_data_suffix() {
+        constexpr char suffix[] = ".data";
+        constexpr std::size_t n = sizeof(log_path.value);   // includes the NUL
+        constexpr std::size_t m = sizeof(suffix) - 1;
+        std::array<char, n + m> out{};
+        for (std::size_t i = 0; i + 1 < n; ++i) out[i] = log_path.value[i];
+        for (std::size_t i = 0; i < m; ++i) out[n - 1 + i] = suffix[i];
+        out[n + m - 1] = '\0';
+        return out;
+    }
+
     // level_v/path_v/capacity_v (not level/path/capacity): each is exposed
     // again as a same-named static member below (storage_spec::level, etc)
     // - the "_v" suffix marks the template parameter as the more-local side
     // of that pairing, leaving the public-facing static member with the
     // plain, natural name.
-    template <durability level_v = durability::shared, fixed_string path_v = fixed_string(""), std::size_t capacity_v = 16ull * 1024 * 1024>
+    //
+    // capacity is per FILE, not the total: local_sync reserves it once for
+    // the log and once for the data file. data_offset can never exceed
+    // write_offset (every live materialization has a CREATE behind it in the
+    // log), so one bound genuinely covers both - at the price of reserving
+    // 2 * capacity of disk.
+    template <durability level_v = durability::shared, fixed_string path_v = fixed_string(""), std::size_t capacity_v = 16ull * 1024 * 1024,
+              fixed_string data_path_v = fixed_string("")>
     struct storage_spec {
         static constexpr durability level = level_v;
         static constexpr auto path = path_v;
         static constexpr std::size_t capacity = capacity_v;
+
+        // Held as a member so the array outlives every use of data_path;
+        // an explicit data_path_v wins over the derived name.
+        static constexpr auto derived_data_path = with_data_suffix<path_v>();
+        static constexpr const char* data_path = data_path_v.value[0] ? data_path_v.value : derived_data_path.data();
     };
 
     // =====================================================================
@@ -206,20 +265,39 @@ namespace storage {
         // holds no such table.
         struct raw_view { record_id id; tag_t tag; std::span<const std::byte> bytes; };
 
+        // True when the log and the materialized records live in separate
+        // files. Named once here because it gates every place the two models
+        // differ, and reads better at those sites than repeating the
+        // durability comparison.
+        static constexpr bool split_regions = (spec::level == durability::local_sync);
+
         explicit storage(std::byte* shared_base = nullptr) {
-            if constexpr (spec::level == durability::local_sync) {
+            if constexpr (split_regions) {
                 fd = ::open(spec::path.value, O_RDWR | O_CREAT, 0644);
                 ::posix_fallocate(fd, 0, spec::capacity);
                 base = (std::byte*)(::mmap(nullptr, spec::capacity, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+
+                // Same flags as the log, deliberately: this mapping is
+                // written to constantly (every update() patches it) and is
+                // never synced. MAP_SHARED is what keeps those pages
+                // reclaimable - writeback cleans them and the kernel can
+                // then evict them, which is the entire reason this is a file
+                // and not MAP_ANONYMOUS.
+                data_fd = ::open(spec::data_path, O_RDWR | O_CREAT, 0644);
+                ::posix_fallocate(data_fd, 0, spec::capacity);
+                data_base = (std::byte*)(::mmap(nullptr, spec::capacity, PROT_READ | PROT_WRITE, MAP_SHARED, data_fd, 0));
             } else {
                 base = shared_base;
+                data_base = shared_base;
             }
         }
 
         ~storage() {
-            if constexpr (spec::level == durability::local_sync) {
+            if constexpr (split_regions) {
                 if (base) ::munmap(base, spec::capacity);
+                if (data_base) ::munmap(data_base, spec::capacity);
                 if (fd >= 0) ::close(fd);
+                if (data_fd >= 0) ::close(data_fd);
             }
         }
 
@@ -229,8 +307,8 @@ namespace storage {
         template <tagged_aggregate T>
         record_id create(const T& value) {
             record_id id = next_id++;
-            std::byte* rec = write_record<record_op::create>(id, 0, T::tag, std::as_bytes(std::span{&value, 1}));
-            reserve(id).data = rec;
+            std::byte* logged = write_record<record_op::create>(id, 0, T::tag, std::as_bytes(std::span{&value, 1}));
+            reserve(id).data = materialize(id, T::tag, logged, (uint32_t)sizeof(T));
             live_byte_count += sizeof(T);
             return id;
         }
@@ -241,8 +319,8 @@ namespace storage {
         template <tagged_aggregate T>
         record_id recreate(record_id id, const T& value) {
             if (alive(id)) live_byte_count -= header_of(index[id].data)->len;
-            std::byte* rec = write_record<record_op::create>(id, 0, T::tag, std::as_bytes(std::span{&value, 1}));
-            reserve(id).data = rec;
+            std::byte* logged = write_record<record_op::create>(id, 0, T::tag, std::as_bytes(std::span{&value, 1}));
+            reserve(id).data = materialize(id, T::tag, logged, (uint32_t)sizeof(T));
             live_byte_count += sizeof(T);
             return id;
         }
@@ -294,7 +372,7 @@ namespace storage {
             switch (hdr.op) {
                 case record_op::create:
                     if (alive(hdr.id)) live_byte_count -= header_of(index[hdr.id].data)->len;
-                    reserve(hdr.id).data = (std::byte*)(data);
+                    reserve(hdr.id).data = materialize(hdr.id, hdr.tag, data, hdr.len);
                     live_byte_count += hdr.len;
                     break;
                 case record_op::update:
@@ -313,8 +391,12 @@ namespace storage {
         // nothing past that point is read or applied. For local_sync,
         // file_size is usually obtained via ::stat() on the compile-time
         // known spec::path.
+        // file_size is the LOG's size. The data file is not inspected at all
+        // - whatever a crash left in it is stale by definition, and this
+        // scan rewrites it from offset 0 as each CREATE is replayed.
         std::size_t recover(std::size_t file_size) {
             std::size_t pos = 0;
+            data_offset = 0;
             while (pos + sizeof(record_header) <= file_size) {
                 record_header hdr;
                 std::memcpy(&hdr, base + pos, sizeof(hdr));
@@ -394,29 +476,29 @@ namespace storage {
             return pos;
         }
 
-        // msync's only the delta since the last sync() - never the whole
-        // file. The range IS honoured for writeback; what is not scoped to
-        // it is the filesystem commit MS_SYNC triggers underneath
-        // (msync -> vfs_fsync_range -> the fs's ->fsync, which on btrfs is a
-        // log/transaction commit), and that commit is what dominates the
-        // cost when update()'s in-place patches have dirtied pages scattered
-        // across the mapping.
+        // Flushes the LOG, and only the log - the delta since the last
+        // sync(), never the whole file. When it returns, every record
+        // appended so far is durable; that is the whole guarantee, and it is
+        // enough, because the log is the source of truth and the data file
+        // is a rebuildable cache (see the file header).
+        //
+        // The msync range is honoured for writeback, but the filesystem
+        // commit it triggers underneath (msync -> vfs_fsync_range -> the fs's
+        // ->fsync, a log/transaction commit on btrfs) is per-INODE and cannot
+        // be scoped to a range. That is exactly why the data file is a
+        // separate inode: the log's inode now has no dirty pages except the
+        // tail being flushed, so "commit the whole inode" and "commit the
+        // tail" have become the same thing.
         //
         // Measured, btrfs, 200k random-key durable updates
-        // (bench/probe_inplace_update_cost.cpp):
-        //     msync(tail, MS_SYNC)                3.71 s   1143 MiB written
-        //     sync_file_range(tail, WRITE|WAIT)   0.04 s     23 MiB written
-        //     sync_file_range + one fsync at end  0.05 s     39 MiB written
-        // Same range, same dirty pages - 50x less I/O once the per-batch
-        // commit is dropped. (chattr +C to disable CoW only moves 1143 -> 745
-        // MiB, so CoW relocation is a contributor, not the main term.)
+        // (bench/probe_split_log_and_data.cpp), same workload, same
+        // guarantee, only the layout differs:
+        //     one file (log and data together)    3.0 s   ~1010 MiB written
+        //     log and data in separate files      0.2 s     ~40 MiB written
         //
-        // This function keeps the strong guarantee: when it returns, the data
-        // is durable. If you are flushing per batch and do not need that on
-        // every batch, sync_file_range() for the range plus one sync() at the
-        // point durability actually matters is dramatically cheaper - but
-        // sync_file_range alone is NOT durable (it commits no metadata and
-        // issues no device cache flush), so it cannot simply replace this.
+        // What did NOT go away: the data file's dirty pages still reach the
+        // disk eventually, via background writeback. Splitting moves that
+        // work off the critical path; it does not delete it.
         void sync() noexcept {
             if (write_offset <= last_synced) return;
             std::size_t aligned_start = last_synced & ~(page_size - 1);
@@ -425,10 +507,22 @@ namespace storage {
         }
 
         std::size_t live_bytes() const noexcept { return live_byte_count; }
+
+        // Live data as a fraction of the LOG, so this measures what
+        // compaction actually reclaims: not just dead records but every
+        // update() and destroy() ever appended. It is therefore the right
+        // trigger for a second reason - the log's length is also the restart
+        // cost, since recover() replays all of it.
         double garbage_ratio() const noexcept {
             return write_offset == 0 ? 0.0 : 1.0 - (double)(live_byte_count) / write_offset;
         }
         std::size_t current_offset() const noexcept { return write_offset; }
+
+        // How much of the data region the materialized records occupy. Above
+        // live_bytes() by whatever recreate()/destroy() left behind there
+        // since the last compaction. Always 0 for shared/replicated, which
+        // have no separate data region to account for.
+        std::size_t data_region_offset() const noexcept { return data_offset; }
 
         // Non-disruptive snapshot export: the same "every live record,
         // freshly encoded as a CREATE" walk compact() uses internally, but
@@ -468,6 +562,7 @@ namespace storage {
         void reset() {
             write_offset = 0;
             last_synced = 0;
+            data_offset = 0;
             live_byte_count = 0;
             next_id = 1;
             index.clear();
@@ -481,25 +576,20 @@ namespace storage {
         // (header_of) - T is never needed, so this works across any mix of
         // types in the storage at once.
         // =================================================================
-        void compact(std::byte* scratch_base) {
-            std::size_t scratch_offset = 0;
-            live_byte_count = 0;
-            for (record_id id = 1; id < index.size(); ++id) {
-                if (!index[id].data) continue; // dead record - not carried over
-                const record_header* old_hdr = header_of(index[id].data);
-                std::byte* new_data = write_record_at<record_op::create>(scratch_base, scratch_offset,
-                                                      id, 0, old_hdr->tag,
-                                                      std::span<const std::byte>{index[id].data, old_hdr->len});
-                index[id].data = new_data;
-                live_byte_count += old_hdr->len;
-            }
-            base = scratch_base;
-            write_offset = scratch_offset;
-            // last_synced MUST be reset: scratch has never been synced, and
-            // the old value (from the previous, larger region) could exceed
-            // the new write_offset - sync() would then conclude there's
-            // nothing to flush and silently skip the whole compacted region.
-            last_synced = 0;
+        // Two overloads rather than one with a defaulted second scratch: a
+        // split storage that compacted into a single region would silently
+        // point its index back into the log and quietly undo the split. A
+        // `requires` makes that a compile error at the call site instead.
+        void compact(std::byte* scratch_base) requires (!split_regions) {
+            compact_into(scratch_base, nullptr);
+        }
+
+        // scratch_data_base must be a DIFFERENT region from the current data
+        // region: records are read from the old one while being written to
+        // the new one, and their relative order is not guaranteed to make an
+        // in-place shuffle safe.
+        void compact(std::byte* scratch_base, std::byte* scratch_data_base) requires (split_regions) {
+            compact_into(scratch_base, scratch_data_base);
         }
 
         // --- Below: methods for background_compact (Variant 2) only, not
@@ -587,27 +677,83 @@ namespace storage {
         // CREATEs, then switches index/base/write_offset/last_synced
         // to the new region. Call only while holding the lock (see
         // background_compact).
-        void finish_compaction(std::byte* scratch, snapshot& snap) {
-            std::size_t scratch_offset = 0;
-            live_byte_count = 0;
-            for (record_id id = 1; id < index.size(); ++id) {
-                auto it = snap.index.find(id);
-                if (it == snap.index.end()) { index[id].data = nullptr; continue; } // died during catch-up
-                const arena_ref& ref = it->second;
-                std::byte* new_data = write_record_at<record_op::create>(scratch, scratch_offset,
-                                                      id, 0, ref.tag,
-                                                      std::span<const std::byte>{snap.arena.data() + ref.offset, ref.len});
-                index[id].data = new_data;
-                live_byte_count += ref.len;
-            }
-            base = scratch;
-            write_offset = scratch_offset;
-            last_synced = 0;
+        void finish_compaction(std::byte* scratch, snapshot& snap) requires (!split_regions) {
+            finish_compaction_into(scratch, nullptr, snap);
+        }
+        void finish_compaction(std::byte* scratch, std::byte* scratch_data, snapshot& snap) requires (split_regions) {
+            finish_compaction_into(scratch, scratch_data, snap);
         }
 
     private:
         static record_header* header_of(std::byte* data) noexcept {
             return (record_header*)(data - sizeof(record_header));
+        }
+
+        // Where index[id].data should point for a CREATE whose payload has
+        // just been appended to the log at `payload`.
+        //
+        // Unsplit (shared/replicated): nowhere new - the index aliases the
+        // log payload directly, exactly as it always did. No copy, no second
+        // region, byte-for-byte the same behaviour as before the split.
+        //
+        // Split (local_sync): a second copy, header and all, in the data
+        // region. The header comes along because header_of() is how len and
+        // tag are read back everywhere (get, for_each_raw, destroy,
+        // compaction), and keeping it beside the payload leaves all of that
+        // untouched. The payload really is written twice for a create -
+        // that is the price of the split, and it buys a durability point
+        // that no longer scales with how scattered update()'s patches are.
+        std::byte* materialize(record_id id, tag_t tag, const std::byte* payload, uint32_t len) {
+            if constexpr (!split_regions) return (std::byte*)payload;
+            else return write_record_at<record_op::create>(data_base, data_offset, id, 0, tag,
+                                                           std::span<const std::byte>{payload, len});
+        }
+
+        // Shared body of both compact() overloads. scratch_data_base is
+        // nullptr exactly when the storage is unsplit.
+        void compact_into(std::byte* scratch_base, std::byte* scratch_data_base) {
+            std::size_t scratch_offset = 0, scratch_data_offset = 0;
+            live_byte_count = 0;
+            for (record_id id = 1; id < index.size(); ++id) {
+                if (!index[id].data) continue; // dead record - not carried over
+                const record_header* old_hdr = header_of(index[id].data);
+                std::span<const std::byte> payload{index[id].data, old_hdr->len};
+                std::byte* logged = write_record_at<record_op::create>(scratch_base, scratch_offset, id, 0, old_hdr->tag, payload);
+                if constexpr (split_regions)
+                    index[id].data = write_record_at<record_op::create>(scratch_data_base, scratch_data_offset, id, 0, old_hdr->tag, payload);
+                else
+                    index[id].data = logged;
+                live_byte_count += old_hdr->len;
+            }
+            base = scratch_base;
+            write_offset = scratch_offset;
+            // last_synced MUST be reset: scratch has never been synced, and
+            // the old value (from the previous, larger region) could exceed
+            // the new write_offset - sync() would then conclude there's
+            // nothing to flush and silently skip the whole compacted region.
+            last_synced = 0;
+            if constexpr (split_regions) { data_base = scratch_data_base; data_offset = scratch_data_offset; }
+        }
+
+        void finish_compaction_into(std::byte* scratch, std::byte* scratch_data, snapshot& snap) {
+            std::size_t scratch_offset = 0, scratch_data_offset = 0;
+            live_byte_count = 0;
+            for (record_id id = 1; id < index.size(); ++id) {
+                auto it = snap.index.find(id);
+                if (it == snap.index.end()) { index[id].data = nullptr; continue; } // died during catch-up
+                const arena_ref& ref = it->second;
+                std::span<const std::byte> payload{snap.arena.data() + ref.offset, ref.len};
+                std::byte* logged = write_record_at<record_op::create>(scratch, scratch_offset, id, 0, ref.tag, payload);
+                if constexpr (split_regions)
+                    index[id].data = write_record_at<record_op::create>(scratch_data, scratch_data_offset, id, 0, ref.tag, payload);
+                else
+                    index[id].data = logged;
+                live_byte_count += ref.len;
+            }
+            base = scratch;
+            write_offset = scratch_offset;
+            last_synced = 0;
+            if constexpr (split_regions) { data_base = scratch_data; data_offset = scratch_data_offset; }
         }
 
         bool alive(record_id id) const noexcept {
@@ -685,12 +831,20 @@ namespace storage {
 
         static constexpr std::size_t page_size = 4096; // de facto standard on x86_64 Linux
 
-        std::byte* base = nullptr;
+        std::byte* base = nullptr;          // the log - append-only, the source of truth
         std::size_t write_offset = 0;
         std::size_t last_synced = 0;
+
+        // The materialized records. A separate file only when split_regions;
+        // otherwise it aliases base and data_offset stays 0, because nothing
+        // is ever written through it.
+        std::byte* data_base = nullptr;
+        std::size_t data_offset = 0;
+
         std::size_t live_byte_count = 0;
         record_id next_id = 1;
         int fd = -1;
+        int data_fd = -1;
         std::vector<index_entry> index;
     };
 
@@ -762,11 +916,19 @@ namespace storage {
     //
     // max_catchup_rounds/catchup_threshold_bytes tune phase 2's lock-free
     // catch-up loop below - defaults match what was previously hardcoded.
+    //
+    // tmp_data_path/live_data_path are required for a split (local_sync)
+    // storage and ignored otherwise: compaction has to produce a fresh data
+    // region alongside the fresh log, and it cannot reuse the live one
+    // (records are read from it while the new layout is written). The data
+    // file is renamed into place like the log purely so the on-disk state
+    // keeps matching spec::data_path - nothing reads it across a restart.
     // =====================================================================
     template <typename spec>
     void background_compact(storage<spec>& table, std::mutex& mu,
                             const char* tmp_path, const char* live_path,
                             std::size_t scratch_capacity,
+                            const char* tmp_data_path = nullptr, const char* live_data_path = nullptr,
                             int max_catchup_rounds = 5, std::size_t catchup_threshold_bytes = 4096) {
         typename storage<spec>::snapshot snapshot;
         std::size_t caught_up_to;
@@ -799,6 +961,14 @@ namespace storage {
         ::posix_fallocate(tmp_fd, 0, scratch_capacity);
         std::byte* scratch = (std::byte*)(::mmap(nullptr, scratch_capacity, PROT_READ | PROT_WRITE, MAP_SHARED, tmp_fd, 0));
 
+        int tmp_data_fd = -1;
+        std::byte* scratch_data = nullptr;
+        if constexpr (storage<spec>::split_regions) {
+            tmp_data_fd = ::open(tmp_data_path, O_RDWR | O_CREAT, 0644);
+            ::posix_fallocate(tmp_data_fd, 0, scratch_capacity);
+            scratch_data = (std::byte*)(::mmap(nullptr, scratch_capacity, PROT_READ | PROT_WRITE, MAP_SHARED, tmp_data_fd, 0));
+        }
+
         { // --- PHASE 3 (short lock): final catch-up, write, switchover,
           // and sync. sync() MUST happen inside this lock, not after it
           // releases: write_offset/last_synced are the same fields the
@@ -809,12 +979,17 @@ namespace storage {
             std::lock_guard<std::mutex> lock(mu);
             std::size_t final_offset = table.current_offset();
             table.replay_into(wal_base, caught_up_to, final_offset, snapshot);
-            table.finish_compaction(scratch, snapshot);
+            if constexpr (storage<spec>::split_regions) table.finish_compaction(scratch, scratch_data, snapshot);
+            else table.finish_compaction(scratch, snapshot);
             table.sync();
         }
 
         ::close(tmp_fd);
         ::rename(tmp_path, live_path);
+        if constexpr (storage<spec>::split_regions) {
+            ::close(tmp_data_fd);
+            ::rename(tmp_data_path, live_data_path);
+        }
     }
 
 } // namespace storage

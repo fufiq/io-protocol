@@ -3,7 +3,10 @@
 #include "../storage/storage.hpp"
 
 #include <cstring>
+#include <cstdio>
 #include <random>
+#include <string>
+#include <sys/stat.h>
 
 // No `using namespace storage;` here: the namespace and the class template
 // share the name, so an unqualified `storage::storage<>` would be ambiguous.
@@ -447,4 +450,158 @@ TEST_CASE("for_each visits exactly the live records of the requested type") {
     // orders are included too. This documents that: the tag check is the
     // caller's job via for_each_raw, exactly as HEAP_API.md says.
     CHECK(seen == 8 + 5);
+}
+
+// =====================================================================
+// durability::local_sync - the split between the log and the materialized
+// records. Everything above this point runs on a caller-provided region
+// (durability::shared), which deliberately does NOT split; these cases
+// cover the file-backed path, which is the one that has two of everything.
+// =====================================================================
+namespace {
+
+using split_spec = storage::storage_spec<storage::durability::local_sync, "test_split.db", 4ull * 1024 * 1024>;
+
+// Removes both files so each case starts from nothing - a leftover log from
+// a previous run would otherwise be recovered into the fresh storage.
+struct split_fixture {
+    split_fixture() { cleanup(); table = new storage::storage<split_spec>(); }
+    ~split_fixture() { delete table; cleanup(); }
+    static void cleanup() {
+        std::remove(split_spec::path.value);
+        std::remove(split_spec::data_path);
+    }
+    storage::storage<split_spec>* table = nullptr;
+};
+
+std::size_t file_size_of(const char* path) {
+    struct ::stat st{};
+    return ::stat(path, &st) == 0 ? (std::size_t)st.st_size : 0;
+}
+
+} // namespace
+
+TEST_CASE("local_sync derives the data path from the log path and opens both") {
+    CHECK(std::string(split_spec::data_path) == std::string(split_spec::path.value) + ".data");
+
+    split_fixture f;
+    f.table->create(user{100, 30});
+    CHECK(file_size_of(split_spec::path.value) == split_spec::capacity);
+    CHECK(file_size_of(split_spec::data_path) == split_spec::capacity);
+}
+
+TEST_CASE("shared storage keeps a single region and never opens a data file") {
+    // The counterpart of the case above: the split is local_sync-only, so a
+    // shared storage must still materialize records inside the log itself.
+    CHECK(storage::storage<split_spec>::split_regions);
+    CHECK_FALSE(storage::storage<>::split_regions);
+
+    fixture f;
+    f.table.create(user{1, 2});
+    CHECK(f.table.data_region_offset() == 0);
+}
+
+TEST_CASE("update patches the data region and leaves the log immutable") {
+    // This is the property the whole split exists for: if update() wrote
+    // into the log, the log's inode would collect scattered dirty pages and
+    // every sync() would pay for them.
+    split_fixture f;
+    record_id id = f.table->create(user{1000, 40});
+    f.table->sync();
+
+    const std::byte* log = f.table->raw_base();
+    // The CREATE sits at offset 0; its payload follows the 24-byte header.
+    user logged_before{};
+    std::memcpy(&logged_before, log + sizeof(storage::record_header), sizeof(user));
+    CHECK(logged_before.balance == 1000);
+
+    f.table->update<&user::balance>(id, 7777);
+
+    CHECK(f.table->get<user>(id)->balance == 7777);
+    user logged_after{};
+    std::memcpy(&logged_after, log + sizeof(storage::record_header), sizeof(user));
+    CHECK(logged_after.balance == 1000); // the CREATE's bytes never moved
+}
+
+TEST_CASE("recover rebuilds the data region from the log alone") {
+    split_fixture f;
+    std::vector<record_id> ids;
+    for (int i = 0; i < 50; ++i) ids.push_back(f.table->create(user{(uint64_t)i * 10, (uint32_t)i}));
+    for (int i = 0; i < 50; i += 3) f.table->update<&user::balance>(ids[i], 900000 + i);
+    for (int i = 0; i < 50; i += 7) f.table->destroy(ids[i]);
+    f.table->recreate(ids[1], order{42, 555});
+    f.table->sync();
+
+    const std::size_t log_bytes = f.table->current_offset();
+    const std::size_t live_before = f.table->live_bytes();
+    delete f.table;
+    f.table = nullptr;
+
+    // Deliberately scribble over the data file before reopening: recover()
+    // must not read a single byte of it, only rewrite it.
+    {
+        int fd = ::open(split_spec::data_path, O_RDWR);
+        REQUIRE(fd >= 0);
+        std::vector<std::byte> garbage(64 * 1024, (std::byte)0xAB);
+        REQUIRE(::pwrite(fd, garbage.data(), garbage.size(), 0) == (ssize_t)garbage.size());
+        ::close(fd);
+    }
+
+    storage::storage<split_spec> restored;
+    CHECK(restored.recover(split_spec::capacity) == log_bytes);
+    CHECK(restored.live_bytes() == live_before);
+    CHECK(restored.data_region_offset() > 0);
+
+    for (int i = 0; i < 50; ++i) {
+        if (i % 7 == 0) { CHECK(restored.get<user>(ids[i]) == nullptr); continue; }
+        if (i == 1) { CHECK(restored.get<order>(ids[1])->amount == 555); continue; }
+        const user* u = restored.get<user>(ids[i]);
+        REQUIRE(u != nullptr);
+        CHECK(u->balance == (i % 3 == 0 ? (uint64_t)(900000 + i) : (uint64_t)i * 10));
+    }
+}
+
+TEST_CASE("compaction rebuilds both regions and reclaims both") {
+    split_fixture f;
+    std::vector<record_id> ids;
+    for (int i = 0; i < 200; ++i) ids.push_back(f.table->create(user{(uint64_t)i, (uint32_t)i}));
+    for (int i = 0; i < 200; ++i) f.table->update<&user::balance>(ids[i], 1000 + i);
+    for (int i = 0; i < 200; i += 2) f.table->destroy(ids[i]);
+
+    const std::size_t live = f.table->live_bytes();
+    const std::size_t log_before = f.table->current_offset();
+    const std::size_t data_before = f.table->data_region_offset();
+
+    std::vector<std::byte> scratch_log(1u << 20), scratch_data(1u << 20);
+    f.table->compact(scratch_log.data(), scratch_data.data());
+
+    CHECK(f.table->live_bytes() == live);
+    CHECK(f.table->current_offset() < log_before);
+    CHECK(f.table->data_region_offset() < data_before);
+    CHECK(f.table->raw_base() == scratch_log.data());
+
+    // Every surviving record still reads back its post-update value, and now
+    // reads it out of the NEW data region.
+    for (int i = 1; i < 200; i += 2) {
+        const user* u = f.table->get<user>(ids[i]);
+        REQUIRE(u != nullptr);
+        CHECK(u->balance == (uint64_t)(1000 + i));
+        CHECK(u->age == (uint32_t)i);
+    }
+    for (int i = 0; i < 200; i += 2) CHECK(f.table->get<user>(ids[i]) == nullptr);
+}
+
+TEST_CASE("updates after compaction land in the new data region, not the old one") {
+    split_fixture f;
+    record_id id = f.table->create(user{5, 5});
+    std::vector<std::byte> scratch_log(1u << 20), scratch_data(1u << 20);
+    f.table->compact(scratch_log.data(), scratch_data.data());
+
+    f.table->update<&user::balance>(id, 12345);
+    CHECK(f.table->get<user>(id)->balance == 12345);
+
+    // The value must live inside the scratch data region we just handed over.
+    const std::byte* v = (const std::byte*)f.table->get<user>(id);
+    CHECK(v >= scratch_data.data());
+    CHECK(v + sizeof(user) <= scratch_data.data() + scratch_data.size());
 }

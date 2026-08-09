@@ -1,5 +1,19 @@
 // Why are durable RANDOM updates slow, when sync() only msyncs the log tail?
 //
+// ANSWERED, AND SINCE FIXED. The answer was that the filesystem commit
+// msync triggers is per-INODE: update()'s in-place patches lived in the same
+// file as the log, so every durability point dragged their scattered dirty
+// pages into the transaction. local_sync now keeps the materialized records
+// in a second file (see storage.hpp's header). Same probe, same machine:
+//
+//                              before the split      after
+//   B rand + msync tail        3.71 s  1143 MiB      0.194 s   38 MiB
+//   E rand + msync WHOLE file  3.71 s  1143 MiB      0.197 s   37 MiB
+//
+// Note what happened to E: msync'ing the entire file is now indistinguishable
+// from msync'ing just the tail, because the log's inode no longer HAS any
+// dirty pages besides the tail. That equality is the proof the split worked.
+//
 // Variants, all with identical update counts:
 //   A seq  + msync(tail, MS_SYNC)   <- what sync() actually does
 //   B rand + msync(tail, MS_SYNC)

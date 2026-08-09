@@ -71,9 +71,45 @@ struct order {
 // NTTP string, required for local_sync; capacity defaults to 16MB.
 using accounts_spec = storage::storage_spec<storage::durability::local_sync, "accounts.db", 64ull * 1024 * 1024>;
 
-storage::storage<accounts_spec> accounts;      // local_sync - opens its own file
+storage::storage<accounts_spec> accounts;      // local_sync - opens its own TWO files
 storage::storage<> misc(shared_base);          // shared - caller-owned region
+
+// A fourth parameter overrides the derived data-file name if you need the
+// two files on different devices:
+using split_spec = storage::storage_spec<storage::durability::local_sync, "/nvme/accounts.db",
+                                         64ull * 1024 * 1024, "/ssd/accounts.data">;
 ```
+
+### local_sync owns two files
+
+A `local_sync` storage opens **two** files, not one:
+
+| file | what it holds | synced? | survives a crash? |
+|---|---|---|---|
+| `spec::path` | the log - the append-only WAL | yes, this is all `sync()` flushes | yes, it is the source of truth |
+| `spec::data_path` | the materialized records | never | no - `recover()` rewrites it from the log |
+
+`spec::data_path` defaults to `spec::path + ".data"`, so specs written
+before the split keep working unchanged; `capacity` is reserved once per
+file, so a `local_sync` storage reserves `2 * capacity` of disk.
+
+Why two files: a filesystem commit is per-**inode**, so `msync` of the log
+tail drags every dirty page of that inode into the transaction. With the
+in-place patches in the same file, `update()`'s scattered random writes were
+all being paid for at every durability point - 1010 MiB written and 3.0 s
+for 200k random durable updates, against 40 MiB and 0.2 s once split
+(`bench/probe_split_log_and_data.cpp`, confirmed on the real engine by
+`bench/probe_inplace_update_cost.cpp`).
+
+Why a **file** rather than anonymous memory for the data: file pages get
+written back, go clean, and are then reclaimable, so the dataset may exceed
+RAM. Anonymous pages can only go to swap.
+
+`durability::shared` and `durability::replicated` are unchanged - one
+caller-provided region, `index[id].data` aliasing the log payload directly,
+no second copy. `storage<spec>::split_regions` tells you which model you
+have; `data_region_offset()` reports how much of the data region is in use
+(always 0 when unsplit).
 
 `T` must satisfy `tagged_aggregate`: trivially copyable, standard layout,
 no padding (`has_unique_object_representations_v`), not a pointer, not
@@ -98,7 +134,8 @@ storage.recreate(id, user{700, 31});          // full replacement, see §4
 storage.current_offset();                     // bytes written so far
 storage.live_bytes();                         // sum of live bytes across all records
 storage.garbage_ratio();                      // 1 - live/offset (see §6 on its floor)
-storage.sync();                               // explicit msync - delta only, since the last sync()
+storage.sync();                               // explicit msync of the LOG - delta only, since the last sync()
+storage.data_region_offset();                 // bytes used in the data region (0 unless local_sync)
 ```
 
 `get<T>`, `for_each<T>`, `create<T>`, `recreate<T>` all require
@@ -164,7 +201,15 @@ caller has already opened and mapped. Each live record is copied by
 reading its own `len`/`tag` straight from its header - `T` is never
 needed, so this works across any mix of types in the storage at once.
 
-The on-disk file is swapped safely via a temp file + `msync` + atomic
+For a `local_sync` storage the signature takes **two** scratch regions -
+`compact(scratch_log, scratch_data)` - because both the log and the data
+region have to be rebuilt, and the data one cannot be rebuilt in place
+(records are read from the live region while the new layout is written into
+the other). A `shared` storage keeps the one-argument form; the two are
+separate overloads constrained by `requires`, so using the wrong one is a
+compile error rather than a storage that silently un-splits itself.
+
+The on-disk files are swapped safely via temp files + `msync` + atomic
 `rename()` - see `maybe_compact()` in `stress_heap.cpp`. **`compact()`
 itself never calls `msync`** - durability after compaction is entirely the
 caller's decision (call `sync()` afterward if you need it; for a `shared`
@@ -182,9 +227,14 @@ That is the price of metadata, not leftover garbage.
 std::mutex mu; // the SAME mutex the writer uses (via batch_commit or by hand)
 storage::background_compact(storage, mu, "tmp_path.db", "live_path.db", scratch_capacity);
 
+// local_sync needs a temp/live pair for the data file too:
+storage::background_compact(storage, mu, "tmp_path.db", "live_path.db", scratch_capacity,
+                            "tmp_path.db.data", "live_path.db.data");
+
 // optional trailing params, defaults shown - tune these if phase 3's lock
 // is ever measured holding longer than expected under your write rate:
 storage::background_compact(storage, mu, "tmp_path.db", "live_path.db", scratch_capacity,
+                            "tmp_path.db.data", "live_path.db.data",
                             /*max_catchup_rounds=*/5, /*catchup_threshold_bytes=*/4096);
 ```
 

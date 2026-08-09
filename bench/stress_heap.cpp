@@ -133,15 +133,21 @@ namespace transfer_bench {
 
         std::string live_path = std::string(account_storage_spec::path.value);
         std::string tmp_path = live_path + ".compact_tmp";
+        std::string live_data_path = std::string(account_storage_spec::data_path);
+        std::string tmp_data_path = live_data_path + ".compact_tmp";
 
-        int tmp_fd;
+        int tmp_fd, tmp_data_fd;
         std::byte* scratch = open_mmap(tmp_path.c_str(), tmp_fd, account_storage_spec::capacity);
+        std::byte* scratch_data = open_mmap(tmp_data_path.c_str(), tmp_data_fd, account_storage_spec::capacity);
 
-        table.compact(scratch);
+        table.compact(scratch, scratch_data);
         table.sync();
 
         if (::close(tmp_fd) != 0 || ::rename(tmp_path.c_str(), live_path.c_str()) != 0) {
             std::perror("compaction rename failed");
+        }
+        if (::close(tmp_data_fd) != 0 || ::rename(tmp_data_path.c_str(), live_data_path.c_str()) != 0) {
+            std::perror("compaction data rename failed");
         }
     }
 
@@ -343,9 +349,11 @@ namespace recreate_bench {
 
         {
             std::remove("stress_heap_recreate_local.compact_tmp");
-            int scratch_fd;
+            std::remove("stress_heap_recreate_local.compact_tmp.data");
+            int scratch_fd, scratch_data_fd;
             std::byte* scratch = open_mmap("stress_heap_recreate_local.compact_tmp", scratch_fd, profile_local_storage_spec::capacity);
-            table.compact(scratch);
+            std::byte* scratch_data = open_mmap("stress_heap_recreate_local.compact_tmp.data", scratch_data_fd, profile_local_storage_spec::capacity);
+            table.compact(scratch, scratch_data);
 
             if (table.live_bytes() != expected_live) {
                 std::printf("[phaseE1:compact] live_bytes MISMATCH after compact(): expected=%zu got=%zu\n",
@@ -512,7 +520,8 @@ namespace background_bench {
             while (compactor_running.load()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(15));
                 if (committed.load(std::memory_order_relaxed) - last > 30'000) {
-                    storage::background_compact(table, mu, "stress_heap_bg_compact.db.tmp", "stress_heap_bg_compact.db", spec::capacity);
+                    storage::background_compact(table, mu, "stress_heap_bg_compact.db.tmp", "stress_heap_bg_compact.db", spec::capacity,
+                                                "stress_heap_bg_compact.db.data.tmp", "stress_heap_bg_compact.db.data");
                     last = committed.load(std::memory_order_relaxed);
                     compactions.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -537,7 +546,8 @@ namespace background_bench {
         compactor.join();
 
         // final synchronous catch-up - guaranteed to reflect everything up to the last committed
-        storage::background_compact(table, mu, "stress_heap_bg_compact.db.tmp", "stress_heap_bg_compact.db", spec::capacity);
+        storage::background_compact(table, mu, "stress_heap_bg_compact.db.tmp", "stress_heap_bg_compact.db", spec::capacity,
+                                                "stress_heap_bg_compact.db.data.tmp", "stress_heap_bg_compact.db.data");
 
         double secs = elapsed(t0, t1);
         std::printf("[phaseF:background_compact] %zu updates under %zu background compactions, %.4f sec (%.0f ops/sec, durable)\n",

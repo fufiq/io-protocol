@@ -68,27 +68,27 @@
 //   E rand + msync(WHOLE, MS_SYNC)   44.22 ms/sync   1348 MiB written
 //
 // Note B: we ask msync to flush only the log tail, yet 1171 MiB reaches the
-// device for 12.8 MB of logical updates - ~90x amplification, and nearly as
-// much as E, which explicitly syncs the entire file. So the range argument
-// does NOT bound what actually gets written back: MS_SYNC goes through
-// btrfs_sync_file, which commits the inode's dirty pages regardless of the
-// range we passed. C and D close the argument - the same scattered dirtying
-// with no synchronous flush costs ~nothing, so the pages themselves are
-// cheap and the cost is entirely in the synchronous commit.
+// device for 12.8 MB of logical updates - ~90x amplification. C and D show
+// the dirty pages themselves are nearly free; the cost is entirely in the
+// synchronous flush.
 //
-// The arithmetic checks out: 1171 MiB / 200 flushes = 5.9 MiB per flush. A
-// batch of 1000 random keys dirties 1000 distinct 4K pages (4 MiB) plus
-// btrfs CoW metadata, since a copy-on-write filesystem cannot rewrite a page
-// in place - each dirtied page is relocated with fresh checksums. Sequential
-// keys touch ~16 pages per batch instead: 0.31 MiB per flush, as measured.
+// It is NOT that msync discards the range. The range is honoured for
+// writeback - what is not scoped to it is the filesystem commit MS_SYNC
+// triggers (msync -> vfs_fsync_range -> btrfs_sync_file -> log/transaction
+// commit). Swapping the syscall while keeping the identical range proves it:
 //
-// Two things follow. First, this is the price of the in-place write that
-// makes get() a pointer return with no replay - the same decision that buys
-// the ~100M/s read row. Second, sync()'s own comment ("msync's only the
-// delta since the last sync() - never the whole file") describes an
-// intention the filesystem does not honour: narrowing the range does not
-// narrow the writeback. On a non-CoW filesystem the amplification would
-// likely be smaller, but that has not been measured here.
+//   msync(tail, MS_SYNC)                 3.71 s   1143 MiB
+//   sync_file_range(tail, WRITE|WAIT)    0.04 s     23 MiB   (50x less I/O)
+//   sync_file_range + one fsync at end   0.05 s     39 MiB
+//
+// Copy-on-write is a contributor but not the main term: chattr +C
+// (nodatacow) only moves 1143 -> 745 MiB, while dropping the per-batch
+// commit moves it to 23 MiB.
+//
+// The catch is that sync_file_range alone is not durable - it commits no
+// metadata and issues no device cache flush - so it is not a drop-in
+// replacement for sync(). The usable shape is per-batch range writeback plus
+// one real fsync where durability is actually required.
 
 #include "../storage/storage.hpp"
 

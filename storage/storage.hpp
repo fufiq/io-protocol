@@ -394,25 +394,29 @@ namespace storage {
             return pos;
         }
 
-        // Asks msync to flush only the delta since the last sync(), never
-        // the whole file.
+        // msync's only the delta since the last sync() - never the whole
+        // file. The range IS honoured for writeback; what is not scoped to
+        // it is the filesystem commit MS_SYNC triggers underneath
+        // (msync -> vfs_fsync_range -> the fs's ->fsync, which on btrfs is a
+        // log/transaction commit), and that commit is what dominates the
+        // cost when update()'s in-place patches have dirtied pages scattered
+        // across the mapping.
         //
-        // Be careful what you conclude from that: the range argument bounds
-        // what we *ask* for, not what the filesystem actually writes back.
-        // Measured on btrfs (see bench/probe_inplace_update_cost.cpp), a
-        // MS_SYNC over just the tail still pushed 1171 MiB to the device for
-        // 12.8 MB of logical updates - almost exactly as much as explicitly
-        // syncing the entire file - because MS_SYNC goes through the
-        // filesystem's own file-sync path, which commits the inode's dirty
-        // pages regardless of the range passed here.
+        // Measured, btrfs, 200k random-key durable updates
+        // (bench/probe_inplace_update_cost.cpp):
+        //     msync(tail, MS_SYNC)                3.71 s   1143 MiB written
+        //     sync_file_range(tail, WRITE|WAIT)   0.04 s     23 MiB written
+        //     sync_file_range + one fsync at end  0.05 s     39 MiB written
+        // Same range, same dirty pages - 50x less I/O once the per-batch
+        // commit is dropped. (chattr +C to disable CoW only moves 1143 -> 745
+        // MiB, so CoW relocation is a contributor, not the main term.)
         //
-        // That matters for update(): its in-place patch dirties whatever page
-        // the record lives on, anywhere in the mapping. Under random-access
-        // updates those pages are scattered, and every sync() pays to write
-        // all of them back (plus CoW metadata), even though none of them are
-        // in this range. Sequential access keeps them clustered and cheap.
-        // Narrowing the range is still worth doing, it just is not the
-        // guarantee it looks like.
+        // This function keeps the strong guarantee: when it returns, the data
+        // is durable. If you are flushing per batch and do not need that on
+        // every batch, sync_file_range() for the range plus one sync() at the
+        // point durability actually matters is dramatically cheaper - but
+        // sync_file_range alone is NOT durable (it commits no metadata and
+        // issues no device cache flush), so it cannot simply replace this.
         void sync() noexcept {
             if (write_offset <= last_synced) return;
             std::size_t aligned_start = last_synced & ~(page_size - 1);

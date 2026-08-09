@@ -208,3 +208,58 @@ TEST_CASE("end-to-end: a retransmitted packet still decrypts+reassembles correct
     CHECK(res == transport::result::completed);
     CHECK(out == msg);
 }
+
+// =========================================================================
+// Regression: malformed SACKs. Found by fuzz_sack_decode - SACK packets are
+// the one wire type that is not AEAD-authenticated, so frag_count here is
+// attacker-chosen input from anyone who can guess a live conn_id.
+// =========================================================================
+
+TEST_CASE("decode_sack rejects a frag_count larger than a 64-bit mask can describe") {
+    // frag_count = 53456 is what the fuzzer landed on; it used to reach
+    // `1ull << frag_count`, which is undefined behavior.
+    uint8_t wire[reliability::sack_wire_len]{};
+    wire[0] = 1; // msg_id
+    wire[4] = (uint8_t)(53456 & 0xFF);
+    wire[5] = (uint8_t)(53456 >> 8);
+    for (int i = 0; i < 8; ++i) wire[6 + i] = 0xFF; // all-ones mask
+
+    auto info = reliability::decode_sack(wire);
+    CHECK(info.frag_count == 0);   // treated as malformed
+    CHECK(info.completed == false); // and definitely not "complete"
+}
+
+TEST_CASE("decode_sack still accepts the largest legitimate frag_count") {
+    uint8_t wire[reliability::sack_wire_len]{};
+    wire[0] = 7;
+    wire[4] = (uint8_t)assembly::max_fragments; // exactly 64
+    wire[5] = 0;
+    for (int i = 0; i < 8; ++i) wire[6 + i] = 0xFF; // all 64 bits set
+
+    auto info = reliability::decode_sack(wire);
+    CHECK(info.frag_count == assembly::max_fragments);
+    CHECK(info.completed == true); // a full 64-fragment message really is complete
+}
+
+TEST_CASE("handle_ack survives an out-of-range frag_count handed to it directly") {
+    // handle_ack is a public entry point, so it must bound frag_count itself
+    // rather than trusting that decode_sack already did.
+    auto pair = make_connected_pair();
+    reliability::reliable_sender<> sender(pair.a, std::chrono::milliseconds(20),
+                                          std::chrono::milliseconds(200), 5, 4, 64);
+    std::vector<uint8_t> msg(100, 0xAB);
+    sender.send_message(msg.data(), msg.size());
+    size_t pending_before = sender.pending_count();
+
+    assembly::ack_info bogus{};
+    bogus.msg_id = 0;
+    bogus.frag_count = 65535; // way past what a 64-bit mask can address
+    bogus.received_mask = ~0ull;
+    bogus.completed = true;
+    sender.handle_ack(bogus); // must not invoke UB, must not hang
+
+    // It may legitimately retire the fragments it does cover, but it can
+    // never invent new pending state out of a forged ack.
+    CHECK(sender.pending_count() <= pending_before);
+    CHECK(sender.cwnd() > 0);
+}

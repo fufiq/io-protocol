@@ -79,7 +79,23 @@ constexpr assembly::ack_info decode_sack(const uint8_t* data) {
     uint64_t mask = 0;
     for (int i = 0; i < 8; ++i) mask |= (uint64_t)data[6 + i] << (8 * i);
     info.received_mask = mask;
-    info.completed = (info.frag_count > 0) && (mask == ((info.frag_count == 64) ? ~0ull : ((1ull << info.frag_count) - 1)));
+
+    // frag_count comes straight off the wire, and SACKs are the one packet
+    // type that is NOT authenticated (see protocol.hpp's tick(): type 5 goes
+    // out as plaintext), so this is attacker-chosen input from anyone who can
+    // guess a live conn_id. A received_mask is 64 bits, so a count above
+    // assembly::max_fragments cannot describe anything real - and shifting by
+    // it is undefined behavior, which is exactly what a fuzzer found here
+    // ("shift exponent 53456 is too large for 64-bit type"). Treat an
+    // impossible count as a malformed SACK: zero it, which makes `completed`
+    // false and makes handle_ack's loop below a no-op.
+    if (info.frag_count > assembly::max_fragments) {
+        info.frag_count = 0;
+        info.completed = false;
+        return info;
+    }
+    info.completed = (info.frag_count > 0) &&
+                     (mask == ((info.frag_count == 64) ? ~0ull : ((1ull << info.frag_count) - 1)));
     return info;
 }
 
@@ -138,7 +154,14 @@ public:
     // every fragment bit set in `received_mask`.
     void handle_ack(const assembly::ack_info& info) {
         bool any_newly_acked = false;
-        for (uint16_t i = 0; i < info.frag_count; ++i) {
+        // Bounded independently of decode_sack's own check: this is a public
+        // entry point taking a caller-supplied ack_info, so it must not
+        // depend on someone else having validated frag_count first. Past 64
+        // the shift below is undefined behavior, and the loop would also
+        // spin up to 65535 times doing map lookups on a packet nobody
+        // authenticated.
+        const uint16_t count = info.frag_count > assembly::max_fragments ? assembly::max_fragments : info.frag_count;
+        for (uint16_t i = 0; i < count; ++i) {
             if (!(info.received_mask & (1ull << i))) continue;
             auto token = make_token(info.msg_id, i);
             wheel.cancel(token);

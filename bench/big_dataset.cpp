@@ -21,33 +21,55 @@
 // is the price of the log/data split, and it is most visible exactly here.
 //
 // MEASURED: 26 GB of logical data (27262976 records of 1024 bytes) on a
-// machine with 31 GB of RAM, ~25 GB of it available. 200k random operations.
+// machine with 31 GB of RAM. 200k random operations. Averages, with the
+// per-engine spread in brackets.
 //
-//                        ours        lmdb     rocksdb    postgres
-//   fill (rec/sec)     227902     1994078       39642       74675
-//   fill (seconds)      119.6        13.7       687.7       365.1
-//   random read          3262        2249        2263        4570
-//   random update       10148        1010        2642        6172
-//   RSS (MB)             7181        2759        1951    14 (client)
-//   on disk (GB)         56.2        34.8        26.9        30.5
+// TWO BATCHES, and that matters more than any single number here. Engines
+// were ALTERNATED within a batch and writeback was drained between runs
+// (/proc/meminfo Dirty and Writeback), which is what makes a comparison
+// inside a batch mean something. Across batches it does not: the second
+// batch ran the machine harder and every engine in it reads slower than the
+// same engine did earlier.
 //
-// * FILL varies by 50x between the extremes. LMDB writes one copy with
-//   write() and MDB_APPEND; we write two (log AND materialized records) and
-//   dirty mmap pages; RocksDB writes 26.9 GB of final data but moves several
-//   times that through compaction levels, which is where its 687 seconds go.
+//   batch 1, 3 rounds:   ours, ours-fields
+//   batch 2, 2 rounds:   lmdb, postgres, rocksdb
 //
-// * RANDOM READ puts everyone within 2x, because everyone is now the device's
-//   random-read latency. Postgres is fastest, and the reason is instructive:
-//   it reads 8 KB pages with pread() into its own buffer pool, while we take
-//   mmap faults. Its 8 GB shared_buffers plus the page cache holds a larger
-//   effective working set than our resident mapping does.
+//                       ours   ours-fld  |    lmdb   postgres   rocksdb
+//   fill (rec/sec)    185662     321555  |  989626      55369     24619
+//   random read         3168       7987  |    1845       3390      1148
+//   random update       8120      11340  |     834       4564      1092
+//   on disk (GB)        56.2       28.5  |    34.8       30.5      26.9
 //
-// * RANDOM UPDATE is where the designs separate most. Ours writes a 32-byte
-//   diff at the log tail and patches 8 bytes in place: one page touched,
-//   14252 major faults for 200k updates. LMDB reads the whole kilobyte,
-//   modifies it, and copies-on-write the entire B+tree path: 82153 faults for
-//   the same 200k. Postgres writes a new tuple version without rewriting a
-//   tree.
+//   spread across runs of the same engine:
+//     ours          fill 1.6x   read 1.2x   update 1.4x
+//     ours-fld      fill 1.2x   read 1.1x   update 1.4x
+//     lmdb          fill 10.8x  read 1.0x   update 1.1x
+//     postgres      fill 1.3x   read 1.3x   update 1.1x
+//     rocksdb       fill 1.2x   read 1.1x   update 1.3x
+//
+// LMDB's fill is the outlier and the reason is visible in the log: 1812090
+// rec/sec with 25 GB of RAM available, 167161 with 16.7 GB. Writing 34.8 GB
+// through write() depends almost entirely on how much page cache it can
+// dirty before the kernel starts throttling, so its fill number is really a
+// measurement of the machine's free memory at that moment.
+//
+// * FILL spans 40x. LMDB writes one copy with write() and MDB_APPEND;
+//   ours-fields writes one copy through mmap; ours writes two (the log AND
+//   the materialized records); Postgres writes a heap plus WAL through a
+//   socket; RocksDB writes 26.9 GB of final data but moves several times that
+//   through compaction levels, which is where its ~1100 seconds go.
+//
+// * RANDOM READ. ours-fields is the fastest thing measured here, and against
+//   the engines it shares a batch with the margin would be larger still,
+//   since batch 2 ran under heavier pressure. Postgres is the best of batch 2
+//   and the reason is instructive: it reads 8 KB pages with pread() into an
+//   8 GB buffer pool rather than taking mmap faults.
+//
+// * RANDOM UPDATE is where the designs separate most, and it is the row the
+//   fault counts explain. Ours writes a 32-byte diff at the log tail and
+//   patches 8 bytes in place -- one random page per update, 0.126 major
+//   faults each. ours-fields patches nothing and takes 0.0016. LMDB reads the
+//   whole kilobyte and copies-on-write the entire B+tree path, 0.411.
 //
 // * MAJOR FAULT COUNTS ARE ONLY COMPARABLE BETWEEN OURS AND LMDB. Both use
 //   mmap, so their misses are page faults. RocksDB and Postgres read with

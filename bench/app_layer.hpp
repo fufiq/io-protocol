@@ -135,6 +135,23 @@ namespace app {
             ++indexed_records;
         }
 
+        // Indexes a record that already exists, for rebuilding from live
+        // records rather than from the log. After a checkpoint restart the
+        // engine's own state is back instantly but these indexes are empty -
+        // they live in memory and nothing replayed them. One pass over the
+        // live records puts them back, and that pass is proportional to LIVE
+        // DATA rather than to log length, which is the whole difference
+        // between rebuilding and replaying.
+        void index_existing(record_id id, tag_t what, const std::byte* bytes) {
+            switch ((kind)what) {
+                case kind::customer:   { customer v; std::memcpy(&v, bytes, sizeof(v)); add(id, v); break; }
+                case kind::product:    { product v; std::memcpy(&v, bytes, sizeof(v)); add(id, v); break; }
+                case kind::order:      { order v; std::memcpy(&v, bytes, sizeof(v)); add(id, v); break; }
+                case kind::order_line: { order_line v; std::memcpy(&v, bytes, sizeof(v)); add(id, v); break; }
+            }
+            ++indexed_records;
+        }
+
     private:
         // The value the record WILL have. A create carries it whole; an
         // update carries only a diff, so the current record supplies the rest.

@@ -111,6 +111,59 @@ second copy. `storage<spec>::split_regions` tells you which model you have;
 `data_region_offset()` reports how much of the data region is in use
 (always 0 when unsplit).
 
+### Restarting without replaying: `checkpoint()` / `restart()`
+
+`recover()` replays the log because the log is the only thing on disk that is
+trusted. A sixth spec parameter changes that:
+
+```cpp
+using accounts_spec = storage::storage_spec<storage::durability::local_sync, "accounts.db",
+                                            64ull * 1024 * 1024,
+                                            "",                 // data path: derived
+                                            "accounts.idx",     // index in a file (required)
+                                            "accounts.ck">;     // checkpoint marker
+
+table.checkpoint();                 // on a clean shutdown
+...
+table.restart(log_size);            // instead of recover()
+table.started_from_checkpoint();    // did it, or did it fall back?
+```
+
+`checkpoint()` flushes the log, the materialized records and the index - the
+one and only place the data region is ever flushed - and **only then** writes a
+marker naming the offset at which all three agree. The marker goes to a temp
+file, is fsynced, renamed, and the parent directory is fsynced too, because a
+rename is not durable until the directory entry naming it is.
+
+That ordering is the whole correctness argument: everything the marker
+describes is already durable before the marker exists, so a crash leaves either
+no marker (replay, exactly as before) or a marker whose contents are on disk.
+
+`restart()` accepts a checkpoint **only if the log ends exactly where the
+marker says** - the next header must read as a sparse tail, and a CRC of the
+bytes before it must match. That is deliberately strict. It means nothing was
+written after the checkpoint, so the data region and index on disk cannot have
+drifted past it and there is no delta to replay. A crash after further writes,
+a compacted log, a restored backup, a corrupt or missing marker: all fall back
+to a full replay, which is always correct.
+
+Call `discard_checkpoint()` after compacting - compaction rewrites the log, so
+every offset the marker records becomes meaningless. (The CRC check would catch
+it anyway; removing the file says so outright.)
+
+**What this does not bring back**: anything a layer above keeps in memory. The
+engine's own state returns without replaying a record, but secondary indexes
+maintained by an observer are still empty - nothing replayed them. Rebuild them
+from live records instead of from the log; that pass is proportional to live
+data rather than to log length. `bench/app_txn.hpp`'s `rebuild_indexes()` shows
+the shape. Measured on 200k records with 100k live:
+
+| | |
+|---|---|
+| replaying the log | 0.025 s |
+| from a checkpoint, engine only | 0.000 s |
+| ...plus rebuilding the indexes | 0.003 s |
+
 ### The index, and putting it in a file too
 
 The index is one machine word per id **ever created** - dead slots are never

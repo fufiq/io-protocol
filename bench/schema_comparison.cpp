@@ -100,9 +100,22 @@
 // * LMDB gives multi-process readers with real MVCC, and RocksDB gives
 //   concurrent writers, range scans and compaction. We give one writer in one
 //   process. That is most of why we are faster.
-// * REOPEN still goes LMDB's way and not ours: 0.001 s at any size, because
-//   its B+tree IS the file. We rebuild our index from the log. RocksDB is the
-//   slowest of the three there.
+// * REOPEN. LMDB opens in ~0.000 s at any size because its B+tree IS the
+//   file. We now have two answers: replaying the log, or a checkpoint. With
+//   200k records and 100k of them live at shutdown:
+//
+//     ours, replaying the log            0.025 s
+//     ours, from a checkpoint            0.000 s   (engine state only)
+//     ours, + rebuilding the indexes     0.003 s   (usable)
+//     lmdb                               0.000 s
+//     rocksdb                            3.475 s
+//
+//   A checkpoint flushes the log, the materialized records and the index
+//   together and writes a marker naming the offset they agree at, so nothing
+//   is replayed. What is left - the 3 ms - is entirely the secondary indexes,
+//   which live in the observer's memory and have to be rebuilt from live
+//   records. LMDB is still ahead because its indexes are IN the file; the gap
+//   went from 25 ms to 3.
 //
 // Build:
 //   g++ -std=c++23 -O3 -march=native -o schema_comparison bench/schema_comparison.cpp -llmdb -lrocksdb -DHAVE_ROCKSDB
@@ -135,7 +148,10 @@ namespace {
     // the same count that takes seconds without durability takes hours with it.
     std::size_t n_records = 200'000;
 
-    using bench_spec = storage::storage_spec<storage::durability::local_sync, "schemacmp_ours.db", 2ull << 30>;
+    // index_path and checkpoint_path turn on the fast-restart path; without
+    // them this spec behaves exactly as before and recover() replays the log.
+    using bench_spec = storage::storage_spec<storage::durability::local_sync, "schemacmp_ours.db", 2ull << 30,
+                                             "", "schemacmp_ours.idx", "schemacmp_ours.ck">;
 
     double secs(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
         return std::chrono::duration<double>(b - a).count();
@@ -149,6 +165,8 @@ namespace {
     void wipe_ours() {
         std::remove("schemacmp_ours.db");
         std::remove("schemacmp_ours.db.data");
+        std::remove("schemacmp_ours.idx");
+        std::remove("schemacmp_ours.ck");
     }
     void wipe_lmdb() {
         std::remove("schemacmp_lmdb.mdb");
@@ -182,7 +200,8 @@ namespace {
         wipe_ours();
         std::vector<record_id> ids;
         ids.reserve(n_records);
-        double reopen_seconds = 0;
+        double reopen_seconds = 0, restart_seconds = 0, rebuild_seconds = 0;
+        bool checkpoint_ok = false;
         std::size_t log_bytes = 0;
 
         {
@@ -238,31 +257,58 @@ namespace {
             t1 = std::chrono::steady_clock::now();
             line("ours", "update INDEXED field", d, n_records, secs(t0, t1));
 
+            // Half, not all: the reopen measured below has to have something
+            // live to come back to, and a database that ends empty makes the
+            // index-rebuild column meaningless.
+            const std::size_t n_deleted = n_records / 2;
             t0 = std::chrono::steady_clock::now();
-            for (std::size_t i = 0; i < n_records; ++i) {
+            for (std::size_t i = 0; i < n_deleted; ++i) {
                 txn<bench_spec> tx(table, txn_id++);
                 tx.delete_customer(ids[i]);
                 tx.commit(false);
                 group_commit(i);
             }
             t1 = std::chrono::steady_clock::now();
-            line("ours", "delete + index entry", d, n_records, secs(t0, t1));
+            line("ours", "delete + index entry", d, n_deleted, secs(t0, t1));
 
             table.sync();
             log_bytes = table.current_offset();
+            // A clean shutdown: flush the log, the materialized records and
+            // the index together, then name the offset they all agree at.
+            checkpoint_ok = table.checkpoint();
         }
         {
-            // Reopen: the index does not exist on disk, so this is where we
-            // pay for everything the other two paid for at write time.
+            // How a restart goes with no checkpoint to lean on: replay the
+            // whole log and rebuild every index from it.
             table_t<bench_spec> restored;
             auto t0 = std::chrono::steady_clock::now();
             restored.recover(bench_spec::capacity);
             auto t1 = std::chrono::steady_clock::now();
             reopen_seconds = secs(t0, t1);
         }
+        {
+            // And with one: the engine comes back without replaying a single
+            // record, and the secondary indexes are rebuilt from live records
+            // instead of from the log.
+            table_t<bench_spec> restored;
+            auto t0 = std::chrono::steady_clock::now();
+            restored.restart(bench_spec::capacity);
+            const bool fast = restored.started_from_checkpoint();
+            auto t1 = std::chrono::steady_clock::now();
+            const std::size_t reindexed = rebuild_indexes(restored);
+            auto t2 = std::chrono::steady_clock::now();
+            if (reindexed == 0) std::printf("  !! nothing live at reopen - the rebuild column is meaningless\n");
+            restart_seconds = secs(t0, t1);
+            rebuild_seconds = secs(t1, t2);
+            if (!fast) std::printf("  !! the checkpoint was refused (written=%d)\n", (int)checkpoint_ok);
+        }
         std::printf("%-9s %-26s %-12s %9.1f MB %8.3f s  %12.0f MB/sec\n",
-                    "ours", "REOPEN (rebuild index)", d, log_bytes / 1048576.0, reopen_seconds,
+                    "ours", "REOPEN replaying the log", d, log_bytes / 1048576.0, reopen_seconds,
                     log_bytes / 1048576.0 / reopen_seconds);
+        std::printf("%-9s %-26s %-12s %9s %8.3f s  %12s\n",
+                    "ours", "REOPEN from a checkpoint", d, "-", restart_seconds, "engine only");
+        std::printf("%-9s %-26s %-12s %9s %8.3f s  %12s\n",
+                    "ours", "  + rebuild the indexes", d, "-", restart_seconds + rebuild_seconds, "usable");
         wipe_ours();
     }
 
@@ -382,8 +428,9 @@ namespace {
         t1 = std::chrono::steady_clock::now();
         line("lmdb", "update INDEXED field", d, n_records, secs(t0, t1));
 
+        const std::size_t n_deleted = n_records / 2;
         t0 = std::chrono::steady_clock::now();
-        for (std::size_t i = 0; i < n_records; ++i) {
+        for (std::size_t i = 0; i < n_deleted; ++i) {
             MDB_txn* t = nullptr;
             mdb_txn_begin(env, nullptr, 0, &t);
             MDB_val k{ sizeof(uint64_t), &ids[i] }, v{};
@@ -397,7 +444,7 @@ namespace {
             group_commit(i);
         }
         t1 = std::chrono::steady_clock::now();
-        line("lmdb", "delete + index entry", d, n_records, secs(t0, t1));
+        line("lmdb", "delete + index entry", d, n_deleted, secs(t0, t1));
 
         mdb_env_sync(env, 1);
         mdb_env_close(env);
@@ -550,8 +597,9 @@ namespace {
         t1 = std::chrono::steady_clock::now();
         line("rocksdb", "update INDEXED field", d, n_records, secs(t0, t1));
 
+        const std::size_t n_deleted = n_records / 2;
         t0 = std::chrono::steady_clock::now();
-        for (std::size_t i = 0; i < n_records; ++i) {
+        for (std::size_t i = 0; i < n_deleted; ++i) {
             const uint64_t id = ids[i];
             if (!db->Get(ro, handles[0], slice_of(id), &value).ok()) continue;
             const customer c = *(const customer*)value.data();
@@ -563,7 +611,7 @@ namespace {
             group_commit(i);
         }
         t1 = std::chrono::steady_clock::now();
-        line("rocksdb", "delete + index entry", d, n_records, secs(t0, t1));
+        line("rocksdb", "delete + index entry", d, n_deleted, secs(t0, t1));
 
         db->SyncWAL();
         for (auto* h : handles) db->DestroyColumnFamilyHandle(h);

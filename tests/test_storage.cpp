@@ -1313,3 +1313,160 @@ TEST_CASE("compaction forgets the last record, so a stale flag cannot be set") {
     CHECK_FALSE(f.table.set_last_record_flags(0x01));
     CHECK(f.table.get<user>(id)->balance == 1);
 }
+
+// =====================================================================
+// checkpoint() / restart() - a clean shutdown that starts back up without
+// replaying anything. The interesting cases are the ones where the
+// checkpoint must be REFUSED, because accepting a stale one silently
+// resurrects a state that never existed.
+// =====================================================================
+namespace {
+
+using ckpt_spec = storage::storage_spec<storage::durability::local_sync, "test_ckpt.db",
+                                        4ull * 1024 * 1024, "", "test_ckpt.idx", "test_ckpt.ck">;
+
+void wipe_ckpt() {
+    std::remove(ckpt_spec::path.value);
+    std::remove(ckpt_spec::data_path);
+    std::remove(ckpt_spec::index_path);
+    std::remove(ckpt_spec::checkpoint_path);
+}
+
+} // namespace
+
+TEST_CASE("a clean shutdown restarts without replaying the log") {
+    wipe_ckpt();
+    std::vector<record_id> ids;
+    std::size_t log_bytes, live;
+    {
+        storage::storage<ckpt_spec> table;
+        for (int i = 0; i < 500; ++i) ids.push_back(table.create(user{(uint64_t)i, (uint32_t)i}));
+        for (int i = 0; i < 500; i += 3) table.update<&user::balance>(ids[i], 90000 + i);
+        for (int i = 0; i < 500; i += 7) table.destroy(ids[i]);
+        table.recreate(ids[1], order{5, 55});
+        log_bytes = table.current_offset();
+        live = table.live_bytes();
+        REQUIRE(table.checkpoint());
+    }
+
+    storage::storage<ckpt_spec> restored;
+    CHECK(restored.restart(ckpt_spec::capacity) == log_bytes);
+    CHECK(restored.started_from_checkpoint());
+    CHECK(restored.live_bytes() == live);
+
+    for (int i = 0; i < 500; ++i) {
+        if (i % 7 == 0) { CHECK(restored.get<user>(ids[i]) == nullptr); continue; }
+        if (i == 1) { CHECK(restored.get<order>(ids[1])->amount == 55); continue; }
+        const user* u = restored.get<user>(ids[i]);
+        REQUIRE(u != nullptr);
+        CHECK(u->balance == (i % 3 == 0 ? (uint64_t)(90000 + i) : (uint64_t)i));
+    }
+    // And it keeps working: a create after a restart must not collide.
+    auto fresh = restored.create(user{7, 7});
+    for (auto id : ids) CHECK(fresh != id);
+    wipe_ckpt();
+}
+
+TEST_CASE("writes after a checkpoint make it refuse to be used") {
+    wipe_ckpt();
+    record_id a, b;
+    std::size_t log_after_writes;
+    {
+        storage::storage<ckpt_spec> table;
+        a = table.create(user{1, 1});
+        REQUIRE(table.checkpoint());
+        b = table.create(user{2, 2});   // past the checkpoint, and never re-checkpointed
+        table.sync();
+        log_after_writes = table.current_offset();
+    }
+
+    storage::storage<ckpt_spec> restored;
+    CHECK(restored.restart(ckpt_spec::capacity) == log_after_writes);
+    CHECK_FALSE(restored.started_from_checkpoint()); // fell back to replaying
+    CHECK(restored.get<user>(a) != nullptr);
+    CHECK(restored.get<user>(b) != nullptr);         // and the extra write survived
+    wipe_ckpt();
+}
+
+TEST_CASE("a checkpoint from a different log is refused") {
+    wipe_ckpt();
+    record_id a;
+    {
+        storage::storage<ckpt_spec> table;
+        for (int i = 0; i < 40; ++i) a = table.create(user{(uint64_t)i, 1});
+        REQUIRE(table.checkpoint());
+    }
+    // Rewrite the log's tail with different bytes at the same length - what a
+    // compaction, a restore from backup, or a swapped file would look like.
+    {
+        int fd = ::open(ckpt_spec::path.value, O_RDWR);
+        REQUIRE(fd >= 0);
+        uint64_t different = 0xA5A5A5A5A5A5A5A5ull;
+        REQUIRE(::pwrite(fd, &different, sizeof(different), 8) == (ssize_t)sizeof(different));
+        ::fsync(fd);
+        ::close(fd);
+    }
+    storage::storage<ckpt_spec> restored;
+    restored.restart(ckpt_spec::capacity);
+    CHECK_FALSE(restored.started_from_checkpoint()); // tail_crc caught it
+    (void)a;
+    wipe_ckpt();
+}
+
+TEST_CASE("a corrupted or missing checkpoint falls back to replaying") {
+    wipe_ckpt();
+    std::size_t log_bytes;
+    record_id a;
+    {
+        storage::storage<ckpt_spec> table;
+        a = table.create(user{123, 4});
+        log_bytes = table.current_offset();
+        REQUIRE(table.checkpoint());
+    }
+
+    SUBCASE("truncated") {
+        int fd = ::open(ckpt_spec::checkpoint_path, O_RDWR);
+        REQUIRE(fd >= 0);
+        REQUIRE(::ftruncate(fd, 16) == 0);
+        ::close(fd);
+    }
+    SUBCASE("scribbled") {
+        int fd = ::open(ckpt_spec::checkpoint_path, O_RDWR);
+        REQUIRE(fd >= 0);
+        uint64_t junk = 0xDEADBEEF;
+        REQUIRE(::pwrite(fd, &junk, sizeof(junk), 24) == (ssize_t)sizeof(junk));
+        ::close(fd);
+    }
+    SUBCASE("absent") { std::remove(ckpt_spec::checkpoint_path); }
+
+    storage::storage<ckpt_spec> restored;
+    CHECK(restored.restart(ckpt_spec::capacity) == log_bytes);
+    CHECK_FALSE(restored.started_from_checkpoint());
+    REQUIRE(restored.get<user>(a) != nullptr);
+    CHECK(restored.get<user>(a)->balance == 123);
+    wipe_ckpt();
+}
+
+TEST_CASE("checkpoint and restart round-trip repeatedly") {
+    wipe_ckpt();
+    std::vector<record_id> ids;
+    for (int round = 0; round < 4; ++round) {
+        storage::storage<ckpt_spec> table;
+        if (round == 0) CHECK(table.restart(ckpt_spec::capacity) == 0);
+        else CHECK(table.started_from_checkpoint() == false); // not restarted yet
+        if (round > 0) {
+            table.restart(ckpt_spec::capacity);
+            CHECK(table.started_from_checkpoint());
+        }
+        for (int i = 0; i < 50; ++i) ids.push_back(table.create(user{(uint64_t)(round * 100 + i), 1}));
+        CHECK(table.live_bytes() == ids.size() * sizeof(user));
+        REQUIRE(table.checkpoint());
+    }
+    storage::storage<ckpt_spec> final_table;
+    final_table.restart(ckpt_spec::capacity);
+    CHECK(final_table.started_from_checkpoint());
+    CHECK(final_table.live_bytes() == ids.size() * sizeof(user));
+    for (std::size_t i = 0; i < ids.size(); ++i)
+        REQUIRE(final_table.get<user>(ids[i]) != nullptr);
+    wipe_ckpt();
+}

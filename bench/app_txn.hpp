@@ -358,6 +358,22 @@ namespace app {
         return table.recover(last_commit_end);
     }
 
+    // Puts the secondary indexes back after a checkpoint restart, in one pass
+    // over the live records. The engine's own state came back without
+    // replaying anything; this is the part that still has to be paid for,
+    // and it costs live data rather than log.
+    template <typename spec>
+    std::size_t rebuild_indexes(table_t<spec>& table) {
+        schema_index fresh;
+        std::size_t seen = 0;
+        table.for_each_raw([&](typename table_t<spec>::raw_view rv) {
+            fresh.index_existing(rv.id, rv.tag, rv.bytes.data());
+            ++seen;
+        });
+        table.observer_state() = std::move(fresh);
+        return seen;
+    }
+
     // ---- queries, to show what the indexes are for ----------------------
 
     template <typename spec>

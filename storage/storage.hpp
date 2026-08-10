@@ -224,7 +224,8 @@ namespace storage {
     // log), so one bound genuinely covers both - at the price of reserving
     // 2 * capacity of disk.
     template <durability level_v = durability::shared, fixed_string path_v = fixed_string(""), std::size_t capacity_v = 16ull * 1024 * 1024,
-              fixed_string data_path_v = fixed_string(""), fixed_string index_path_v = fixed_string("")>
+              fixed_string data_path_v = fixed_string(""), fixed_string index_path_v = fixed_string(""),
+              fixed_string checkpoint_path_v = fixed_string("")>
     struct storage_spec {
         static constexpr durability level = level_v;
         static constexpr auto path = path_v;
@@ -249,7 +250,41 @@ namespace storage {
         // an explicit data_path_v wins over the derived name.
         static constexpr auto derived_data_path = with_data_suffix<path_v>();
         static constexpr const char* data_path = data_path_v.value[0] ? data_path_v.value : derived_data_path.data();
+
+        // Empty (the default) means recover() always replays the log, as it
+        // always has. Naming a path turns on the fast-restart path - see
+        // storage::checkpoint().
+        //
+        // It requires index_path, because a heap index cannot survive the
+        // process and there would be nothing to restart from.
+        static constexpr const char* checkpoint_path = checkpoint_path_v.value;
+        static constexpr bool fast_restart = checkpoint_path_v.value[0] != '\0';
+        static_assert(!fast_restart || index_path_v.value[0] != '\0',
+                      "a checkpoint needs the index on disk too - give the spec an index_path");
+        static_assert(!fast_restart || level_v == durability::local_sync,
+                      "a checkpoint only means anything for durability::local_sync, which owns its files");
     };
+
+    // What a checkpoint records: the exact position at which the log, the
+    // materialized records and the index were all made durable together.
+    // Written last and atomically, so it can only exist once everything it
+    // describes is already on disk.
+    struct checkpoint_record {
+        uint64_t magic;             // 8, offset 0
+        uint32_t version;           // 4, offset 8
+        uint32_t reserved;          // 4, offset 12
+        uint64_t write_offset;      // 8, offset 16 - the log's end
+        uint64_t data_offset;       // 8, offset 24
+        uint64_t live_byte_count;   // 8, offset 32
+        uint64_t next_id;           // 8, offset 40
+        uint64_t index_count;       // 8, offset 48
+        uint32_t tail_crc;          // 4, offset 56 - of the log bytes just before write_offset
+        uint32_t checksum;          // 4, offset 60 - over everything above
+    };
+    static_assert(sizeof(checkpoint_record) == 64);
+    inline constexpr uint64_t checkpoint_magic = 0x4b50435f45524f54ull;
+    inline constexpr uint32_t checkpoint_version = 1;
+    inline constexpr std::size_t checkpoint_tail_bytes = 4096;
 
     // =====================================================================
     // record_header sits in the file right before its payload. tag is
@@ -344,16 +379,20 @@ namespace storage {
             index_array(const index_array&) = delete;
             index_array& operator=(const index_array&) = delete;
 
-            void map_file(const char* path, std::size_t entries) {
+            // keep_contents is what a checkpoint needs: the index on disk IS
+            // the state being restarted from, so truncating it would throw
+            // away the very thing being preserved. Without a checkpoint the
+            // previous run's contents are meaningless, and dropping them is
+            // what guarantees every slot starts dead.
+            void map_file(const char* path, std::size_t entries, bool keep_contents = false) {
                 close_file();
                 int opened = ::open(path, O_RDWR | O_CREAT, 0644);
                 if (opened < 0) return; // stays on the heap - degraded, not broken
                 const std::size_t bytes = entries * sizeof(index_entry);
-                // Truncate then reserve: truncating drops the previous run's
-                // contents, and blocks reserved by posix_fallocate read back
-                // as zeros, so every slot starts dead without touching (and
-                // therefore faulting in) a single page.
-                if (::ftruncate(opened, 0) != 0 || ::posix_fallocate(opened, 0, bytes) != 0) { ::close(opened); return; }
+                // Reserved blocks read back as zeros, so every slot starts
+                // dead without touching (and therefore faulting in) a page.
+                if (!keep_contents && ::ftruncate(opened, 0) != 0) { ::close(opened); return; }
+                if (::posix_fallocate(opened, 0, bytes) != 0) { ::close(opened); return; }
                 void* m = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, opened, 0);
                 if (m == MAP_FAILED) { ::close(opened); return; }
                 slots = (index_entry*)m;
@@ -387,6 +426,24 @@ namespace storage {
                 if (file_backed) { if (count) std::memset(slots, 0, count * sizeof(index_entry)); }
                 else { heap.clear(); slots = nullptr; capacity = 0; }
                 count = 0;
+            }
+
+            // Only the slots in use - the mapping covers the whole capacity,
+            // and flushing pages nothing was ever written to would be pure
+            // waste at any realistic index size.
+            void sync() noexcept {
+                if (!file_backed || !count) return;
+                ::msync(slots, (count * sizeof(index_entry) + 4095) & ~std::size_t(4095), MS_SYNC);
+            }
+
+            bool on_disk() const noexcept { return file_backed; }
+
+            // Adopts a count from a checkpoint: the slots below it are already
+            // in the mapping, so nothing has to be replayed to reach them.
+            bool restore_count(std::size_t n) noexcept {
+                if (!file_backed || n > capacity) return false;
+                count = n;
+                return true;
             }
 
         private:
@@ -435,7 +492,7 @@ namespace storage {
                 base = shared_base;
                 data_base = shared_base;
             }
-            if constexpr (spec::index_on_disk) index.map_file(spec::index_path, spec::index_entries);
+            if constexpr (spec::index_on_disk) index.map_file(spec::index_path, spec::index_entries, spec::fast_restart);
         }
 
         ~storage() {
@@ -673,6 +730,106 @@ namespace storage {
         // nothing past that point is read or applied. For local_sync,
         // file_size is usually obtained via ::stat() on the compile-time
         // known spec::path.
+        // =================================================================
+        // Fast restart.
+        //
+        // recover() replays the log because the log is the only thing on disk
+        // that is trusted. checkpoint() makes the other two trusted as well:
+        // it flushes the log, the materialized records and the index, and only
+        // THEN writes a marker naming the offset at which all three agree.
+        //
+        // The ordering is the whole correctness argument. Everything the
+        // marker describes is durable before the marker exists, and the marker
+        // is written to a temp file, fsynced, and renamed - so a crash at any
+        // point leaves either no marker at all (recover() replays, exactly as
+        // before) or a marker whose contents are already on disk.
+        //
+        // Enabled by spec::checkpoint_path. Without it this is a no-op and
+        // nothing changes.
+        // =================================================================
+        bool checkpoint() noexcept requires (spec::fast_restart) {
+            if (!index.on_disk()) return false;
+
+            // 1. The log. 2. The materialized records - the one place they are
+            // ever flushed; every other day of their life they are a cache
+            // that recover() would rebuild. 3. The index.
+            sync();
+            if (data_offset) ::msync(data_base, (data_offset + page_size - 1) & ~(page_size - 1), MS_SYNC);
+            index.sync();
+
+            checkpoint_record rec{};
+            rec.magic = checkpoint_magic;
+            rec.version = checkpoint_version;
+            rec.write_offset = write_offset;
+            rec.data_offset = data_offset;
+            rec.live_byte_count = live_byte_count;
+            rec.next_id = next_id;
+            rec.index_count = index.size();
+            rec.tail_crc = log_tail_crc(write_offset);
+            rec.checksum = crc32c(&rec, offsetof(checkpoint_record, checksum)) ^ 0xFFFFFFFFu;
+
+            // 4. And only now the marker, atomically.
+            std::string tmp = std::string(spec::checkpoint_path) + ".tmp";
+            int fd_tmp = ::open(tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+            if (fd_tmp < 0) return false;
+            const bool written = ::pwrite(fd_tmp, &rec, sizeof(rec), 0) == (ssize_t)sizeof(rec) && ::fsync(fd_tmp) == 0;
+            ::close(fd_tmp);
+            if (!written) { ::remove(tmp.c_str()); return false; }
+            if (::rename(tmp.c_str(), spec::checkpoint_path) != 0) { ::remove(tmp.c_str()); return false; }
+
+            // The rename itself is only durable once the directory entry is,
+            // which is the step almost everyone forgets.
+            sync_parent_directory(spec::checkpoint_path);
+            return true;
+        }
+
+        // Adopts a checkpoint if there is a consistent one, replaying nothing;
+        // otherwise falls back to recover(). Returns the offset now in effect.
+        //
+        // A checkpoint is accepted ONLY when the log ends exactly where the
+        // marker says. That is deliberately strict: it means nothing was
+        // written after the checkpoint, so the data region and the index on
+        // disk cannot have drifted past it, and there is no delta to replay.
+        // Anything else - a crash after further writes, a compacted log, a
+        // truncated file - falls back to a full replay, which is always
+        // correct.
+        std::size_t restart(std::size_t file_size) requires (spec::fast_restart) {
+            checkpoint_record rec{};
+            if (!read_checkpoint(rec)) return recover(file_size);
+            if (rec.write_offset > file_size) return recover(file_size);
+
+            // The log must end here: the next header must read as a sparse
+            // tail, and the bytes just before must be the ones checkpointed.
+            if (rec.write_offset + sizeof(record_header) <= file_size) {
+                record_header next{};
+                std::memcpy(&next, base + rec.write_offset, sizeof(next));
+                if (next.id != 0) return recover(file_size);
+            }
+            if (log_tail_crc(rec.write_offset) != rec.tail_crc) return recover(file_size);
+            if (!index.restore_count((std::size_t)rec.index_count)) return recover(file_size);
+
+            write_offset = (std::size_t)rec.write_offset;
+            last_synced = write_offset;
+            data_offset = (std::size_t)rec.data_offset;
+            live_byte_count = (std::size_t)rec.live_byte_count;
+            next_id = (record_id)rec.next_id;
+            last_record_offset = no_record; // the record it would point at was another run's
+            restarted_from_checkpoint = true;
+            return write_offset;
+        }
+
+        // Whether the last restart() adopted a checkpoint or fell back to
+        // replaying. Worth exposing: "my start was fast" is a fact a caller
+        // may need, e.g. to decide whether its own derived state is still
+        // valid or has to be rebuilt.
+        bool started_from_checkpoint() const noexcept { return restarted_from_checkpoint; }
+
+        // Invalidates any checkpoint on disk. Compaction rewrites the log, so
+        // every offset a checkpoint records becomes meaningless - and the
+        // tail_crc check would catch it anyway, but removing the file says so
+        // outright instead of relying on a mismatch.
+        void discard_checkpoint() noexcept requires (spec::fast_restart) { ::remove(spec::checkpoint_path); }
+
         // file_size is the LOG's size. The data file is not inspected at all
         // - whatever a crash left in it is stale by definition, and this
         // scan rewrites it from offset 0 as each CREATE is replayed.
@@ -1156,6 +1313,36 @@ namespace storage {
 
         std::byte* record_ptr(record_id id) const noexcept { return data_base + index[id].offset; }
 
+        // CRC of the last few KB before `end`, which is what binds a
+        // checkpoint to the log it was taken from: a compacted or rewritten
+        // log has different bytes there even at the same offset.
+        uint32_t log_tail_crc(std::size_t end) const noexcept {
+            const std::size_t len = end < checkpoint_tail_bytes ? end : checkpoint_tail_bytes;
+            return crc32c(base + end - len, len) ^ 0xFFFFFFFFu;
+        }
+
+        bool read_checkpoint(checkpoint_record& out) const noexcept {
+            int cf = ::open(spec::checkpoint_path, O_RDONLY);
+            if (cf < 0) return false;
+            const bool got = ::pread(cf, &out, sizeof(out), 0) == (ssize_t)sizeof(out);
+            ::close(cf);
+            if (!got || out.magic != checkpoint_magic || out.version != checkpoint_version) return false;
+            return (crc32c(&out, offsetof(checkpoint_record, checksum)) ^ 0xFFFFFFFFu) == out.checksum;
+        }
+
+        // A rename is not durable until the directory entry naming it is.
+        // Skipping this is the classic way to lose a file that fsync() said
+        // was safe.
+        static void sync_parent_directory(const char* path) noexcept {
+            std::string dir(path);
+            const std::size_t slash = dir.find_last_of('/');
+            dir = (slash == std::string::npos) ? std::string(".") : dir.substr(0, slash ? slash : 1);
+            int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+            if (dfd < 0) return;
+            ::fsync(dfd);
+            ::close(dfd);
+        }
+
         // An unsplit storage's index aliases the log, so patching a field
         // rewrites bytes its CREATE's checksum covers - leave it stale and
         // the next recover() stops dead at that record. A split storage
@@ -1276,6 +1463,7 @@ namespace storage {
         std::size_t write_offset = 0;
         std::size_t last_synced = 0;
         std::size_t last_record_offset = no_record; // start of the newest record in the log
+        bool restarted_from_checkpoint = false;
 
         // The materialized records. A separate file only when split_regions;
         // otherwise it aliases base and data_offset stays 0, because nothing

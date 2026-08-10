@@ -94,6 +94,51 @@
 // the log.
 //
 // ---------------------------------------------------------------------------
+// WHERE THE TIME ACTUALLY GOES. Throughput says who won; hardware counters say
+// why. One engine at a time, pinned to a P-core, 1.5M ops per run
+// (500k insert + 500k read + 500k update):
+//
+//   taskset -c 0 perf stat -e cpu_core/cycles/u,cpu_core/instructions/u,\
+//       cpu_core/branch-misses/u,cpu_core/cache-misses/u,task-clock,page-faults \
+//       ./kv_comparison ours nosync
+//
+//   no fsync    task-ms      cycles   IPC  branch-miss  cache-miss  pgfaults
+//   ours             94   131984808  0.88        92316     3200365     30011
+//   lmdb           2007  3632467137  1.24     30164978    45166376      3935
+//   rocksdb        3490 14032490649  2.79     38698914    57791051     26847
+//
+//   fsync/batch task-ms      cycles   IPC  branch-miss  cache-miss  pgfaults
+//   ours           1091   327674888  0.38        99062     5892717    327365
+//   lmdb          11136  4374893048  1.03     29238828    83765973      4302
+//   rocksdb        3737 14300864044  2.81     38289258    58106589     26850
+//
+// Per operation, no fsync:
+//                    cycles   branch-misses   cache-misses
+//   ours                 88           0.06           2.1
+//   lmdb               2421          20.1           30.1
+//   rocksdb            9355          25.8           38.5
+//
+// Three things worth reading twice:
+//
+// 1. Branch misses differ by 300-400x, and that is the whole "general-purpose
+//    machinery costs something" story in one number. Descending a B+tree or
+//    searching LSM levels is data-dependent, branchy code. Indexing an array
+//    by a record id is not.
+//
+// 2. IPC is INVERTED. Ours has the WORST instructions-per-cycle (0.88) and
+//    RocksDB the best (2.79) - while needing 106x fewer cycles. High IPC means
+//    the CPU is kept busy, not that the program is fast. Ours is low because
+//    there is almost nothing to do between cache misses: look up an offset,
+//    copy a field, bump a pointer.
+//
+// 3. RocksDB is CPU-bound; we are I/O-bound. Turning durability on costs
+//    RocksDB 7% (3490 -> 3737 ms) because its fsync hides behind work it was
+//    doing anyway. It costs us 11x (94 -> 1091 ms) because we were not doing
+//    any. So our durable throughput is a property of the DEVICE and theirs is
+//    a property of their own overhead - which is also why the durable columns
+//    swing so much here and theirs do not.
+//
+// ---------------------------------------------------------------------------
 // The original diagnosis, kept because it is what led to the fix
 // (bench/probe_inplace_update_cost.cpp, btrfs, 200k updates, 200 flushes):
 //
@@ -177,6 +222,7 @@ using bench_spec = storage::storage_spec<storage::durability::local_sync, "kvben
 
 void bench_ours(bool sync_per_batch) {
     std::remove("kvbench_ours.db");
+    std::remove("kvbench_ours.db.data");
     const char* dur = sync_per_batch ? "fsync/batch" : "no fsync";
     {
         storage::storage<bench_spec> table;
@@ -213,6 +259,7 @@ void bench_ours(bool sync_per_batch) {
         row("ours", "random update", dur, n_records, secs(t4, t5));
     }
     std::remove("kvbench_ours.db");
+    std::remove("kvbench_ours.db.data");
 }
 
 // =========================================================================
@@ -368,20 +415,33 @@ void bench_rocksdb(bool sync_per_batch) {
 
 } // namespace
 
-int main() {
-    std::printf("records=%zu  value=%zu bytes  batch=%zu ops per durability flush\n\n",
-                n_records, value_bytes, batch_size);
-    std::printf("%-14s %-16s %-12s %10s      %8s  %12s\n", "engine", "phase", "durability", "ops", "time", "throughput");
-    std::printf("%s\n", std::string(88, '-').c_str());
+int main(int argc, char** argv) {
+    // Engine and durability selection, so `perf stat` can be pointed at ONE
+    // engine doing ONE thing. Measuring the whole binary would just report
+    // the average of three unrelated programs.
+    //   kv_comparison [ours|lmdb|rocksdb|all] [nosync|sync|both]
+    const std::string engine = argc > 1 ? argv[1] : "all";
+    const std::string mode = argc > 2 ? argv[2] : "both";
+    const bool quiet = (engine != "all");
+
+    if (!quiet) {
+        std::printf("records=%zu  value=%zu bytes  batch=%zu ops per durability flush\n\n",
+                    n_records, value_bytes, batch_size);
+        std::printf("%-14s %-16s %-12s %10s      %8s  %12s\n", "engine", "phase", "durability", "ops", "time", "throughput");
+        std::printf("%s\n", std::string(88, '-').c_str());
+    }
 
     for (bool sync : {false, true}) {
-        std::printf("\n--- durability: %s ---\n", sync ? "fsync per batch" : "no fsync");
-        bench_ours(sync);
-        bench_lmdb(sync);
+        if (mode == "nosync" && sync) continue;
+        if (mode == "sync" && !sync) continue;
+        if (!quiet) std::printf("\n--- durability: %s ---\n", sync ? "fsync per batch" : "no fsync");
+        if (engine == "all" || engine == "ours") bench_ours(sync);
+        if (engine == "all" || engine == "lmdb") bench_lmdb(sync);
 #ifdef HAVE_ROCKSDB
-        bench_rocksdb(sync);
+        if (engine == "all" || engine == "rocksdb") bench_rocksdb(sync);
 #else
-        if (sync) std::printf("%-14s (not built - rebuild with -DHAVE_ROCKSDB -lrocksdb)\n", "rocksdb");
+        if (engine == "rocksdb") { std::printf("rocksdb not built - rebuild with -DHAVE_ROCKSDB -lrocksdb\n"); return 1; }
+        if (engine == "all" && sync) std::printf("%-14s (not built - rebuild with -DHAVE_ROCKSDB -lrocksdb)\n", "rocksdb");
 #endif
     }
     return 0;

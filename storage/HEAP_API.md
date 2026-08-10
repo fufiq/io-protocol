@@ -196,6 +196,57 @@ Two different operations, not interchangeable:
   reclaimed on the next compaction. `id` itself never changes, so any other
   record referencing it by id stays valid.
 
+## 4b. Observing the write stream
+
+Secondary indexes are not this engine's job - but making them *recoverable*
+is, and that needs one thing from the engine: a single place where a record
+becomes state, reached identically by a live write, by `recover()`, and by
+replication's `apply_wal_range()`. That place is `apply()`, and an observer
+is called from it:
+
+```cpp
+struct balance_index {
+    std::multimap<uint64_t, storage::record_id> by_balance;
+
+    void on_record(auto& table, const storage::record_header& hdr, const std::byte* payload) {
+        // The storage still holds the PREVIOUS state here, so whatever this
+        // record currently indexes is the entry to retract.
+        if (const user* previous = table.template get<user>(hdr.id))
+            retract(previous->balance, hdr.id);
+        ...
+    }
+};
+
+storage::storage<accounts_spec, balance_index> accounts;
+accounts.observer_state().by_balance;   // your index, fed by the engine
+```
+
+- It runs **before** the record is applied, so `get<T>(hdr.id)` yields the
+  value about to be replaced or removed. The new value is in `payload`,
+  already checksum-verified.
+- Every reason to refuse a record is checked first, so a record the observer
+  sees is guaranteed to be applied.
+- The default is `null_observer`, which is empty and marked
+  `[[no_unique_address]]` - it costs no space and inlines to nothing.
+- It fires on a replica too, because replication ingest goes through the same
+  `apply()`. An index maintained this way is maintained on the replica for
+  free.
+
+### Catching an index up instead of rebuilding it
+
+```cpp
+std::size_t stopped = table.for_each_record(my_saved_offset, [&](const storage::record_header& hdr,
+                                                                 std::span<const std::byte> payload) {
+    ... // fold into my index; return false to stop early
+});
+```
+
+Walks the verified records of a log range and hands each to you **without
+applying anything** - `for_each_raw`'s sibling for a delta rather than a whole
+state. Pair it with `current_offset()`: persist "my index reflects the log
+through offset X" and replay only what came after, instead of rebuilding from
+scratch on every start.
+
 ## 5. Durability and checksums
 
 - Every record carries a CRC32C (hardware, SSE4.2) in its header.

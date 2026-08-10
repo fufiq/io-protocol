@@ -8,6 +8,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <map>
 
 // No `using namespace storage;` here: the namespace and the class template
 // share the name, so an unqualified `storage::storage<>` would be ambiguous.
@@ -897,4 +898,208 @@ TEST_CASE("a corrupted UPDATE payload is still rejected") {
     CHECK(restored.recover(split_spec::capacity) == after_create); // the CREATE survived, the UPDATE did not
     REQUIRE(restored.get<user>(a) != nullptr);
     CHECK(restored.get<user>(a)->balance == 500); // pre-update value, not the corrupted one
+}
+
+// =====================================================================
+// The observer: one application point for live writes, recovery and
+// replication ingest. This is what makes a secondary index maintained
+// ABOVE the engine recoverable - the same code runs in all three cases,
+// so the index cannot drift from the data it indexes.
+// =====================================================================
+namespace {
+
+// A secondary index kept entirely outside the engine: balance -> ids.
+struct balance_index {
+    std::multimap<uint64_t, record_id> by_balance;
+    int creates = 0, updates = 0, destroys = 0;
+
+    void on_record(auto& table, const storage::record_header& hdr, const std::byte* payload) {
+        // The storage still holds the PREVIOUS state here, so whatever the
+        // record currently indexes is the entry to retract.
+        const user* previous = table.template get<user>(hdr.id);
+        if (previous) retract(previous->balance, hdr.id);
+
+        switch (hdr.op) {
+            case storage::record_op::create: {
+                user fresh{};
+                std::memcpy(&fresh, payload, sizeof(fresh));
+                by_balance.emplace(fresh.balance, hdr.id);
+                ++creates;
+                break;
+            }
+            case storage::record_op::update: {
+                uint64_t balance = previous ? previous->balance : 0;
+                if (hdr.offset == offsetof(user, balance)) std::memcpy(&balance, payload, sizeof(balance));
+                by_balance.emplace(balance, hdr.id);
+                ++updates;
+                break;
+            }
+            case storage::record_op::destroy:
+                ++destroys; // already retracted above
+                break;
+        }
+    }
+
+    void retract(uint64_t key, record_id id) {
+        auto [lo, hi] = by_balance.equal_range(key);
+        for (auto it = lo; it != hi; ++it)
+            if (it->second == id) { by_balance.erase(it); return; }
+    }
+};
+
+using observed_spec = storage::storage_spec<storage::durability::local_sync, "test_observed.db", 4ull * 1024 * 1024>;
+using observed_storage = storage::storage<observed_spec, balance_index>;
+
+} // namespace
+
+TEST_CASE("an observer rebuilt by recovery matches the one built by live writes") {
+    std::remove(observed_spec::path.value);
+    std::remove(observed_spec::data_path);
+
+    std::multimap<uint64_t, record_id> live_index;
+    int live_creates, live_updates, live_destroys;
+    std::size_t log_bytes;
+    std::vector<record_id> ids;
+    {
+        observed_storage table;
+        for (int i = 0; i < 60; ++i) ids.push_back(table.create(user{(uint64_t)(i * 10), (uint32_t)i}));
+        for (int i = 0; i < 60; i += 3) table.update<&user::balance>(ids[i], 500000 + i);
+        for (int i = 0; i < 60; i += 4) table.update<&user::age>(ids[i], 77); // a field the index does not key on
+        for (int i = 0; i < 60; i += 7) table.destroy(ids[i]);
+        table.recreate(ids[1], user{31337, 5});
+        table.sync();
+
+        live_index = table.observer_state().by_balance;
+        live_creates = table.observer_state().creates;
+        live_updates = table.observer_state().updates;
+        live_destroys = table.observer_state().destroys;
+        log_bytes = table.current_offset();
+    }
+
+    // Nothing but the log survives. The observer must land in the same place.
+    observed_storage restored;
+    CHECK(restored.recover(observed_spec::capacity) == log_bytes);
+
+    CHECK(restored.observer_state().by_balance == live_index);
+    CHECK(restored.observer_state().creates == live_creates);
+    CHECK(restored.observer_state().updates == live_updates);
+    CHECK(restored.observer_state().destroys == live_destroys);
+
+    // And the index actually agrees with the data it indexes.
+    CHECK_FALSE(live_index.empty());
+    for (auto [balance, id] : restored.observer_state().by_balance) {
+        const user* u = restored.get<user>(id);
+        REQUIRE(u != nullptr);
+        CHECK(u->balance == balance);
+    }
+    int live_records = 0;
+    restored.for_each<user>([&](record_id, const user&) { ++live_records; });
+    CHECK((int)restored.observer_state().by_balance.size() == live_records);
+
+    std::remove(observed_spec::path.value);
+    std::remove(observed_spec::data_path);
+}
+
+TEST_CASE("the observer sees the pre-record state, so an index can retract") {
+    std::remove(observed_spec::path.value);
+    std::remove(observed_spec::data_path);
+    observed_storage table;
+
+    record_id id = table.create(user{100, 1});
+    CHECK(table.observer_state().by_balance.count(100) == 1);
+
+    table.update<&user::balance>(id, 200);
+    CHECK(table.observer_state().by_balance.count(100) == 0); // old entry retracted
+    CHECK(table.observer_state().by_balance.count(200) == 1);
+
+    table.destroy(id);
+    CHECK(table.observer_state().by_balance.empty());
+
+    std::remove(observed_spec::path.value);
+    std::remove(observed_spec::data_path);
+}
+
+TEST_CASE("a default-observer storage costs nothing in size") {
+    // [[no_unique_address]] on the observer - the empty default must not
+    // grow the storage, or every existing user pays for a hook they do not use.
+    CHECK(sizeof(storage::storage<>) == sizeof(storage::storage<storage::storage_spec<>, storage::null_observer>));
+}
+
+TEST_CASE("for_each_record walks a delta without applying anything") {
+    fixture f;
+    for (int i = 0; i < 5; ++i) f.table.create(user{(uint64_t)i, (uint32_t)i});
+    const std::size_t mark = f.table.current_offset();
+
+    auto a = f.table.create(user{100, 1});
+    f.table.update<&user::balance>(a, 999);
+    f.table.destroy(a);
+    const std::size_t end = f.table.current_offset();
+
+    std::vector<storage::record_op> seen;
+    std::vector<record_id> seen_ids;
+    std::size_t stopped = f.table.for_each_record(mark, end, [&](const storage::record_header& hdr, std::span<const std::byte> bytes) {
+        seen.push_back(hdr.op);
+        seen_ids.push_back(hdr.id);
+        if (hdr.op == storage::record_op::update) CHECK(bytes.size() == sizeof(uint64_t));
+    });
+
+    CHECK(stopped == end);
+    REQUIRE(seen.size() == 3);
+    CHECK(seen[0] == storage::record_op::create);
+    CHECK(seen[1] == storage::record_op::update);
+    CHECK(seen[2] == storage::record_op::destroy);
+    for (auto id : seen_ids) CHECK(id == a);
+
+    // Walking must not have changed anything.
+    CHECK(f.table.current_offset() == end);
+    CHECK(f.table.get<user>(a) == nullptr);
+
+    // The one-argument form walks from a mark to now.
+    int count = 0;
+    f.table.for_each_record(mark, [&](const storage::record_header&, std::span<const std::byte>) { ++count; });
+    CHECK(count == 3);
+}
+
+TEST_CASE("for_each_record stops early when the callback says so") {
+    fixture f;
+    for (int i = 0; i < 10; ++i) f.table.create(user{(uint64_t)i, (uint32_t)i});
+    int seen = 0;
+    f.table.for_each_record(0, [&](const storage::record_header&, std::span<const std::byte>) {
+        return ++seen < 4;
+    });
+    CHECK(seen == 4);
+}
+
+TEST_CASE("an UPDATE whose diff falls outside its record is refused") {
+    // The checksum only proves the bytes are the ones that were sent. For a
+    // replica they were sent by a primary that may be compromised or buggy,
+    // so the diff's range has to be checked against the record it patches.
+    std::vector<std::byte> region(region_bytes);
+    record_id id;
+    std::size_t written;
+    {
+        storage::storage<> t(region.data());
+        id = t.create(user{4242, 7});
+        written = t.current_offset();
+    }
+
+    // Hand-craft an UPDATE that writes 8 bytes starting well past the record.
+    std::vector<std::byte> hostile(sizeof(storage::record_header) + sizeof(uint64_t));
+    uint64_t poison = 0xBADC0FFEE0DDF00Dull;
+    storage::record_header hdr{ id, (uint32_t)(sizeof(user) + 4096), (uint32_t)sizeof(poison), storage::record_op::update, 0, 0 };
+    hdr.checksum = storage::checksum_of(hdr, &poison, sizeof(poison));
+    std::memcpy(hostile.data(), &hdr, sizeof(hdr));
+    std::memcpy(hostile.data() + sizeof(hdr), &poison, sizeof(poison));
+
+    storage::storage<> t(region.data());
+    t.recover(written);
+    const std::size_t before = t.current_offset();
+    t.apply_wal_range(hostile.data(), hostile.size());
+
+    // The record is copied into the log (it is well-formed and verifies),
+    // but it must not have been applied anywhere.
+    CHECK(t.current_offset() > before);
+    REQUIRE(t.get<user>(id) != nullptr);
+    CHECK(t.get<user>(id)->balance == 4242);
+    CHECK(t.get<user>(id)->age == 7);
 }

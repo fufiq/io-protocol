@@ -270,13 +270,35 @@ namespace storage {
     }
 
     // =====================================================================
+    // An observer is told about every record the storage applies - from a
+    // live create/update/destroy, from recover(), and from replication's
+    // apply_wal_range(), all through the SAME call. That sameness is the
+    // point: a secondary index maintained here is maintained identically
+    // when the log is replayed at startup or shipped to a replica, so it
+    // cannot drift from the data it indexes.
+    //
+    // It runs BEFORE the record is applied, so the storage still holds the
+    // PREVIOUS state: get<T>(hdr.id) yields the value about to be replaced
+    // or removed, which is exactly what an index needs in order to retract
+    // its old entry. The new value is in `payload`, already checksum-verified.
+    // The record is guaranteed to be applied after the call returns - every
+    // reason to refuse one is checked first.
+    //
+    // The default sees everything and does nothing; [[no_unique_address]]
+    // means it costs no space and the call inlines to nothing.
+    // =====================================================================
+    struct null_observer {
+        void on_record(auto&, const record_header&, const std::byte*) noexcept {}
+    };
+
+    // =====================================================================
     // storage<spec> - the single storage. No tuple<storage<T>...>, no
     // compile-time type list, no type_id dispatch table. For local_sync it
     // opens and maps its own file (as region<spec> used to); for
     // shared/replicated, base is supplied by the caller - the storage neither
     // opens nor owns it.
     // =====================================================================
-    template <typename spec = storage_spec<>>
+    template <typename spec = storage_spec<>, typename observer = null_observer>
     class storage {
     public:
         // An OFFSET from data_base, not a pointer: a pointer cannot be
@@ -414,11 +436,12 @@ namespace storage {
         template <tagged_aggregate T>
         record_id create(const T& value) {
             record_id id = next_id++;
-            index_entry* slot = reserve(id);
-            if (!slot) return 0; // index full - 0 is never a valid record id
+            // Reserved up front so a refusal costs nothing: apply() would
+            // decline the record anyway, but only after it had been appended
+            // to the log.
+            if (!reserve(id)) return 0; // index full - 0 is never a valid record id
             std::byte* logged = write_record<record_op::create>(id, 0, T::tag, std::as_bytes(std::span{&value, 1}));
-            slot->offset = offset_in_data(materialize(id, T::tag, logged, (uint32_t)sizeof(T)));
-            live_byte_count += sizeof(T);
+            apply(*header_of(logged), logged);
             return id;
         }
 
@@ -427,12 +450,9 @@ namespace storage {
         // bytes become garbage, reclaimed on the next compaction.
         template <tagged_aggregate T>
         record_id recreate(record_id id, const T& value) {
-            index_entry* slot = reserve(id);
-            if (!slot) return 0;
-            if (slot->offset) live_byte_count -= header_of(data_base + slot->offset)->len;
+            if (!reserve(id)) return 0;
             std::byte* logged = write_record<record_op::create>(id, 0, T::tag, std::as_bytes(std::span{&value, 1}));
-            slot->offset = offset_in_data(materialize(id, T::tag, logged, (uint32_t)sizeof(T)));
-            live_byte_count += sizeof(T);
+            apply(*header_of(logged), logged);
             return id;
         }
 
@@ -441,20 +461,14 @@ namespace storage {
         void update(record_id id, member_value_t<member> value) {
             if (!alive(id)) return;
             const std::size_t off = member_offset<member>();
-            write_record<record_op::update>(id, (uint32_t)(off), tag_t{0}, std::as_bytes(std::span{&value, 1}));
-            // Direct cast-and-assign instead of memcpy - value is already a
-            // `field` (trivially copyable, standard layout); a C-style cast
-            // on the computed offset, the same idiom used throughout this
-            // file (see header_of()), applied here to a typed field.
-            *(member_value_t<member>*)(record_ptr(id) + off) = value;
-            refresh_after_patch(id);
+            std::byte* logged = write_record<record_op::update>(id, (uint32_t)(off), tag_t{0}, std::as_bytes(std::span{&value, 1}));
+            apply(*header_of(logged), logged);
         }
 
         void destroy(record_id id) {
             if (!alive(id)) return;
-            write_record<record_op::destroy>(id, 0, tag_t{0}, {});
-            live_byte_count -= header_of(record_ptr(id))->len;
-            index[id].offset = 0;
+            std::byte* logged = write_record<record_op::destroy>(id, 0, tag_t{0}, {});
+            apply(*header_of(logged), logged);
         }
 
         template <tagged_aggregate T>
@@ -478,33 +492,79 @@ namespace storage {
             }
         }
 
-        // Applies a single WAL record during replay. Never interprets the
-        // payload (tag is ignored) - it only moves bytes by offset/len, so
-        // one method covers every type at once, generically.
-        void apply(const record_header& hdr, const std::byte* data) {
+        // THE single point where a record becomes state. Live writes reach it
+        // by appending to the log and handing back the record they just wrote;
+        // recover() and apply_wal_range() reach it by verifying bytes off the
+        // disk or the wire. Never interprets the payload (tag is ignored) - it
+        // only moves bytes by offset/len, so one method covers every type.
+        // hdr BY VALUE, deliberately. A reference would point into the log
+        // mapping, and every store below goes through a std::byte*, which is
+        // allowed to alias anything - so the compiler would have to reload
+        // hdr.id/op/offset/len from memory after each one. Measured on random
+        // updates: 9.2M ops/s with a reference, 32.2M with a copy of the same
+        // 24 bytes. Same reason record_ptr() is hoisted into `rec` instead of
+        // being called twice: the second call would reload index[id].
+        void apply(record_header hdr, const std::byte* data) {
+            // Every reason to refuse comes first, so that by the time the
+            // observer is called the record is certain to be applied.
+            index_entry* slot = nullptr;
+            std::byte* rec = nullptr;
+            if (hdr.op == record_op::create) {
+                slot = reserve(hdr.id);
+                if (!slot) return; // id beyond a file-backed index's capacity
+            } else {
+                if (!alive(hdr.id)) return; // dead or never existed
+                rec = record_ptr(hdr.id);
+                // A diff has to land inside the record it claims to patch.
+                // Nothing upstream guarantees that: the checksum only proves
+                // the bytes are the ones that were sent, and for a replica
+                // they were sent by a primary that may be compromised or
+                // simply buggy (see tests/fuzz/fuzz_wal_apply_range.cpp).
+                if (hdr.op == record_op::update &&
+                    (std::size_t)hdr.offset + hdr.len > header_of(rec)->len) return;
+            }
+
+            obs.on_record(*this, hdr, data);
+
             switch (hdr.op) {
-                case record_op::create: {
-                    index_entry* slot = reserve(hdr.id);
-                    if (!slot) break; // id beyond a file-backed index's capacity - record refused, not written past the end
+                case record_op::create:
                     if (slot->offset) live_byte_count -= header_of(data_base + slot->offset)->len;
                     slot->offset = offset_in_data(materialize(hdr.id, hdr.tag, data, hdr.len));
                     live_byte_count += hdr.len;
                     break;
-                }
                 case record_op::update:
-                    if (alive(hdr.id)) {
-                        std::memcpy(record_ptr(hdr.id) + hdr.offset, data, hdr.len);
-                        refresh_after_patch(hdr.id);
-                    }
+                    copy_field(rec + hdr.offset, data, hdr.len);
+                    refresh_after_patch(hdr.id);
                     break;
                 case record_op::destroy:
-                    if (alive(hdr.id)) {
-                        live_byte_count -= header_of(record_ptr(hdr.id))->len;
-                        index[hdr.id].offset = 0;
-                    }
+                    live_byte_count -= header_of(rec)->len;
+                    index[hdr.id].offset = 0;
                     break;
             }
         }
+
+        // Walks the verified records of [from, to) and hands each to fn
+        // WITHOUT applying anything - the sibling of for_each_raw for a
+        // delta rather than a whole state. This is what a layer above uses
+        // to catch its own persisted index up to the storage ("my index
+        // reflects the log through offset Y, the storage is at X, give me
+        // what is in between") instead of rebuilding it from scratch on
+        // every start.
+        //
+        // fn may return void, or bool to stop early. Returns the offset it
+        // stopped at, which for a clean walk is `to` rounded down to the
+        // last whole record.
+        std::size_t for_each_record(std::size_t from, std::size_t to, auto&& fn) const {
+            return scan(base, from, to, [&](const record_header& hdr, const std::byte* payload) {
+                if constexpr (std::is_void_v<decltype(fn(hdr, std::span<const std::byte>{payload, hdr.len}))>) {
+                    fn(hdr, std::span<const std::byte>{payload, hdr.len});
+                    return true;
+                } else {
+                    return fn(hdr, std::span<const std::byte>{payload, hdr.len});
+                }
+            });
+        }
+        std::size_t for_each_record(std::size_t from, auto&& fn) const { return for_each_record(from, write_offset, fn); }
 
         // Strictly sequential scan, stops at the first checksum mismatch -
         // nothing past that point is read or applied. For local_sync,
@@ -514,20 +574,11 @@ namespace storage {
         // - whatever a crash left in it is stale by definition, and this
         // scan rewrites it from offset 0 as each CREATE is replayed.
         std::size_t recover(std::size_t file_size) {
-            std::size_t pos = 0;
             data_offset = 0;
-            while (pos + sizeof(record_header) <= file_size) {
-                record_header hdr;
-                std::memcpy(&hdr, base + pos, sizeof(hdr));
-                if (hdr.id == 0) break; // sparse file tail, not a real record
-                if (pos + sizeof(hdr) + hdr.len > file_size) break; // truncated tail
-
-                uint32_t expected = checksum_of(hdr, base + pos + sizeof(hdr), hdr.len);
-                if (expected != hdr.checksum) break;
-
-                apply(hdr, base + pos + sizeof(hdr));
-                pos += pad8(sizeof(hdr) + hdr.len);
-            }
+            std::size_t pos = scan(base, 0, file_size, [this](record_header hdr, const std::byte* payload) {
+                apply(hdr, payload);
+                return true;
+            });
             write_offset = pos;
             last_synced = pos; // reading an existing file - treat it as already synced
             return pos;
@@ -564,35 +615,21 @@ namespace storage {
         std::size_t apply_wal_range(const std::byte* bytes, std::size_t len) {
             std::memcpy(base + write_offset, bytes, len);
 
-            // Verified against base + write_offset (the just-copied,
-            // guaranteed pad8()-aligned destination) from here on, not
-            // against `bytes` directly - `bytes` is a caller-provided
-            // buffer (a network payload, for replication's actual use)
-            // with no alignment guarantee at all, unlike every other
-            // caller of checksum_of/crc32c in this file. memcpy already
-            // made an identical copy at the aligned destination, so
-            // there's no reason to read the unaligned source a second time
-            // for this.
-            std::size_t pos = 0;
-            while (pos + sizeof(record_header) <= len) {
-                record_header hdr;
-                std::memcpy(&hdr, base + write_offset + pos, sizeof(hdr));
-                if (hdr.id == 0) break;
-                if (pos + sizeof(hdr) + hdr.len > len) break; // truncated tail
-
-                uint32_t expected = checksum_of(hdr, base + write_offset + pos + sizeof(hdr), hdr.len);
-                if (expected != hdr.checksum) break;
-
-                // apply() reads its payload from THIS storage's own region
-                // (base + write_offset + ...), not from `bytes` directly -
-                // the memcpy above already placed it there, and index_
-                // entries must point into this storage's own mmap'd
-                // memory, not into the caller's temporary buffer.
-                apply(hdr, base + write_offset + pos + sizeof(hdr));
-                pos += pad8(sizeof(hdr) + hdr.len);
-            }
-            write_offset += pos;
-            return pos;
+            // Everything below reads the just-copied destination, never
+            // `bytes` directly. Two reasons: `bytes` is a caller-provided
+            // buffer (a network payload, for replication's actual use) with
+            // no alignment guarantee at all, unlike every other caller of
+            // checksum_of/crc32c in this file; and index entries must point
+            // into this storage's own mapped memory, not into the caller's
+            // temporary buffer.
+            const std::size_t end = scan(base, write_offset, write_offset + len,
+                                         [this](record_header hdr, const std::byte* payload) {
+                apply(hdr, payload);
+                return true;
+            });
+            std::size_t consumed = end - write_offset;
+            write_offset = end;
+            return consumed;
         }
 
         // Flushes the LOG, and only the log - the delta since the last
@@ -624,6 +661,12 @@ namespace storage {
             ::msync(base + aligned_start, write_offset - aligned_start, MS_SYNC);
             last_synced = write_offset;
         }
+
+        // The observer instance, so the layer above can reach whatever state
+        // it maintains (its index, its counters) through the storage that
+        // feeds it.
+        observer& observer_state() noexcept { return obs; }
+        const observer& observer_state() const noexcept { return obs; }
 
         std::size_t live_bytes() const noexcept { return live_byte_count; }
 
@@ -837,15 +880,7 @@ namespace storage {
         // the lock (the WAL is immutable in this range: bytes before `to`
         // are never mutated again, only appended past it).
         std::size_t replay_into(std::byte* wal_base, std::size_t from, std::size_t to, snapshot& snap) const {
-            std::size_t pos = from;
-            while (pos + sizeof(record_header) <= to) {
-                record_header hdr;
-                std::memcpy(&hdr, wal_base + pos, sizeof(hdr));
-                if (hdr.id == 0) break;
-                if (pos + sizeof(hdr) + hdr.len > to) break;
-                uint32_t expected = checksum_of(hdr, wal_base + pos + sizeof(hdr), hdr.len);
-                if (expected != hdr.checksum) break;
-
+            return scan(wal_base, from, to, [&](record_header hdr, const std::byte* payload) {
                 switch (hdr.op) {
                     case record_op::create: {
                         // recreate() of the same id: the old range in the
@@ -853,24 +888,23 @@ namespace storage {
                         // (the whole arena is discarded after
                         // finish_compaction - not worth the complexity of
                         // reusing fragments).
-                        std::size_t off = snap.append(wal_base + pos + sizeof(hdr), hdr.len);
-                        if (off == snapshot::npos) return pos; // overflow latched
+                        std::size_t off = snap.append(payload, hdr.len);
+                        if (off == snapshot::npos) return false; // overflow latched
                         snap.set(hdr.id, hdr.tag, off, hdr.len);
                         break;
                     }
                     case record_op::update: {
                         arena_ref* ref = snap.find(hdr.id);
                         if (ref && (std::size_t)(hdr.offset) + hdr.len <= ref->len)
-                            std::memcpy(snap.bytes() + ref->offset + hdr.offset, wal_base + pos + sizeof(hdr), hdr.len);
+                            std::memcpy(snap.bytes() + ref->offset + hdr.offset, payload, hdr.len);
                         break;
                     }
                     case record_op::destroy:
                         snap.erase(hdr.id);
                         break;
                 }
-                pos += pad8(sizeof(hdr) + hdr.len);
-            }
-            return pos;
+                return true;
+            });
         }
 
         // Final step: writes the entire snapshot into scratch as fresh
@@ -887,6 +921,51 @@ namespace storage {
     private:
         static record_header* header_of(std::byte* data) noexcept {
             return (record_header*)(data - sizeof(record_header));
+        }
+        static const record_header* header_of(const std::byte* data) noexcept {
+            return (const record_header*)(data - sizeof(record_header));
+        }
+
+        // An UPDATE's payload is one `field`, so its length is almost always
+        // 1, 2, 4 or 8 - but hdr.len is read from the record at run time, and
+        // a memcpy with a run-time length compiles to the general libc call
+        // with its size-class dispatch. That call is not a rounding error at
+        // this granularity: routing update() through apply() with a plain
+        // memcpy doubled the benchmark's instruction count (102M -> 202M) and
+        // cost 4x on random updates (37.5M -> 8.7M ops/s), for copying eight
+        // bytes. Naming the common sizes lets each one inline to a single
+        // load and store, and the branch is perfectly predicted by any
+        // workload that touches one field repeatedly.
+        static void copy_field(std::byte* dst, const std::byte* src, uint32_t len) noexcept {
+            switch (len) {
+                case 8: std::memcpy(dst, src, 8); return;
+                case 4: std::memcpy(dst, src, 4); return;
+                case 2: std::memcpy(dst, src, 2); return;
+                case 1: *dst = *src; return;
+                default: std::memcpy(dst, src, len); return;
+            }
+        }
+
+        // THE verified walk over a log range, shared by recover(),
+        // apply_wal_range(), replay_into() and for_each_record(). Each of
+        // those used to carry its own copy of this loop - four places that
+        // had to agree about the sparse-tail check, the truncation check,
+        // the checksum and the pad8 stride, and that had already drifted
+        // once. fn returns false to stop; the returned offset is where the
+        // walk stopped, and the record that failed a check (or that fn
+        // rejected) is never counted as consumed.
+        static std::size_t scan(const std::byte* region, std::size_t from, std::size_t to, auto&& fn) {
+            std::size_t pos = from;
+            while (pos + sizeof(record_header) <= to) {
+                record_header hdr;
+                std::memcpy(&hdr, region + pos, sizeof(hdr));
+                if (hdr.id == 0) break;                          // sparse tail, not a real record
+                if (pos + sizeof(hdr) + hdr.len > to) break;     // truncated tail
+                if (checksum_of(hdr, region + pos + sizeof(hdr), hdr.len) != hdr.checksum) break;
+                if (!fn(hdr, region + pos + sizeof(hdr))) break;
+                pos += pad8(sizeof(hdr) + hdr.len);
+            }
+            return pos;
         }
 
         // Where index[id].data should point for a CREATE whose payload has
@@ -1096,6 +1175,7 @@ namespace storage {
         std::byte* data_base = nullptr;
         std::size_t data_offset = 0;
 
+        [[no_unique_address]] observer obs{};
         std::size_t live_byte_count = 0;
         record_id next_id = 1;
         int fd = -1;
@@ -1179,13 +1259,13 @@ namespace storage {
     // file is renamed into place like the log purely so the on-disk state
     // keeps matching spec::data_path - nothing reads it across a restart.
     // =====================================================================
-    template <typename spec>
-    void background_compact(storage<spec>& table, std::mutex& mu,
+    template <typename spec, typename observer>
+    void background_compact(storage<spec, observer>& table, std::mutex& mu,
                             const char* tmp_path, const char* live_path,
                             std::size_t scratch_capacity,
                             const char* tmp_data_path = nullptr, const char* live_data_path = nullptr,
                             int max_catchup_rounds = 5, std::size_t catchup_threshold_bytes = 4096) {
-        typename storage<spec>::snapshot snapshot;
+        typename storage<spec, observer>::snapshot snapshot;
         // The snapshot's two files are derived from tmp_path and unlinked as
         // soon as they are mapped, so they need no cleanup and cannot be left
         // behind. Sizing the arena at scratch_capacity is the same bound the
@@ -1228,7 +1308,7 @@ namespace storage {
         bool switched_over = false;
         int tmp_data_fd = -1;
         std::byte* scratch_data = nullptr;
-        if constexpr (storage<spec>::split_regions) {
+        if constexpr (storage<spec, observer>::split_regions) {
             tmp_data_fd = ::open(tmp_data_path, O_RDWR | O_CREAT, 0644);
             ::posix_fallocate(tmp_data_fd, 0, scratch_capacity);
             scratch_data = (std::byte*)(::mmap(nullptr, scratch_capacity, PROT_READ | PROT_WRITE, MAP_SHARED, tmp_data_fd, 0));
@@ -1250,7 +1330,7 @@ namespace storage {
             // compaction leaves the storage exactly as it was.
             if (snapshot.overflowed()) { switched_over = false; }
             else {
-                if constexpr (storage<spec>::split_regions) table.finish_compaction(scratch, scratch_data, snapshot);
+                if constexpr (storage<spec, observer>::split_regions) table.finish_compaction(scratch, scratch_data, snapshot);
                 else table.finish_compaction(scratch, snapshot);
                 table.sync();
                 switched_over = true;
@@ -1258,19 +1338,19 @@ namespace storage {
         }
 
         ::close(tmp_fd);
-        if constexpr (storage<spec>::split_regions) ::close(tmp_data_fd);
+        if constexpr (storage<spec, observer>::split_regions) ::close(tmp_data_fd);
 
         if (!switched_over) {
             // Nothing adopted the scratch regions, so this function still
             // owns them, and the temp files are not the live ones.
             ::munmap(scratch, scratch_capacity);
             ::remove(tmp_path);
-            if constexpr (storage<spec>::split_regions) { ::munmap(scratch_data, scratch_capacity); ::remove(tmp_data_path); }
+            if constexpr (storage<spec, observer>::split_regions) { ::munmap(scratch_data, scratch_capacity); ::remove(tmp_data_path); }
             return;
         }
 
         ::rename(tmp_path, live_path);
-        if constexpr (storage<spec>::split_regions) ::rename(tmp_data_path, live_data_path);
+        if constexpr (storage<spec, observer>::split_regions) ::rename(tmp_data_path, live_data_path);
     }
 
 } // namespace storage

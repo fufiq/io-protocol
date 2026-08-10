@@ -117,7 +117,7 @@ namespace replication {
         // snapshot_done, or a resync_request on detected desync) - pass it
         // straight to endpoint.send_message(conn_id, payload,
         // /*reliable=*/true).
-        void on_message(storage::storage<spec>& table, uint32_t msg_id, const std::vector<uint8_t>& data, auto&& send_reply) {
+        void on_message(auto& table, uint32_t msg_id, const std::vector<uint8_t>& data, auto&& send_reply) {
             // Already applied: a retransmit of old news. Dropping it here
             // rather than parking it in `pending` is what keeps the buffer
             // from growing without bound under a peer that retransmits a
@@ -184,7 +184,7 @@ namespace replication {
         std::size_t reorder_buffer_size() const { return pending.size(); }
 
     private:
-        void apply_one(storage::storage<spec>& table, const std::vector<uint8_t>& data, auto&& send_reply) {
+        void apply_one(auto& table, const std::vector<uint8_t>& data, auto&& send_reply) {
             if (data.empty()) return;
             switch ((msg_kind)data[0]) {
                 case msg_kind::wal_batch: apply_wal_batch(table, data, send_reply); break;
@@ -194,7 +194,7 @@ namespace replication {
             }
         }
 
-        void apply_wal_batch(storage::storage<spec>& table, const std::vector<uint8_t>& data, auto&& send_reply) {
+        void apply_wal_batch(auto& table, const std::vector<uint8_t>& data, auto&& send_reply) {
             if (data.size() < 1 + sizeof(uint64_t)) return;
 
             uint64_t from_offset;
@@ -224,7 +224,7 @@ namespace replication {
             incoming_snapshot.insert(incoming_snapshot.end(), data.begin() + 1, data.end());
         }
 
-        void apply_snapshot_done(storage::storage<spec>& table, const std::vector<uint8_t>& data, auto&& send_reply) {
+        void apply_snapshot_done(auto& table, const std::vector<uint8_t>& data, auto&& send_reply) {
             if (data.size() < 1 + sizeof(uint64_t)) return;
             uint64_t resume_offset;
             std::memcpy(&resume_offset, data.data() + 1, sizeof(resume_offset));
@@ -360,7 +360,7 @@ namespace replication {
         // by the caller (ship_snapshot() to each) - the detection is
         // mechanism, the decision to resnapshot, and how often to retry it
         // for a flapping replica, stays policy.
-        std::vector<crypto::public_key> replicas_needing_resync(const storage::storage<spec>& table) const {
+        std::vector<crypto::public_key> replicas_needing_resync(const auto& table) const {
             std::vector<crypto::public_key> out;
             std::size_t current = table.current_offset();
             for (const auto& [replica_key, state] : replicas) {
@@ -388,7 +388,7 @@ namespace replication {
         // hardcoding the default instantiation here would lock replication
         // to endpoints that happen to use the default timeouts - which is
         // exactly wrong for a test or a deployment that tunes them.
-        void ship_snapshot(storage::storage<spec>& table, auto& ep,
+        void ship_snapshot(auto& table, auto& ep,
                            const crypto::public_key& replica_key, std::size_t max_batch_bytes = 64 * 1024) {
             auto it = replicas.find(replica_key);
             if (it == replicas.end() || !it->second.conn_id.has_value()) return;
@@ -426,7 +426,7 @@ namespace replication {
         // different consumer of the same already-written, immutable-once-
         // written bytes. Uses the reliable path: losing a replication
         // chunk is never an acceptable "best effort," it must retransmit.
-        void tick(storage::storage<spec>& table, auto& ep, std::size_t max_batch_bytes = 64 * 1024) {
+        void tick(auto& table, auto& ep, std::size_t max_batch_bytes = 64 * 1024) {
             std::size_t current = table.current_offset();
             for (auto& [replica_key, state] : replicas) {
                 if (!state.conn_id.has_value()) continue; // disconnected - nothing to ship until it reconnects

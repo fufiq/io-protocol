@@ -57,12 +57,52 @@
 //   per transaction. At that point nothing above the engine matters - batch
 //   transactions or accept ~1ms each.
 //
-// * RECOVERY IS THE ONE THAT SHOULD WORRY YOU. 44.9 MB replayed in 0.202 s is
-//   222 MB/s, against roughly 5.8 GB/s for the same replay with no observer
-//   (bench/probe_restart_cost.cpp). Rebuilding the indexes is ~26x the cost of
-//   replaying the log, and it dominates startup completely. This is the
-//   measurement that argues for persisting indexes and replaying only the
-//   delta with for_each_record(), rather than rebuilding from zero each time.
+// ---------------------------------------------------------------------------
+// CRUD AND RECOVERY, LIKE FOR LIKE. The same operations and the same recovery
+// at each layer, 100k records, three runs (the spread across them is what the
+// ranges below show):
+//
+//   op        L0 engine     L1 +indexes         L4 +txn+constraints
+//   create    ~10.2M/s      ~7.8M/s   1.2-1.3x  ~4.6M/s   2.1-2.3x
+//   read      ~87-99M/s     ~83-105M/s  ~1x     ~93-112M/s  ~1x
+//   update    ~53.8M/s      ~20.0M/s  2.6-2.9x  ~7.6M/s   7.0-7.1x
+//   delete    ~41.4M/s      ~24.3M/s  1.7x      ~7.0M/s   5.9x
+//   recovery  ~1930 MB/s    ~870 MB/s 2.2x      ~935 MB/s 4.4-4.5x wall
+//   log size   9.9 MB        9.9 MB   1.0x      21.4 MB   2.15x
+//
+// * READS COST NOTHING. The observer is not on the read path at all, so L0 and
+//   L1 run identical code and the 0.82-1.17x spread is measurement noise on
+//   this machine, not an effect. L4's column reads by KEY through the unique
+//   index rather than by primary id, which is the query an application
+//   actually issues, and it still lands in the same band.
+//
+// * UPDATE IS THE EXPENSIVE ONE, not create - 2.6x against create's 1.3x. On a
+//   create the observer finds nothing to retract and does one hash insert. On
+//   an update it must read the old record, erase its entry, apply the diff to
+//   a copy, and insert the new entry: two hash operations and two record reads
+//   against a raw update that costs 19 ns. The layer's fixed cost simply has
+//   less to hide behind.
+//
+// * A TRANSACTION IS AN EXTRA RECORD. L4's log is 2.15x larger entirely
+//   because of commit markers, and a marker is a full record - it goes through
+//   apply() and the observer like any other. That is most of the gap between
+//   L1's 20M and L4's 7.6M updates: not the constraint checks, the second
+//   write.
+//
+// * RECOVERY, corrected. An earlier version of this file claimed rebuilding
+//   indexes cost ~26x, by comparing 222 MB/s here against ~5.8 GB/s from
+//   probe_restart_cost.cpp. That was two different workloads with two
+//   different record sizes and a warm cache - not a comparison at all. Doing
+//   it properly, by replaying the SAME log twice, once with the observer and
+//   once with the default null_observer:
+//
+//     100k customers, one index touched   1930 -> 870 MB/s    2.2x
+//     the order workload, all 6 indexes   1570 ->  220 MB/s   7.1x
+//
+//   So index rebuilding does dominate startup, and it scales with how many
+//   indexes a record touches rather than with the log - but by 7x, not 26x.
+//   The argument for persisting indexes and replaying only the delta with
+//   for_each_record() still holds; it is just a 7x argument.
 //
 // Build:
 //   g++ -std=c++23 -O3 -march=native -o app_layer_bench bench/app_layer_bench.cpp
@@ -366,6 +406,22 @@ namespace {
         struct ::stat st{};
         ::stat(app_spec::path.value, &st);
 
+        // The SAME log, replayed twice: once with the observer rebuilding all
+        // six indexes, once with the default null_observer. Identical bytes,
+        // identical records, so the difference is index maintenance and
+        // nothing else. (Comparing against probe_restart_cost.cpp instead
+        // would compare two different workloads and two different record
+        // sizes, which is how I first got this wrong by an order of
+        // magnitude.)
+        double plain_seconds = 0;
+        {
+            storage::storage<app_spec> plain;   // default observer: does nothing
+            auto p0 = std::chrono::steady_clock::now();
+            plain.recover((std::size_t)st.st_size);
+            auto p1 = std::chrono::steady_clock::now();
+            plain_seconds = secs(p0, p1);
+        }
+
         table_t<app_spec> restored;
         auto t0 = std::chrono::steady_clock::now();
         std::size_t replayed = recover_to_last_commit(restored, (std::size_t)st.st_size);
@@ -377,8 +433,11 @@ namespace {
         });
 
         const double s = secs(t0, t1);
-        std::printf("\n  recovery: replayed %.1f MB in %.3f s  (%.0f MB/s), rebuilding every index\n",
-                    replayed / 1048576.0, s, replayed / 1048576.0 / s);
+        std::printf("\n  recovery of the SAME log, %.1f MB:\n", replayed / 1048576.0);
+        std::printf("    no observer                    %8.3f s  %8.0f MB/s\n",
+                    plain_seconds, replayed / 1048576.0 / plain_seconds);
+        std::printf("    rebuilding all 6 indexes       %8.3f s  %8.0f MB/s   %.2fx\n",
+                    s, replayed / 1048576.0 / s, s / plain_seconds);
 
         auto check = [](const char* what, std::size_t a, std::size_t b) {
             std::printf("    %-34s live %9zu   recovered %9zu   %s\n", what, a, b, a == b ? "ok" : "MISMATCH");
@@ -392,6 +451,206 @@ namespace {
         std::printf("    %-34s live %9lld   recovered %9lld   %s\n", "total stock (triggers only)",
                     (long long)live_stock_total, (long long)restored_stock_total,
                     live_stock_total == restored_stock_total ? "ok - triggers did NOT re-fire" : "MISMATCH");
+    }
+
+    // -----------------------------------------------------------------
+    // The CRUD matrix: the same four operations and the same recovery, at
+    // each layer, so the cost of the layer is the only difference between
+    // the columns.
+    // -----------------------------------------------------------------
+    struct crud_row {
+        double create = 0, read = 0, update = 0, del = 0;
+        double recover_seconds = 0;
+        std::size_t log_bytes = 0;
+        std::size_t records = 0;
+    };
+
+    constexpr std::size_t n_crud = 100'000;
+
+    crud_row crud_engine() {
+        crud_row r;
+        wipe(plain_spec::path.value);
+        std::vector<record_id> ids;
+        {
+            storage::storage<plain_spec> table;
+            ids.reserve(n_crud);
+
+            auto t0 = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < n_crud; ++i)
+                ids.push_back(table.create(customer{ (uint64_t)i + 1, 1000, 0, 0 }));
+            auto t1 = std::chrono::steady_clock::now();
+            r.create = secs(t0, t1);
+
+            volatile int64_t sink = 0;
+            xorshift rng(3);
+            t0 = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < n_crud; ++i) sink = table.get<customer>(ids[rng.range(n_crud)])->balance;
+            t1 = std::chrono::steady_clock::now();
+            r.read = secs(t0, t1);
+            (void)sink;
+
+            t0 = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < n_crud; ++i) table.update<&customer::balance>(ids[i], (int64_t)i);
+            t1 = std::chrono::steady_clock::now();
+            r.update = secs(t0, t1);
+
+            t0 = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < n_crud; ++i) table.destroy(ids[i]);
+            t1 = std::chrono::steady_clock::now();
+            r.del = secs(t0, t1);
+
+            table.sync();
+            r.log_bytes = table.current_offset();
+        }
+        {
+            storage::storage<plain_spec> restored;
+            auto t0 = std::chrono::steady_clock::now();
+            restored.recover(plain_spec::capacity);
+            auto t1 = std::chrono::steady_clock::now();
+            r.recover_seconds = secs(t0, t1);
+        }
+        wipe(plain_spec::path.value);
+        return r;
+    }
+
+    crud_row crud_indexed() {
+        crud_row r;
+        wipe(app_spec::path.value);
+        std::vector<record_id> ids;
+        {
+            table_t<app_spec> table;
+            ids.reserve(n_crud);
+
+            auto t0 = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < n_crud; ++i)
+                ids.push_back(table.create(customer{ (uint64_t)i + 1, 1000, 0, 0 }));
+            auto t1 = std::chrono::steady_clock::now();
+            r.create = secs(t0, t1);
+
+            volatile int64_t sink = 0;
+            xorshift rng(3);
+            t0 = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < n_crud; ++i) sink = table.get<customer>(ids[rng.range(n_crud)])->balance;
+            t1 = std::chrono::steady_clock::now();
+            r.read = secs(t0, t1);
+            (void)sink;
+
+            t0 = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < n_crud; ++i) table.update<&customer::balance>(ids[i], (int64_t)i);
+            t1 = std::chrono::steady_clock::now();
+            r.update = secs(t0, t1);
+
+            t0 = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < n_crud; ++i) table.destroy(ids[i]);
+            t1 = std::chrono::steady_clock::now();
+            r.del = secs(t0, t1);
+
+            table.sync();
+            r.log_bytes = table.current_offset();
+        }
+        {
+            table_t<app_spec> restored;
+            auto t0 = std::chrono::steady_clock::now();
+            restored.recover(app_spec::capacity);
+            auto t1 = std::chrono::steady_clock::now();
+            r.recover_seconds = secs(t0, t1);
+        }
+        wipe(app_spec::path.value);
+        return r;
+    }
+
+    crud_row crud_full() {
+        crud_row r;
+        wipe(app_spec::path.value);
+        std::vector<record_id> ids;
+        uint64_t txn_id = 1;
+        {
+            table_t<app_spec> table;
+            ids.reserve(n_crud);
+
+            auto t0 = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < n_crud; ++i) {
+                txn<app_spec> tx(table, txn_id++);
+                record_id id = tx.insert_customer(customer{ (uint64_t)i + 1, 1000, 0, 0 });
+                tx.commit(false);
+                ids.push_back(id);
+            }
+            auto t1 = std::chrono::steady_clock::now();
+            r.create = secs(t0, t1);
+
+            // Read by KEY here, which is what an application actually asks
+            // for - the layer's whole reason to exist. The engine columns
+            // read by primary id, which is the fastest thing either can do.
+            volatile record_id sink = 0;
+            xorshift rng(3);
+            t0 = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < n_crud; ++i) sink = find_customer_by_email(table, rng.range(n_crud) + 1);
+            t1 = std::chrono::steady_clock::now();
+            r.read = secs(t0, t1);
+            (void)sink;
+
+            t0 = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < n_crud; ++i) {
+                txn<app_spec> tx(table, txn_id++);
+                tx.update<&customer::balance>(ids[i], (int64_t)i);
+                tx.commit(false);
+            }
+            t1 = std::chrono::steady_clock::now();
+            r.update = secs(t0, t1);
+
+            t0 = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < n_crud; ++i) {
+                txn<app_spec> tx(table, txn_id++);
+                tx.delete_customer(ids[i]);
+                tx.commit(false);
+            }
+            t1 = std::chrono::steady_clock::now();
+            r.del = secs(t0, t1);
+
+            table.sync();
+            r.log_bytes = table.current_offset();
+        }
+        {
+            table_t<app_spec> restored;
+            auto t0 = std::chrono::steady_clock::now();
+            restored.recover(app_spec::capacity);
+            auto t1 = std::chrono::steady_clock::now();
+            r.recover_seconds = secs(t0, t1);
+        }
+        wipe(app_spec::path.value);
+        return r;
+    }
+
+    void crud_matrix() {
+        std::printf("\n  === CRUD and recovery, %zu records, same work at each layer ===\n", n_crud);
+        crud_row e = crud_engine();
+        crud_row i = crud_indexed();
+        crud_row f = crud_full();
+
+        auto line = [&](const char* what, double a, double b, double c) {
+            std::printf("    %-10s %13.0f %13.0f  %5.2fx %13.0f  %5.2fx\n", what,
+                        n_crud / a, n_crud / b, b / a, n_crud / c, c / a);
+        };
+        std::printf("    %-10s %13s %13s %7s %13s %7s\n", "op", "L0 engine", "L1 +indexes", "vs L0", "L4 +txn", "vs L0");
+        std::printf("    %s\n", std::string(76, '-').c_str());
+        line("create", e.create, i.create, f.create);
+        line("read", e.read, i.read, f.read);
+        line("update", e.update, i.update, f.update);
+        line("delete", e.del, i.del, f.del);
+
+        std::printf("\n    %-10s %13s %13s %7s %13s %7s\n", "", "L0 engine", "L1 +indexes", "vs L0", "L4 +txn", "vs L0");
+        std::printf("    %-10s %10.0f MB/s %10.0f MB/s  %5.2fx %10.0f MB/s  %5.2fx\n", "recovery",
+                    e.log_bytes / 1048576.0 / e.recover_seconds,
+                    i.log_bytes / 1048576.0 / i.recover_seconds, i.recover_seconds / e.recover_seconds,
+                    f.log_bytes / 1048576.0 / f.recover_seconds, f.recover_seconds / e.recover_seconds);
+        std::printf("    %-10s %10.3f s    %10.3f s     %5.2fx %10.3f s     %5.2fx\n", "  wall",
+                    e.recover_seconds, i.recover_seconds, i.recover_seconds / e.recover_seconds,
+                    f.recover_seconds, f.recover_seconds / e.recover_seconds);
+        std::printf("    %-10s %10.1f MB   %10.1f MB      %5.2fx %10.1f MB      %5.2fx\n", "  log",
+                    e.log_bytes / 1048576.0, i.log_bytes / 1048576.0, (double)i.log_bytes / e.log_bytes,
+                    f.log_bytes / 1048576.0, (double)f.log_bytes / e.log_bytes);
+        std::printf("    (L4 reads by KEY through the unique index; L0/L1 read by primary id,\n"
+                    "     which is the fastest lookup either of them has)\n");
     }
 
     // -----------------------------------------------------------------
@@ -447,6 +706,7 @@ int main() {
     layer0();
     layer1();
     crash_atomicity();
+    crud_matrix();
 
     wipe(app_spec::path.value);
     {

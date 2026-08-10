@@ -121,6 +121,11 @@ namespace app {
             return note_destroy(id);
         }
 
+        // A field update as a transactional statement: the old bytes go on
+        // the undo log first, so an abort puts them back.
+        template <auto member>
+        bool update(record_id id, storage::member_value_t<member> value) { return update_field<member>(id, value); }
+
         // ---- outcome ----------------------------------------------------
 
         txn_result commit(bool durable) {

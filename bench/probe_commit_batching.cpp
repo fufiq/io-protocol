@@ -11,24 +11,32 @@
 // story is right, ops/sec should scale roughly linearly with the batch while
 // commits/sec stays flat at the device's rate.
 //
-// MEASURED (btrfs, NVMe, full app layer, 800 fsyncs per row, two runs):
+// MEASURED (btrfs, NVMe, full app layer). A transaction here is ONE customer:
+// a 48-byte CREATE plus a 40-byte commit marker, 88 bytes. 800 fsyncs per row.
 //
-//   ops/fsync        ops/sec      fsyncs/sec   ms/fsync
-//           1           1048            1048      0.954
-//           2           2078            1039      0.963
-//           5           5412            1082      0.924
-//          10          10224            1022      0.978
-//          50          46234             925      1.081
-//         100         103506            1035      0.966
-//         500         483394             967      1.034
-//        1000         747916             748      1.337
-//        5000        2252910             451      2.219
+//   ops/fsync        ops/sec   fsyncs/sec   ms/fsync   bytes/fsync
+//           1           1740         1740      0.575            88
+//           2           2339         1170      0.855           176
+//           5           8017         1603      0.624           440
+//          10           9807          981      1.020           880
+//          50          47160          943      1.060          4400
+//         100          89470          895      1.118          8800
+//         500         485871          972      1.029         44000
+//        1000         835882          836      1.196         88000
+//        5000        2248210          450      2.224        440000
 //
-// ops/sec moves by ~2000x across the sweep. fsyncs/sec does not move at all
-// until the very last row: it sits at ~1000 per second, ~1 ms each, which is
-// this device's commit latency and nothing to do with any engine.
+// ops/sec moves by ~1300x across the sweep. fsyncs/sec does not move at all
+// until the last row: it sits near 1000 per second, ~1 ms each, which is this
+// device's commit latency and nothing to do with any engine.
 //
-// That reconciles the two numbers that look contradictory:
+// Read the last column next to the last-but-one. Committing 88 bytes costs
+// 0.575 ms; committing 440000 bytes costs 2.224 ms. Five thousand times the
+// payload for four times the time - the cost of a commit is almost entirely
+// fixed latency, not bytes. That is the whole reason batching buys so much,
+// and it is why "one fsync per transaction" is a policy decision rather than
+// a consequence of transaction size: a transaction here is 88 bytes.
+//
+// It also reconciles the two numbers that look contradictory:
 //
 //   kv_comparison      980301 ops/sec   = 1000 ops per fsync x  980 fsyncs/sec
 //   schema_comparison    1215 ops/sec   =    1 op  per fsync x 1215 fsyncs/sec
@@ -36,10 +44,11 @@
 // Same machine, same engine, same ~1 ms commit. The first number was never a
 // property of the storage engine - it was a property of the batch size.
 //
-// The last row is the one place the batch stops being free: at 5000 records
-// per commit each fsync carries ~360 KB, so the bytes themselves start to
-// cost and the rate halves. Somewhere around 100-1000 operations per commit
-// is where the fixed cost is amortised and the payload is still small.
+// Note that atomicity is NOT what is being traded here. The commit marker is
+// what makes a transaction all-or-nothing across a crash, and it is written
+// whether or not anything is synced; recover_to_last_commit() stops at the
+// last one either way. Batching commits risks losing the last few
+// transactions, never seeing half of one.
 //
 // Build:
 //   g++ -std=c++23 -O3 -march=native -o probe bench/probe_commit_batching.cpp
@@ -82,8 +91,9 @@ namespace {
         auto t1 = std::chrono::steady_clock::now();
 
         const double s = secs(t0, t1);
-        std::printf("  %9zu %12zu %14.0f %14.0f %12.3f\n",
-                    batch, n_ops, n_ops / s, n_commits / s, s / n_commits * 1000.0);
+        const double bytes_per_commit = (double)table.current_offset() / n_commits;
+        std::printf("  %9zu %12zu %14.0f %14.0f %12.3f %14.0f\n",
+                    batch, n_ops, n_ops / s, n_commits / s, s / n_commits * 1000.0, bytes_per_commit);
         wipe();
     }
 
@@ -91,13 +101,15 @@ namespace {
 
 int main() {
     std::printf("full app layer (unique index, constraints, transactions), %zu fsyncs per row\n\n", n_commits);
-    std::printf("  %9s %12s %14s %14s %12s\n", "ops/fsync", "ops", "ops/sec", "fsyncs/sec", "ms/fsync");
-    std::printf("  %s\n", std::string(66, '-').c_str());
+    std::printf("  %9s %12s %14s %14s %12s %14s\n", "ops/fsync", "ops", "ops/sec", "fsyncs/sec", "ms/fsync", "bytes/fsync");
+    std::printf("  %s\n", std::string(82, '-').c_str());
     for (std::size_t batch : { 1ul, 2ul, 5ul, 10ul, 50ul, 100ul, 500ul, 1000ul, 5000ul })
         run(batch);
-    std::printf("\n  ops/sec tracks the batch size; fsyncs/sec does not move. The device\n"
-                "  commits at its own rate and nothing above it changes that - the only\n"
-                "  question a durable workload really answers is how many operations were\n"
-                "  willing to share one commit.\n");
+    std::printf("\n  A transaction here is ONE customer: a 48-byte CREATE plus a 40-byte\n"
+                "  commit marker, 88 bytes. At one fsync per transaction the device spends\n"
+                "  a millisecond committing 88 bytes. That is not a big transaction meeting\n"
+                "  a slow disk - it is a tiny one paying a fixed latency, which is exactly\n"
+                "  why sharing that latency across a batch buys so much: ops/sec tracks the\n"
+                "  batch size while fsyncs/sec does not move.\n");
     return 0;
 }

@@ -44,6 +44,13 @@
 // engine got 3-4x faster in between. Compare RATIOS WITHIN a run, never
 // numbers ACROSS runs.
 //
+// And the drift is not small even back to back. Three consecutive runs of
+// this binary, nothing changed in between, "ours / random update / fsync per
+// batch": 50.4K/s, 967K/s, 966K/s. A 20x swing from the filesystem alone. The
+// no-fsync columns are stable to a few percent and are the ones to read when
+// isolating a CPU-side change; the fsync columns cannot resolve anything
+// smaller than an order of magnitude on this machine.
+//
 // BEFORE the log/data split (disk 98% full):
 //
 //   no fsync          ours          lmdb        rocksdb

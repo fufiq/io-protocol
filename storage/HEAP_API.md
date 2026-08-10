@@ -185,9 +185,11 @@ Two different operations, not interchangeable:
   shape never changes. Writes a WAL diff record (`offset + len + payload`,
   checksummed over header and payload together) **and** writes the same
   bytes in place via a direct cast-assign, so `get()` never needs to replay
-  anything. Recovery never trusts the in-place bytes - it always replays
-  from the WAL - so the WAL stays strictly append-only and "stop at the
-  first checksum mismatch" needs no caveats.
+  anything - into the data region for `local_sync`, into the log itself for
+  an unsplit storage (which then refreshes that record's checksum). Recovery
+  never trusts the in-place bytes - it always replays from the WAL - so the
+  WAL stays strictly append-only and "stop at the first checksum mismatch"
+  needs no caveats.
 - **`recreate<T>(id, value)`** - a fresh `CREATE` written over an existing
   id, for when the value's shape or size changes (a variable-length field,
   or a different `T` entirely at the same id). The old bytes become garbage,
@@ -197,17 +199,40 @@ Two different operations, not interchangeable:
 ## 5. Durability and checksums
 
 - Every record carries a CRC32C (hardware, SSE4.2) in its header.
-- **CREATE**: checksum covers the header only. Its payload is legally
-  mutated afterward by `update()` - checksumming the payload would go stale
-  after the first update; that is by design, not corruption.
-- **UPDATE / DELETE**: checksum covers header + payload together - those
-  bytes are never mutated again once written.
+- **Every op - CREATE, UPDATE, DELETE - is checksummed over its header and
+  its payload together.** No exceptions.
 - `recover(file_size)` scans the file strictly sequentially and stops at
   the first checksum mismatch. Nothing past that point is read or applied.
-- **Known, accepted gap**: a torn write during the very first `CREATE` (before
-  any update) is not caught by the payload checksum - only the header is
-  protected. Closing this fully (never mutating WAL bytes in place at all)
-  is a separate architectural change, out of scope here.
+- A `local_sync` storage never patches its log, so its CREATE checksums are
+  written once and stay valid. An unsplit (`shared` / `replicated`) storage
+  aliases its index into the log, so `update()` rewrites bytes the CREATE's
+  checksum covers - it refreshes that checksum in the same step. Either way
+  the log is self-verifying end to end.
+
+> **Format break.** CREATE records used to be checksummed over the header
+> alone, because the payload was patched in place and a payload-covering
+> checksum would have gone stale. The consequence was that a CREATE's payload
+> was unprotected: a torn write landing the header's sector but not the
+> payload's, or later bit rot, passed recovery and was applied as a real
+> value. Logs written before this change do not recover, and a replica must
+> run the same build as its primary.
+
+### What a torn write can and cannot do here
+
+Worth being precise, because the intuition is usually wrong. A torn write is
+**all-or-nothing per sector**, not per byte or per field - damage is a whole
+512 B or 4 KiB chunk missing or stale, never a scattered field.
+
+- A later `update()` **cannot** damage an earlier CREATE's payload. In a
+  split storage the log is only ever appended to. And even the page-level
+  rewrite of a partially-filled tail page is harmless: the old part of the
+  page is written with bytes identical to what is already on the device, so
+  a torn sector leaves the same content either way.
+- What is exposed is the moment a record is **first** flushed, if it straddles
+  a sector boundary - the header's sector can land while the payload's does
+  not. That is what the payload checksum now catches.
+- The data file is exempt entirely: it is never synced and never read after a
+  crash, so a torn page there means nothing. `recover()` rebuilds it.
 
 ### `record_header` layout (24 bytes)
 
@@ -219,7 +244,7 @@ Two different operations, not interchangeable:
 | `op` | `record_op` (`uint8_t`) | 16 | `create` / `update` / `destroy` |
 | - | `uint8_t` | 17 | padding |
 | `tag` | `tag_t` (`uint16_t`) | 18 | opaque to the engine, see §2 |
-| `checksum` | `uint32_t` | 20 | CRC32C, see above |
+| `checksum` | `uint32_t` | 20 | CRC32C over the header (bytes 0..19) and the payload |
 
 ## 6. Compaction - two variants
 

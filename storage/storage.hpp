@@ -19,13 +19,19 @@
 //                              dependency on a fixed T, and nothing that
 //                              grows on the heap with the dataset.
 //
-// Update model: a WAL diff (offset + len + payload, checksum over header
-// and payload) plus an in-place copy for fast get() without replay.
-// Recovery always rebuilds state from the log - the in-place bytes are
-// never trusted for that - so the WAL stays strictly append-only (only the
-// tail can tear), and "stop at the first checksum mismatch" remains sound
-// with no caveats. Changing a value's shape or size (a different T on the
-// same id) goes through recreate(), a distinct operation from update().
+// Update model: a WAL diff (offset + len + payload) plus an in-place copy
+// for fast get() without replay. Recovery always rebuilds state from the log
+// - the in-place bytes are never trusted for that - so the WAL stays strictly
+// append-only (only the tail can tear), and "stop at the first checksum
+// mismatch" remains sound with no caveats. Changing a value's shape or size
+// (a different T on the same id) goes through recreate(), a distinct
+// operation from update().
+//
+// EVERY record's checksum covers its header AND its payload, with no
+// exceptions. Note for anyone reading an old log: CREATE records used to be
+// checksummed over the header alone, so this is an on-disk FORMAT BREAK -
+// logs written before it do not recover, and a replica must run the same
+// build as its primary.
 //
 // WHERE THOSE TWO THINGS LIVE, and why it matters:
 //
@@ -441,6 +447,7 @@ namespace storage {
             // on the computed offset, the same idiom used throughout this
             // file (see header_of()), applied here to a typed field.
             *(member_value_t<member>*)(record_ptr(id) + off) = value;
+            refresh_after_patch(id);
         }
 
         void destroy(record_id id) {
@@ -485,7 +492,10 @@ namespace storage {
                     break;
                 }
                 case record_op::update:
-                    if (alive(hdr.id)) std::memcpy(record_ptr(hdr.id) + hdr.offset, data, hdr.len);
+                    if (alive(hdr.id)) {
+                        std::memcpy(record_ptr(hdr.id) + hdr.offset, data, hdr.len);
+                        refresh_after_patch(hdr.id);
+                    }
                     break;
                 case record_op::destroy:
                     if (alive(hdr.id)) {
@@ -512,9 +522,7 @@ namespace storage {
                 if (hdr.id == 0) break; // sparse file tail, not a real record
                 if (pos + sizeof(hdr) + hdr.len > file_size) break; // truncated tail
 
-                uint32_t expected = (hdr.op == record_op::create)
-                    ? checksum_of(hdr, nullptr, 0)
-                    : checksum_of(hdr, base + pos + sizeof(hdr), hdr.len);
+                uint32_t expected = checksum_of(hdr, base + pos + sizeof(hdr), hdr.len);
                 if (expected != hdr.checksum) break;
 
                 apply(hdr, base + pos + sizeof(hdr));
@@ -537,11 +545,15 @@ namespace storage {
         // msg_id-ordered reorder buffer, which is what guarantees that by
         // the time anything reaches here.
         //
-        // The replica's file ends up a byte-for-byte mirror of the
-        // primary's WAL, sharing its exact offset numbering - that's
-        // deliberate: it's what makes "resume from offset X after a
-        // reconnect" trivially meaningful on both sides, rather than
-        // needing a translated/independent numbering scheme.
+        // The replica's file shares the primary's exact OFFSET numbering -
+        // that's deliberate: it's what makes "resume from offset X after a
+        // reconnect" trivially meaningful on both sides, rather than needing
+        // a translated/independent numbering scheme. The bytes are not
+        // identical, and never were: a replica is unsplit, so its index
+        // aliases its own log and update() patches CREATE payloads there
+        // (and now refreshes their checksums too). Only lengths and
+        // positions have to agree, and they do - pad8() of the same header
+        // and length gives the same stride on both sides.
         //
         // Returns how many bytes were actually verified and applied - less
         // than bytes.size() if a checksum failed or the range was
@@ -568,9 +580,7 @@ namespace storage {
                 if (hdr.id == 0) break;
                 if (pos + sizeof(hdr) + hdr.len > len) break; // truncated tail
 
-                uint32_t expected = (hdr.op == record_op::create)
-                    ? checksum_of(hdr, nullptr, 0)
-                    : checksum_of(hdr, base + write_offset + pos + sizeof(hdr), hdr.len);
+                uint32_t expected = checksum_of(hdr, base + write_offset + pos + sizeof(hdr), hdr.len);
                 if (expected != hdr.checksum) break;
 
                 // apply() reads its payload from THIS storage's own region
@@ -833,9 +843,7 @@ namespace storage {
                 std::memcpy(&hdr, wal_base + pos, sizeof(hdr));
                 if (hdr.id == 0) break;
                 if (pos + sizeof(hdr) + hdr.len > to) break;
-                uint32_t expected = (hdr.op == record_op::create)
-                    ? checksum_of(hdr, nullptr, 0)
-                    : checksum_of(hdr, wal_base + pos + sizeof(hdr), hdr.len);
+                uint32_t expected = checksum_of(hdr, wal_base + pos + sizeof(hdr), hdr.len);
                 if (expected != hdr.checksum) break;
 
                 switch (hdr.op) {
@@ -962,6 +970,19 @@ namespace storage {
         }
 
         std::byte* record_ptr(record_id id) const noexcept { return data_base + index[id].offset; }
+
+        // An unsplit storage's index aliases the log, so patching a field
+        // rewrites bytes its CREATE's checksum covers - leave it stale and
+        // the next recover() stops dead at that record. A split storage
+        // patches the data region, which no checksum in the log describes,
+        // so there is nothing to refresh and this compiles away.
+        void refresh_after_patch(record_id id) noexcept {
+            if constexpr (!split_regions) {
+                std::byte* rec = record_ptr(id);
+                record_header* h = header_of(rec);
+                h->checksum = checksum_of(*h, rec, h->len);
+            }
+        }
         std::size_t offset_in_data(const std::byte* p) const noexcept { return (std::size_t)(p - data_base); }
 
         // Compaction builds a fresh region and hands it over; this takes it
@@ -1037,15 +1058,20 @@ namespace storage {
                                           record_id id, uint32_t offset, tag_t tag,
                                           std::span<const std::byte> bytes) {
             record_header hdr{ id, offset, (uint32_t)(bytes.size()), op, 0, tag };
-            // CREATE - checksum covers only the header (the payload is
-            // legally mutated later by update(), see the file header
-            // comment). UPDATE/DELETE - checksum covers header and payload
-            // together; those bytes are never mutated again.
-            if constexpr (op == record_op::create) {
-                hdr.checksum = checksum_of(hdr, nullptr, 0);
-            } else {
-                hdr.checksum = checksum_of(hdr, bytes.data(), (uint32_t)bytes.size());
-            }
+            // ONE rule for every op: the checksum covers the header and the
+            // payload together. CREATE used to be excepted, because its
+            // payload was the record and update() patched it in place, so a
+            // payload-covering checksum would have gone stale on the first
+            // update. The consequence was that a CREATE's payload was
+            // unprotected - a torn write that landed the header's sector but
+            // not the payload's, or later bit rot, passed recovery silently
+            // and was applied as a real value.
+            //
+            // Split storages made the exception unnecessary: their log is
+            // never patched. Unsplit ones keep patching it and now refresh
+            // this checksum when they do (see refresh_after_patch), which is
+            // cheaper than leaving every created record undefended.
+            hdr.checksum = checksum_of(hdr, bytes.data(), (uint32_t)bytes.size());
             std::byte* pos = target_base + target_offset;
             std::memcpy(pos, &hdr, sizeof(hdr));
             if (!bytes.empty()) std::memcpy(pos + sizeof(hdr), bytes.data(), bytes.size());

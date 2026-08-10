@@ -788,3 +788,113 @@ TEST_CASE("an overflowed snapshot leaves the storage untouched, not half-compact
     std::remove("t_bgfail.tmp");
     std::remove("t_bgfail.data.tmp");
 }
+
+// =====================================================================
+// Checksum coverage. A CREATE's payload used to be outside its checksum,
+// because update() patched it in place and a payload-covering checksum
+// would have gone stale. The consequence was that a torn write which landed
+// the header's sector but not the payload's - or plain bit rot - passed
+// recovery and was applied as a real value. These pin down that it does not.
+// =====================================================================
+
+TEST_CASE("a corrupted CREATE payload is rejected, not applied") {
+    split_fixture f;
+    record_id a = f.table->create(user{1000, 30});
+    f.table->create(user{2000, 40});
+    f.table->sync();
+
+    delete f.table;
+    f.table = nullptr;
+
+    // Scribble inside the FIRST record's payload in the log, leaving its
+    // header intact - precisely what a sector-granularity tear looks like.
+    {
+        int fd = ::open(split_spec::path.value, O_RDWR);
+        REQUIRE(fd >= 0);
+        uint64_t garbage = 0xDEADBEEFDEADBEEFull;
+        REQUIRE(::pwrite(fd, &garbage, sizeof(garbage), sizeof(storage::record_header)) == (ssize_t)sizeof(garbage));
+        ::fsync(fd);
+        ::close(fd);
+    }
+
+    storage::storage<split_spec> restored;
+    CHECK(restored.recover(split_spec::capacity) == 0); // stopped at the very first record
+    CHECK(restored.get<user>(a) == nullptr);
+    CHECK(restored.live_bytes() == 0);
+}
+
+TEST_CASE("corruption partway through the log keeps everything before it") {
+    split_fixture f;
+    std::vector<record_id> ids;
+    for (int i = 0; i < 10; ++i) ids.push_back(f.table->create(user{(uint64_t)i, (uint32_t)i}));
+    f.table->sync();
+    const std::size_t stride = f.table->current_offset() / 10;
+
+    delete f.table;
+    f.table = nullptr;
+
+    {
+        int fd = ::open(split_spec::path.value, O_RDWR);
+        REQUIRE(fd >= 0);
+        uint64_t garbage = 0xFFFFFFFFFFFFFFFFull;
+        // Payload of record index 6.
+        REQUIRE(::pwrite(fd, &garbage, sizeof(garbage), 6 * stride + sizeof(storage::record_header)) == (ssize_t)sizeof(garbage));
+        ::fsync(fd);
+        ::close(fd);
+    }
+
+    storage::storage<split_spec> restored;
+    CHECK(restored.recover(split_spec::capacity) == 6 * stride);
+    for (int i = 0; i < 6; ++i) {
+        const user* u = restored.get<user>(ids[i]);
+        REQUIRE(u != nullptr);
+        CHECK(u->balance == (uint64_t)i);
+    }
+    for (int i = 6; i < 10; ++i) CHECK(restored.get<user>(ids[i]) == nullptr);
+}
+
+TEST_CASE("an unsplit storage keeps its CREATE checksums valid across updates") {
+    // The unsplit index aliases the log, so update() rewrites bytes the
+    // CREATE's checksum covers. If the refresh were missing, recover() would
+    // stop at the first updated record instead of replaying the whole log.
+    std::vector<std::byte> region(region_bytes);
+    record_id a, b;
+    std::size_t written;
+    {
+        storage::storage<> t(region.data());
+        a = t.create(user{1, 10});
+        b = t.create(user{2, 20});
+        for (int i = 0; i < 50; ++i) t.update<&user::balance>(a, (uint64_t)i);
+        t.update<&user::age>(b, 99);
+        written = t.current_offset();
+    }
+    storage::storage<> restored(region.data());
+    CHECK(restored.recover(written) == written); // nothing stopped it early
+    CHECK(restored.get<user>(a)->balance == 49);
+    CHECK(restored.get<user>(b)->age == 99);
+}
+
+TEST_CASE("a corrupted UPDATE payload is still rejected") {
+    split_fixture f;
+    record_id a = f.table->create(user{500, 25});
+    const std::size_t after_create = f.table->current_offset();
+    f.table->update<&user::balance>(a, 12345);
+    f.table->sync();
+
+    delete f.table;
+    f.table = nullptr;
+
+    {
+        int fd = ::open(split_spec::path.value, O_RDWR);
+        REQUIRE(fd >= 0);
+        uint64_t garbage = 0x1234567812345678ull;
+        REQUIRE(::pwrite(fd, &garbage, sizeof(garbage), after_create + sizeof(storage::record_header)) == (ssize_t)sizeof(garbage));
+        ::fsync(fd);
+        ::close(fd);
+    }
+
+    storage::storage<split_spec> restored;
+    CHECK(restored.recover(split_spec::capacity) == after_create); // the CREATE survived, the UPDATE did not
+    REQUIRE(restored.get<user>(a) != nullptr);
+    CHECK(restored.get<user>(a)->balance == 500); // pre-update value, not the corrupted one
+}

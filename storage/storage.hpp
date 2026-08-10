@@ -14,9 +14,10 @@
 //                              exactly one file, so there is no need to
 //                              rebind a base across multiple tables.
 //   background_compact(...) - non-blocking (Variant 2). The snapshot is an
-//                              arena (one vector<byte> plus a map<id,
-//                              arena_ref{tag,offset,len}>) - no per-record
-//                              allocation, and no dependency on a fixed T.
+//                              arena (one mapped buffer plus one mapped
+//                              slot per id) - no per-record allocation, no
+//                              dependency on a fixed T, and nothing that
+//                              grows on the heap with the dataset.
 //
 // Update model: a WAL diff (offset + len + payload, checksum over header
 // and payload) plus an in-place copy for fast get() without replay.
@@ -71,6 +72,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <nmmintrin.h> // _mm_crc32_u8/_mm_crc32_u64 - hardware CRC32C (SSE4.2)
+#include <string>
 #include <unordered_map>
 #include <mutex>
 
@@ -707,35 +709,116 @@ namespace storage {
 
         std::byte* raw_base() const noexcept { return base; }
 
-        // Snapshot of currently-live records - an ARENA, not a malloc per
-        // record. arena_ref owns nothing; it's just an (offset, len) into
-        // ONE shared buffer - the same principle the storage itself uses (bump
-        // write_offset, never free individually), except this buffer is
-        // temporary and lives for exactly one background_compact() call.
-        // offset, not a pointer: the arena can grow (push_back/insert) and
-        // relocate in memory - pointers handed out before that would dangle
-        // silently, while offsets from the buffer's start stay valid
-        // regardless. offset is size_t, not uint32_t: it's the CUMULATIVE
-        // position across every live record snapshotted, unlike
-        // record_header::len (a single record's own length, genuinely
-        // bounded by uint32_t) - capping it at 32 bits would silently
-        // truncate on any storage snapshotting more than ~4GB of combined
-        // live data.
-        struct arena_ref { tag_t tag; std::size_t offset; uint32_t len; };
-        struct snapshot {
-            std::vector<std::byte> arena;
-            std::unordered_map<record_id, arena_ref> index;
+        // Where one live record sits inside the snapshot arena. Owns
+        // nothing - the same principle the storage itself uses (bump an
+        // offset, never free individually). offset is size_t, not uint32_t:
+        // it is the CUMULATIVE position across every record snapshotted,
+        // unlike record_header::len (one record's own length, genuinely
+        // bounded by uint32_t). len == 0 means "no record with this id",
+        // which is unambiguous because a tagged_aggregate always has
+        // sizeof >= 1.
+        struct arena_ref { std::size_t offset; uint32_t len; tag_t tag; };
+
+        // A stable copy of every live record, taken under the lock in phase 1
+        // and caught up on the WAL without the lock in phase 2.
+        //
+        // BOTH halves are file-backed, for the same reason the data region
+        // is. This used to be a std::vector plus a std::unordered_map - an
+        // arena the size of the live set plus ~64 bytes per record, all of it
+        // anonymous memory, which the kernel can only swap and never reclaim,
+        // allocated while phase 1 holds the writer's mutex. Measured at 400k
+        // records of 64 bytes it was 49.7 MB against 25 MB of live data, and
+        // it was the last allocation in the engine that grew with the dataset
+        // and could not be evicted (bench/probe_snapshot_cost.cpp).
+        //
+        // Both files are unlinked the moment they are mapped: they live
+        // exactly as long as the mapping, are never reopened, and cannot be
+        // left behind by a crash.
+        class snapshot {
+        public:
+            static constexpr std::size_t npos = (std::size_t)-1;
+
+            snapshot() = default;
+            ~snapshot() { close(); }
+            snapshot(const snapshot&) = delete;
+            snapshot& operator=(const snapshot&) = delete;
+
+            bool open(const char* arena_path, std::size_t arena_bytes, const char* refs_path, std::size_t entries) {
+                close();
+                arena = map_unlinked(arena_path, arena_bytes, arena_fd);
+                refs = (arena_ref*)map_unlinked(refs_path, entries * sizeof(arena_ref), refs_fd);
+                if (!arena || !refs) { close(); return false; }
+                arena_capacity = arena_bytes;
+                refs_bytes = entries * sizeof(arena_ref);
+                ref_capacity = entries;
+                arena_used = 0;
+                overflow = false;
+                return true;
+            }
+
+            // Copies len bytes in and returns where they landed, or npos if
+            // the arena is full. A full arena is not recoverable mid-way, so
+            // it also latches `overflow` - background_compact checks that
+            // before switching anything over, and abandons the compaction
+            // rather than switch to a snapshot that silently lost records.
+            std::size_t append(const std::byte* src, uint32_t len) noexcept {
+                if (arena_used + len > arena_capacity) { overflow = true; return npos; }
+                std::memcpy(arena + arena_used, src, len);
+                std::size_t at = arena_used;
+                arena_used += len;
+                return at;
+            }
+
+            bool set(record_id id, tag_t tag, std::size_t offset, uint32_t len) noexcept {
+                if (id >= ref_capacity) { overflow = true; return false; }
+                refs[id] = arena_ref{ offset, len, tag };
+                return true;
+            }
+
+            arena_ref* find(record_id id) const noexcept {
+                return (id < ref_capacity && refs[id].len != 0) ? refs + id : nullptr;
+            }
+            void erase(record_id id) noexcept { if (id < ref_capacity) refs[id].len = 0; }
+
+            std::byte* bytes() const noexcept { return arena; }
+            std::size_t used() const noexcept { return arena_used; }
+            bool overflowed() const noexcept { return overflow; }
+
+        private:
+            static std::byte* map_unlinked(const char* path, std::size_t bytes, int& out_fd) noexcept {
+                int opened = ::open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+                if (opened < 0) return nullptr;
+                // Reserved blocks read back as zeros, so every ref starts
+                // with len == 0, i.e. absent, without touching a page.
+                if (::posix_fallocate(opened, 0, bytes) != 0) { ::close(opened); return nullptr; }
+                void* m = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, opened, 0);
+                if (m == MAP_FAILED) { ::close(opened); return nullptr; }
+                ::unlink(path); // the mapping keeps it alive; nothing is left on disk
+                out_fd = opened;
+                return (std::byte*)m;
+            }
+            void close() noexcept {
+                if (arena) { ::munmap(arena, arena_capacity); arena = nullptr; }
+                if (refs) { ::munmap(refs, refs_bytes); refs = nullptr; }
+                if (arena_fd >= 0) { ::close(arena_fd); arena_fd = -1; }
+                if (refs_fd >= 0) { ::close(refs_fd); refs_fd = -1; }
+                arena_capacity = arena_used = refs_bytes = ref_capacity = 0;
+            }
+            std::byte* arena = nullptr;
+            arena_ref* refs = nullptr;
+            std::size_t arena_used = 0, arena_capacity = 0, refs_bytes = 0, ref_capacity = 0;
+            int arena_fd = -1, refs_fd = -1;
+            bool overflow = false;
         };
 
         void snapshot_into(snapshot& out) const {
-            out.arena.reserve(out.arena.size() + live_byte_count); // live_byte_count is exact - one pass, no reallocation
             for (record_id id = 1; id < index.size(); ++id) {
                 if (!index[id].offset) continue;
                 std::byte* rec = record_ptr(id);
                 const record_header* h = header_of(rec);
-                std::size_t off = out.arena.size();
-                out.arena.insert(out.arena.end(), rec, rec + h->len);
-                out.index[id] = arena_ref{ h->tag, off, h->len };
+                std::size_t off = out.append(rec, h->len);
+                if (off == snapshot::npos) return; // overflow latched; the caller aborts
+                out.set(id, h->tag, off, h->len);
             }
         }
 
@@ -762,19 +845,19 @@ namespace storage {
                         // (the whole arena is discarded after
                         // finish_compaction - not worth the complexity of
                         // reusing fragments).
-                        std::size_t off = snap.arena.size();
-                        snap.arena.insert(snap.arena.end(), wal_base + pos + sizeof(hdr), wal_base + pos + sizeof(hdr) + hdr.len);
-                        snap.index[hdr.id] = arena_ref{ hdr.tag, off, hdr.len };
+                        std::size_t off = snap.append(wal_base + pos + sizeof(hdr), hdr.len);
+                        if (off == snapshot::npos) return pos; // overflow latched
+                        snap.set(hdr.id, hdr.tag, off, hdr.len);
                         break;
                     }
                     case record_op::update: {
-                        auto it = snap.index.find(hdr.id);
-                        if (it != snap.index.end() && (std::size_t)(hdr.offset) + hdr.len <= it->second.len)
-                            std::memcpy(snap.arena.data() + it->second.offset + hdr.offset, wal_base + pos + sizeof(hdr), hdr.len);
+                        arena_ref* ref = snap.find(hdr.id);
+                        if (ref && (std::size_t)(hdr.offset) + hdr.len <= ref->len)
+                            std::memcpy(snap.bytes() + ref->offset + hdr.offset, wal_base + pos + sizeof(hdr), hdr.len);
                         break;
                     }
                     case record_op::destroy:
-                        snap.index.erase(hdr.id);
+                        snap.erase(hdr.id);
                         break;
                 }
                 pos += pad8(sizeof(hdr) + hdr.len);
@@ -856,10 +939,10 @@ namespace storage {
             std::size_t scratch_offset = 0, scratch_data_offset = 0;
             live_byte_count = 0;
             for (record_id id = 1; id < index.size(); ++id) {
-                auto it = snap.index.find(id);
-                if (it == snap.index.end()) { index[id].offset = 0; continue; } // died during catch-up
-                const arena_ref& ref = it->second;
-                std::span<const std::byte> payload{snap.arena.data() + ref.offset, ref.len};
+                const arena_ref* ref_ptr = snap.find(id);
+                if (!ref_ptr) { index[id].offset = 0; continue; } // died during catch-up
+                const arena_ref& ref = *ref_ptr;
+                std::span<const std::byte> payload{snap.bytes() + ref.offset, ref.len};
                 std::byte* logged = write_record_at<record_op::create>(scratch, scratch_offset, id, 0, ref.tag, payload);
                 std::byte* placed = logged;
                 if constexpr (split_regions)
@@ -1077,6 +1160,14 @@ namespace storage {
                             const char* tmp_data_path = nullptr, const char* live_data_path = nullptr,
                             int max_catchup_rounds = 5, std::size_t catchup_threshold_bytes = 4096) {
         typename storage<spec>::snapshot snapshot;
+        // The snapshot's two files are derived from tmp_path and unlinked as
+        // soon as they are mapped, so they need no cleanup and cannot be left
+        // behind. Sizing the arena at scratch_capacity is the same bound the
+        // caller already asserted for the compacted log.
+        const std::string arena_path = std::string(tmp_path) + ".arena";
+        const std::string refs_path = std::string(tmp_path) + ".refs";
+        if (!snapshot.open(arena_path.c_str(), scratch_capacity, refs_path.c_str(), spec::index_entries)) return;
+
         std::size_t caught_up_to;
         std::byte* wal_base;
 
@@ -1086,6 +1177,7 @@ namespace storage {
             caught_up_to = table.current_offset();
             wal_base = table.raw_base();
         }
+        if (snapshot.overflowed()) return; // storage untouched - nothing has been switched yet
 
         // --- PHASE 2 (lock-free): catch up on the WAL in a few passes,
         // each one getting closer to "now". Gives up after
@@ -1107,6 +1199,7 @@ namespace storage {
         ::posix_fallocate(tmp_fd, 0, scratch_capacity);
         std::byte* scratch = (std::byte*)(::mmap(nullptr, scratch_capacity, PROT_READ | PROT_WRITE, MAP_SHARED, tmp_fd, 0));
 
+        bool switched_over = false;
         int tmp_data_fd = -1;
         std::byte* scratch_data = nullptr;
         if constexpr (storage<spec>::split_regions) {
@@ -1125,17 +1218,33 @@ namespace storage {
             std::lock_guard<std::mutex> lock(mu);
             std::size_t final_offset = table.current_offset();
             table.replay_into(wal_base, caught_up_to, final_offset, snapshot);
-            if constexpr (storage<spec>::split_regions) table.finish_compaction(scratch, scratch_data, snapshot);
-            else table.finish_compaction(scratch, snapshot);
-            table.sync();
+            // Checked before anything is switched over: a snapshot that ran
+            // out of arena or ran past its last ref slot is MISSING records,
+            // and compacting to it would delete them. Abandoning the
+            // compaction leaves the storage exactly as it was.
+            if (snapshot.overflowed()) { switched_over = false; }
+            else {
+                if constexpr (storage<spec>::split_regions) table.finish_compaction(scratch, scratch_data, snapshot);
+                else table.finish_compaction(scratch, snapshot);
+                table.sync();
+                switched_over = true;
+            }
         }
 
         ::close(tmp_fd);
-        ::rename(tmp_path, live_path);
-        if constexpr (storage<spec>::split_regions) {
-            ::close(tmp_data_fd);
-            ::rename(tmp_data_path, live_data_path);
+        if constexpr (storage<spec>::split_regions) ::close(tmp_data_fd);
+
+        if (!switched_over) {
+            // Nothing adopted the scratch regions, so this function still
+            // owns them, and the temp files are not the live ones.
+            ::munmap(scratch, scratch_capacity);
+            ::remove(tmp_path);
+            if constexpr (storage<spec>::split_regions) { ::munmap(scratch_data, scratch_capacity); ::remove(tmp_data_path); }
+            return;
         }
+
+        ::rename(tmp_path, live_path);
+        if constexpr (storage<spec>::split_regions) ::rename(tmp_data_path, live_data_path);
     }
 
 } // namespace storage

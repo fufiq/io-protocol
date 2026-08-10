@@ -698,3 +698,93 @@ TEST_CASE("a file-backed index refuses an id past its capacity instead of growin
     CHECK(f.table->live_bytes() == live_before);
     CHECK(f.table->current_offset() == offset_before);
 }
+
+// =====================================================================
+// background_compact()'s phase-1 snapshot. It is file-backed and fixed-size,
+// so the interesting case is what happens when it does not fit: a snapshot
+// that quietly dropped records would make compaction DELETE them.
+// =====================================================================
+TEST_CASE("a snapshot round-trips live records and the WAL replayed on top") {
+    fixture f;
+    std::vector<record_id> ids;
+    for (int i = 0; i < 20; ++i) ids.push_back(f.table.create(user{(uint64_t)i, (uint32_t)i}));
+
+    storage::storage<>::snapshot snap;
+    REQUIRE(snap.open("t_snap.arena", 1u << 20, "t_snap.refs", 4096));
+    const std::size_t before_replay = f.table.current_offset();
+    f.table.snapshot_into(snap);
+    CHECK_FALSE(snap.overflowed());
+
+    // Mutations made AFTER the snapshot are picked up by replaying the WAL
+    // onto it - that is what lets phase 2 run without the lock.
+    f.table.update<&user::balance>(ids[3], 4242);
+    f.table.destroy(ids[5]);
+    auto fresh = f.table.create(user{777, 7});
+    f.table.replay_into(f.table.raw_base(), before_replay, f.table.current_offset(), snap);
+    CHECK_FALSE(snap.overflowed());
+
+    auto* r3 = snap.find(ids[3]);
+    REQUIRE(r3 != nullptr);
+    CHECK(((const user*)(snap.bytes() + r3->offset))->balance == 4242);
+    CHECK(r3->tag == (tag_t)kind::user);
+    CHECK(snap.find(ids[5]) == nullptr);          // destroyed after the snapshot
+    REQUIRE(snap.find(fresh) != nullptr);          // created after the snapshot
+    CHECK(((const user*)(snap.bytes() + snap.find(fresh)->offset))->balance == 777);
+    CHECK(snap.find(999999) == nullptr);           // never existed
+}
+
+TEST_CASE("a snapshot that runs out of arena latches overflow instead of losing records") {
+    fixture f;
+    for (int i = 0; i < 200; ++i) f.table.create(user{(uint64_t)i, (uint32_t)i});
+
+    storage::storage<>::snapshot snap;
+    // Room for a handful of records, not 200.
+    REQUIRE(snap.open("t_snap_small.arena", 256, "t_snap_small.refs", 4096));
+    f.table.snapshot_into(snap);
+    CHECK(snap.overflowed());
+    CHECK(snap.used() <= 256);
+}
+
+TEST_CASE("a snapshot that runs out of ref slots latches overflow too") {
+    fixture f;
+    for (int i = 0; i < 200; ++i) f.table.create(user{(uint64_t)i, (uint32_t)i});
+
+    storage::storage<>::snapshot snap;
+    REQUIRE(snap.open("t_snap_norefs.arena", 1u << 20, "t_snap_norefs.refs", 16));
+    f.table.snapshot_into(snap);
+    CHECK(snap.overflowed());
+}
+
+TEST_CASE("an overflowed snapshot leaves the storage untouched, not half-compacted") {
+    // The failure that matters: background_compact must abandon the round
+    // rather than switch the storage over to a snapshot missing records.
+    using bg_spec = storage::storage_spec<storage::durability::local_sync, "t_bgfail.db", 4ull * 1024 * 1024>;
+    std::remove(bg_spec::path.value);
+    std::remove(bg_spec::data_path);
+
+    storage::storage<bg_spec> table;
+    std::vector<record_id> ids;
+    for (int i = 0; i < 500; ++i) ids.push_back(table.create(user{(uint64_t)i, (uint32_t)i}));
+    for (int i = 0; i < 500; i += 2) table.destroy(ids[i]);
+
+    const std::size_t live = table.live_bytes();
+    const std::size_t offset = table.current_offset();
+    std::mutex mu;
+
+    // scratch_capacity also sizes the snapshot arena, so a capacity smaller
+    // than the live set is exactly the overflow case.
+    storage::background_compact(table, mu, "t_bgfail.tmp", bg_spec::path.value, 64,
+                                "t_bgfail.data.tmp", bg_spec::data_path);
+
+    CHECK(table.live_bytes() == live);
+    CHECK(table.current_offset() == offset);
+    for (int i = 1; i < 500; i += 2) {
+        const user* u = table.get<user>(ids[i]);
+        REQUIRE(u != nullptr);
+        CHECK(u->balance == (uint64_t)i);
+    }
+    std::remove(bg_spec::path.value);
+    std::remove(bg_spec::data_path);
+    std::remove("t_bgfail.tmp");
+    std::remove("t_bgfail.data.tmp");
+}

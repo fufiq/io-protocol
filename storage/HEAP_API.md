@@ -282,6 +282,18 @@ storage::background_compact(storage, mu, "tmp_path.db", "live_path.db", scratch_
                             /*max_catchup_rounds=*/5, /*catchup_threshold_bytes=*/4096);
 ```
 
+The phase-1 snapshot is itself two mapped files, derived from `tmp_path`
+and unlinked as soon as they are mapped - nothing to clean up, nothing a
+crash can leave behind. Their size is fixed at open: the arena gets
+`scratch_capacity`, the id→ref array gets `spec::index_entries` slots. If
+the live set does not fit, the snapshot **latches an overflow flag and the
+compaction is abandoned**, leaving the storage exactly as it was - a
+snapshot that quietly dropped records would make compaction delete them.
+
+The blocking `compact()` builds no snapshot at all; it streams straight from
+the index into the scratch regions. That is the variant to reach for when
+the live set approaches RAM.
+
 Requires the writer to also take `mu` on every operation - otherwise the
 lock accomplishes nothing. Two **short** locked sections (an initial
 snapshot, then a final catch-up + switchover, **including the final

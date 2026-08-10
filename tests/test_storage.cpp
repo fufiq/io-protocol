@@ -1228,3 +1228,88 @@ TEST_CASE("patch refuses a range that leaves the record, and a dead id") {
     f.table.patch(id, sizeof(user) - sizeof(tail), std::as_bytes(std::span{&tail, 1}));
     CHECK(f.table.current_offset() > before);
 }
+
+// =====================================================================
+// record_header::flags - eight bits the engine writes as zero and never
+// reads, so a layer above can mark a boundary without spending a record.
+// =====================================================================
+
+TEST_CASE("flags are set on the last record and survive recovery") {
+    std::vector<std::byte> region(region_bytes);
+    record_id a, b, c;
+    std::size_t written;
+    {
+        storage::storage<> t(region.data());
+        CHECK_FALSE(t.set_last_record_flags(1)); // nothing appended yet
+
+        a = t.create(user{1, 1});
+        CHECK(t.set_last_record_flags(0x01));
+        b = t.create(user{2, 2});
+        c = t.create(user{3, 3});
+        CHECK(t.set_last_record_flags(0x82)); // bits are the caller's to choose
+        written = t.current_offset();
+    }
+
+    storage::storage<> restored(region.data());
+    CHECK(restored.recover(written) == written); // refreshing the checksum kept it valid
+
+    std::vector<uint8_t> seen;
+    restored.for_each_record(0, written, [&](const storage::record_header& hdr, std::span<const std::byte>) {
+        seen.push_back(hdr.flags);
+    });
+    REQUIRE(seen.size() == 3);
+    CHECK(seen[0] == 0x01);
+    CHECK(seen[1] == 0x00); // untouched records keep zero
+    CHECK(seen[2] == 0x82);
+
+    // Every record still reads back correctly.
+    CHECK(restored.get<user>(a)->balance == 1);
+    CHECK(restored.get<user>(b)->balance == 2);
+    CHECK(restored.get<user>(c)->balance == 3);
+}
+
+TEST_CASE("flags accumulate and cost no extra bytes") {
+    fixture f;
+    f.table.create(user{1, 1});
+    const std::size_t after_one_record = f.table.current_offset();
+
+    f.table.set_last_record_flags(0x01);
+    f.table.set_last_record_flags(0x04);
+    CHECK(f.table.current_offset() == after_one_record); // a boundary is not a record
+
+    int flags = -1;
+    f.table.for_each_record(0, [&](const storage::record_header& hdr, std::span<const std::byte>) { flags = hdr.flags; });
+    CHECK(flags == 0x05); // OR-ed, not overwritten
+}
+
+TEST_CASE("a flag set on an update record keeps that record verifiable") {
+    // The refresh has to checksum the payload too, not just the header -
+    // an UPDATE carries one, and getting that wrong would make recovery stop
+    // at the first flagged diff.
+    std::vector<std::byte> region(region_bytes);
+    record_id id;
+    std::size_t written;
+    {
+        storage::storage<> t(region.data());
+        id = t.create(user{10, 20});
+        t.update<&user::balance>(id, 999);
+        t.set_last_record_flags(0x01);
+        t.destroy(id);
+        t.set_last_record_flags(0x01);
+        written = t.current_offset();
+    }
+    storage::storage<> restored(region.data());
+    CHECK(restored.recover(written) == written);
+    CHECK(restored.get<user>(id) == nullptr);
+}
+
+TEST_CASE("compaction forgets the last record, so a stale flag cannot be set") {
+    fixture f;
+    auto id = f.table.create(user{1, 1});
+    std::vector<std::byte> scratch(1u << 20);
+    f.table.compact(scratch.data());
+
+    // The record set_last_record_flags would have pointed at no longer exists.
+    CHECK_FALSE(f.table.set_last_record_flags(0x01));
+    CHECK(f.table.get<user>(id)->balance == 1);
+}

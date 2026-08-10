@@ -119,8 +119,11 @@
 #include <lmdb.h>
 
 #ifdef HAVE_ROCKSDB
+#include <rocksdb/cache.h>
 #include <rocksdb/db.h>
+#include <rocksdb/filter_policy.h>
 #include <rocksdb/options.h>
+#include <rocksdb/table.h>
 #include <rocksdb/write_batch.h>
 #endif
 
@@ -434,9 +437,26 @@ namespace {
         rocksdb::Options options;
         options.create_if_missing = true;
         options.create_missing_column_families = true;
+
+        // Not defaults any more. The UNIQUE check is a lookup for a key that
+        // is usually ABSENT, which is precisely what a bloom filter exists
+        // for - without one every such probe walks the levels. 10 bits per key
+        // is the usual setting; index and filter blocks are pinned rather than
+        // cached so they are never evicted mid-run, and the block cache is
+        // sized to hold the working set.
+        rocksdb::BlockBasedTableOptions table_options;
+        table_options.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10, false));
+        table_options.cache_index_and_filter_blocks = false;
+        table_options.block_cache = rocksdb::NewLRUCache(512ull << 20);
+        table_options.whole_key_filtering = true;
+
+        rocksdb::ColumnFamilyOptions cf_options;
+        cf_options.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_options));
+        options.table_factory = cf_options.table_factory;
+
         std::vector<rocksdb::ColumnFamilyDescriptor> cfs = {
-            { rocksdb::kDefaultColumnFamilyName, rocksdb::ColumnFamilyOptions() },
-            { "by_email", rocksdb::ColumnFamilyOptions() },
+            { rocksdb::kDefaultColumnFamilyName, cf_options },
+            { "by_email", cf_options },
         };
         std::vector<rocksdb::ColumnFamilyHandle*> handles;
         auto status = rocksdb::DB::Open(rocksdb::DBOptions(options), "schemacmp_rocks", cfs, &handles, &db);

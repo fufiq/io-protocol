@@ -263,7 +263,13 @@ namespace storage {
         uint32_t  offset;        // 4, offset 8
         uint32_t  len;           // 4, offset 12
         record_op op;             // 1, offset 16
-        uint8_t   pad = 0;        // 1, offset 17
+        // Eight bits that belong to whatever is layered on top. The engine
+        // writes them as zero and never reads them - see
+        // set_last_record_flags() for why they are worth having: a layer that
+        // needs to mark a boundary (the end of a transaction, say) can do it
+        // in a header that was going to be written anyway, instead of
+        // appending a record of its own.
+        uint8_t   flags = 0;      // 1, offset 17
         tag_t     tag;             // 2, offset 18
         uint32_t  checksum = 0;     // 4, offset 20
     };
@@ -485,6 +491,31 @@ namespace storage {
         template <tagged_aggregate T>
         [[nodiscard]] const T* get(record_id id) const noexcept {
             return alive(id) ? (const T*)(record_ptr(id)) : nullptr;
+        }
+
+        static constexpr std::size_t no_record = (std::size_t)-1;
+
+        // Sets bits in record_header::flags on the most recently appended
+        // record, refreshing its checksum in place. Returns false only if
+        // nothing has been appended yet.
+        //
+        // This is what makes a transaction boundary free. A layer above would
+        // otherwise have to append a marker record to say "everything up to
+        // here is committed" - 40 bytes and a whole extra pass through
+        // apply() and the observer, against a bit in a header that was being
+        // written regardless. Recovery then looks for the flag instead of the
+        // marker (see bench/app_txn.hpp).
+        //
+        // It writes in place, but never to an old page: the record was
+        // appended since the last sync(), so its page is already dirty and
+        // already inside the range the next msync will cover. Nothing is
+        // added to what a durability point has to flush.
+        bool set_last_record_flags(uint8_t bits) noexcept {
+            if (last_record_offset == no_record) return false;
+            record_header* h = (record_header*)(base + last_record_offset);
+            h->flags |= bits;
+            h->checksum = checksum_of(*h, base + last_record_offset + sizeof(record_header), h->len);
+            return true;
         }
 
         // The tag a record was created with, or 0 if the id is not live.
@@ -778,6 +809,7 @@ namespace storage {
         void reset() {
             write_offset = 0;
             last_synced = 0;
+            last_record_offset = no_record;
             data_offset = 0;
             live_byte_count = 0;
             next_id = 1;
@@ -1065,6 +1097,7 @@ namespace storage {
             }
             adopt_region(base, fd, scratch_base);
             write_offset = scratch_offset;
+            last_record_offset = no_record; // the record it pointed at is gone
             // last_synced MUST be reset: scratch has never been synced, and
             // the old value (from the previous, larger region) could exceed
             // the new write_offset - sync() would then conclude there's
@@ -1092,6 +1125,7 @@ namespace storage {
             }
             adopt_region(base, fd, scratch);
             write_offset = scratch_offset;
+            last_record_offset = no_record;
             last_synced = 0;
             if constexpr (split_regions) { adopt_region(data_base, data_fd, scratch_data); data_offset = scratch_data_offset; }
             else data_base = scratch;
@@ -1189,7 +1223,7 @@ namespace storage {
         static std::byte* write_record_at(std::byte* target_base, std::size_t& target_offset,
                                           record_id id, uint32_t offset, tag_t tag,
                                           std::span<const std::byte> bytes) {
-            record_header hdr{ id, offset, (uint32_t)(bytes.size()), op, 0, tag };
+            record_header hdr{ id, offset, (uint32_t)(bytes.size()), op, 0, tag }; // flags start clear
             // ONE rule for every op: the checksum covers the header and the
             // payload together. CREATE used to be excepted, because its
             // payload was the record and update() patched it in place, so a
@@ -1213,6 +1247,7 @@ namespace storage {
 
         template <record_op op>
         std::byte* write_record(record_id id, uint32_t offset, tag_t tag, std::span<const std::byte> bytes) {
+            last_record_offset = write_offset;
             return write_record_at<op>(base, write_offset, id, offset, tag, bytes);
         }
 
@@ -1221,6 +1256,7 @@ namespace storage {
         std::byte* base = nullptr;          // the log - append-only, the source of truth
         std::size_t write_offset = 0;
         std::size_t last_synced = 0;
+        std::size_t last_record_offset = no_record; // start of the newest record in the log
 
         // The materialized records. A separate file only when split_regions;
         // otherwise it aliases base and data_offset stays 0, because nothing

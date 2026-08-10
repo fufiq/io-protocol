@@ -22,7 +22,7 @@
 //   L1  update balances, 6 indexes                4905186 ops/sec
 //   L4  insert customers, txn+constraints         4136884 ops/sec
 //   L2  rejected by UNIQUE (nothing written)    225463384 ops/sec
-//   L3  place+pay order (1 order + 3 lines)        247792 ops/sec
+//   L3  place+pay order (1 order + 3 lines)        281160 ops/sec
 //   L4  abort + undo (8 ops reversed)              214990 ops/sec
 //   L4  delete order ON DELETE CASCADE            1654242 ops/sec
 //   Q   point lookup via UNIQUE index           148057449 ops/sec
@@ -41,10 +41,10 @@
 //   CHECK, triggers, undo, commit markers - runs at about half the raw engine,
 //   which is the honest price of being a database rather than a heap.
 //
-// * A place-and-pay order is 247k/sec, and that is 13 records per order:
-//   the order, three lines, six trigger updates (stock and running total per
-//   line), two payment updates, and the commit marker. Per RECORD that is
-//   3.2M/sec - the transaction is not slow, it is thirteen writes.
+// * A place-and-pay order is 281k/sec, and that is 12 records per order: the
+//   order, three lines, six trigger updates (stock and running total per
+//   line), and two payment updates. Per RECORD that is 3.4M/sec - the
+//   transaction is not slow, it is twelve writes.
 //
 // * A rejected constraint costs nothing at all (225M/sec) because it is a
 //   hash lookup that fails before anything is written, and the benchmark
@@ -58,51 +58,52 @@
 //   transactions or accept ~1ms each.
 //
 // ---------------------------------------------------------------------------
-// CRUD AND RECOVERY, LIKE FOR LIKE. The same operations and the same recovery
-// at each layer, 100k records, three runs (the spread across them is what the
-// ranges below show):
+// CRUD AND RECOVERY, LIKE FOR LIKE. Same operations, same recovery, at each
+// layer, 100k records:
 //
 //   op        L0 engine     L1 +indexes         L4 +txn+constraints
-//   create    ~10.2M/s      ~7.8M/s   1.2-1.3x  ~4.6M/s   2.1-2.3x
-//   read      ~87-99M/s     ~83-105M/s  ~1x     ~93-112M/s  ~1x
-//   update    ~53.8M/s      ~20.0M/s  2.6-2.9x  ~7.6M/s   7.0-7.1x
-//   delete    ~41.4M/s      ~24.3M/s  1.7x      ~7.0M/s   5.9x
-//   recovery  ~1930 MB/s    ~870 MB/s 2.2x      ~935 MB/s 4.4-4.5x wall
-//   log size   9.9 MB        9.9 MB   1.0x      21.4 MB   2.15x
+//   create    ~9.9M/s       ~7.5M/s   1.32x     ~6.7M/s   1.46x
+//   read      ~96M/s        ~92M/s    ~1x       ~123M/s   ~1x
+//   update    ~52.6M/s      ~20.7M/s  2.54x     ~16.3M/s  3.23x
+//   delete    ~37.8M/s      ~25.0M/s  1.51x     ~18.2M/s  2.08x
+//   recovery  ~1604 MB/s    ~895 MB/s 1.79x     ~888 MB/s 1.81x
+//   log size   9.9 MB        9.9 MB   1.00x      9.9 MB   1.00x
 //
 // * READS COST NOTHING. The observer is not on the read path at all, so L0 and
-//   L1 run identical code and the 0.82-1.17x spread is measurement noise on
-//   this machine, not an effect. L4's column reads by KEY through the unique
-//   index rather than by primary id, which is the query an application
-//   actually issues, and it still lands in the same band.
+//   L1 run identical code and the spread between them is measurement noise on
+//   this machine. L4's column reads by KEY through the unique index rather
+//   than by primary id, which is the query an application actually issues.
 //
-// * UPDATE IS THE EXPENSIVE ONE, not create - 2.6x against create's 1.3x. On a
-//   create the observer finds nothing to retract and does one hash insert. On
-//   an update it must read the old record, erase its entry, apply the diff to
-//   a copy, and insert the new entry: two hash operations and two record reads
-//   against a raw update that costs 19 ns. The layer's fixed cost simply has
-//   less to hide behind.
+// * UPDATE IS THE EXPENSIVE ONE, not create - 2.54x against create's 1.32x. On
+//   a create the observer finds nothing to retract and does one hash insert.
+//   On an update it must read the old record, erase its entry, apply the diff
+//   to a copy, and insert the new entry: two hash operations and two record
+//   reads against a raw update that costs 19 ns. The layer's fixed cost simply
+//   has less to hide behind.
 //
-// * A TRANSACTION IS AN EXTRA RECORD. L4's log is 2.15x larger entirely
-//   because of commit markers, and a marker is a full record - it goes through
-//   apply() and the observer like any other. That is most of the gap between
-//   L1's 20M and L4's 7.6M updates: not the constraint checks, the second
-//   write.
+// * A TRANSACTION IS NOW FREE IN BYTES. The commit boundary used to be a
+//   40-byte marker record that also went through apply() and the observer;
+//   it is now one bit in record_header::flags on the last record the
+//   transaction already wrote. L4's log went from 21.4 MB to 9.9 MB, which is
+//   byte-for-byte the raw engine's, and the transaction layer's cost over bare
+//   index maintenance fell from 2.2-7x to 1.1-1.3x:
 //
-// * RECOVERY, corrected. An earlier version of this file claimed rebuilding
-//   indexes cost ~26x, by comparing 222 MB/s here against ~5.8 GB/s from
-//   probe_restart_cost.cpp. That was two different workloads with two
-//   different record sizes and a warm cache - not a comparison at all. Doing
-//   it properly, by replaying the SAME log twice, once with the observer and
-//   once with the default null_observer:
+//                    with a marker record   with a header flag
+//     create           4.6M/s  (2.21x)       6.7M/s  (1.46x)
+//     update           7.6M/s  (7.05x)      16.3M/s  (3.23x)
+//     delete           7.0M/s  (5.94x)      18.2M/s  (2.08x)
+//     recovery         4.59x wall            1.81x wall
 //
-//     100k customers, one index touched   1930 -> 870 MB/s    2.2x
-//     the order workload, all 6 indexes   1570 ->  220 MB/s   7.1x
+// * RECOVERY, measured properly. Replaying the SAME log twice, once with the
+//   observer and once with the default null_observer - not against a different
+//   benchmark with different records, which is how an earlier version of this
+//   file got it wrong by an order of magnitude:
 //
-//   So index rebuilding does dominate startup, and it scales with how many
-//   indexes a record touches rather than with the log - but by 7x, not 26x.
-//   The argument for persisting indexes and replaying only the delta with
-//   for_each_record() still holds; it is just a 7x argument.
+//     100k customers, one index touched   1604 -> 895 MB/s   1.8x
+//     the order workload, all 6 indexes   1570 -> 220 MB/s   7.1x
+//
+//   Index rebuilding dominates startup and scales with how many indexes a
+//   record touches rather than with log size.
 //
 // Build:
 //   g++ -std=c++23 -O3 -march=native -o app_layer_bench bench/app_layer_bench.cpp
@@ -284,13 +285,14 @@ namespace {
             for (std::size_t l = 0; l < lines_per_order && o; ++l)
                 tx.insert_line(o, w.products[rng.range(w.products.size())], (int64_t)(rng.range(3) + 1));
             if (!tx.failed()) tx.pay_order(o);
-            tx_records += tx.op_count() + 1; // + the commit marker
+            tx_records += tx.op_count(); // the boundary is a flag, not a record
             if (tx.commit(durable) == txn_result::committed) { w.orders.push_back(o); ++committed; }
         }
         auto t1 = std::chrono::steady_clock::now();
         record(durable ? "L4d" : "L3", "place+pay order (1+3 lines)", n_orders, secs(t0, t1));
         // 1 order + 3 lines + 6 trigger updates (stock and total per line)
-        // + 2 payment updates + 1 commit marker = 13 records per order.
+        // + 2 payment updates = 12 records per order. The commit boundary is a
+        // bit in the last one's header, not a thirteenth record.
         const std::size_t bytes = table.current_offset() - log_before;
         std::printf("       -> %zu committed, %.1f records and %.0f bytes of log per order\n",
                     committed, committed ? (double)tx_records / committed : 0.0,

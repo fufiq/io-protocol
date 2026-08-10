@@ -131,10 +131,15 @@ namespace app {
         txn_result commit(bool durable) {
             if (broken) { abort(); return txn_result::aborted_constraint; }
             finished = true;
-            // The marker is the last thing written, and only then is anything
-            // made durable. A crash before it leaves a transaction that
-            // recover_to_last_commit() will not replay.
-            t.create(commit_marker{ txn_id, (uint64_t)undo.size() });
+            // The boundary is a bit set on the last record this transaction
+            // already wrote, not a record of its own - and only then is
+            // anything made durable. A crash before the bit is set leaves a
+            // transaction recover_to_last_commit() will not replay.
+            //
+            // A transaction that wrote nothing sets nothing: flagging here
+            // would re-flag the PREVIOUS transaction's last record, which is
+            // harmless but meaningless.
+            if (!undo.empty()) t.set_last_record_flags(txn_commit_flag);
             if (durable) t.sync();
             return txn_result::committed;
         }
@@ -225,7 +230,6 @@ namespace app {
                 case kind::product:    std::memcpy(out, t.template get<product>(id), sizeof(product)); return sizeof(product);
                 case kind::order:      std::memcpy(out, t.template get<order>(id), sizeof(order)); return sizeof(order);
                 case kind::order_line: std::memcpy(out, t.template get<order_line>(id), sizeof(order_line)); return sizeof(order_line);
-                case kind::commit:     return 0;
             }
             return 0;
         }
@@ -236,7 +240,6 @@ namespace app {
                 case kind::product:    { product v; std::memcpy(&v, u.bytes, sizeof(v)); t.recreate(u.id, v); break; }
                 case kind::order:      { order v; std::memcpy(&v, u.bytes, sizeof(v)); t.recreate(u.id, v); break; }
                 case kind::order_line: { order_line v; std::memcpy(&v, u.bytes, sizeof(v)); t.recreate(u.id, v); break; }
-                case kind::commit:     break;
             }
         }
 
@@ -262,7 +265,7 @@ namespace app {
         std::size_t position = 0;
         table.for_each_record(0, log_size, [&](const storage::record_header& hdr, std::span<const std::byte> payload) {
             position += storage::pad8(sizeof(storage::record_header) + payload.size());
-            if (hdr.tag == commit_marker::tag) last_commit_end = position;
+            if (hdr.flags & txn_commit_flag) last_commit_end = position;
         });
         // Pass two is the ordinary recovery, bounded by that offset.
         return table.recover(last_commit_end);

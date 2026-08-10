@@ -35,7 +35,18 @@ namespace app {
     using storage::record_id;
     using storage::tag_t;
 
-    enum class kind : tag_t { customer = 1, product = 2, order = 3, order_line = 4, commit = 5 };
+    enum class kind : tag_t { customer = 1, product = 2, order = 3, order_line = 4 };
+
+    // A transaction boundary, in one bit of record_header::flags rather than a
+    // record of its own. The engine writes those eight bits as zero and never
+    // reads them; this layer sets bit 0 on the last record of every committed
+    // transaction, and recovery stops after the last record carrying it.
+    //
+    // It used to be a commit_marker record: 40 bytes plus a full pass through
+    // apply() and the observer, on every transaction. For a single-statement
+    // transaction that was 40 bytes on top of 48 - the bookkeeping was almost
+    // as large as the data.
+    constexpr uint8_t txn_commit_flag = 1u << 0;
 
     // Every type is explicitly padded to satisfy tagged_aggregate - a padding
     // hole is exactly what must not reach a disk or a wire.
@@ -70,21 +81,10 @@ namespace app {
         int64_t   price;
     };
 
-    // Written as the last record of every committed transaction. Recovery
-    // stops at the last one, which is what makes a transaction atomic across
-    // a crash: a half-written transaction has no marker after it, so none of
-    // it is replayed.
-    struct commit_marker {
-        static constexpr tag_t tag = (tag_t)kind::commit;
-        uint64_t txn_id;
-        uint64_t op_count;
-    };
-
     static_assert(storage::tagged_aggregate<customer>);
     static_assert(storage::tagged_aggregate<product>);
     static_assert(storage::tagged_aggregate<order>);
     static_assert(storage::tagged_aggregate<order_line>);
-    static_assert(storage::tagged_aggregate<commit_marker>);
 
     // =====================================================================
     // The observer: every secondary index, and nothing else.
@@ -131,7 +131,6 @@ namespace app {
                 case kind::product:    add(hdr.id, resolve<product>(table, hdr, payload)); break;
                 case kind::order:      add(hdr.id, resolve<order>(table, hdr, payload)); break;
                 case kind::order_line: add(hdr.id, resolve<order_line>(table, hdr, payload)); break;
-                case kind::commit:     return; // a marker indexes nothing
             }
             ++indexed_records;
         }
@@ -183,7 +182,6 @@ namespace app {
                         --it->second;
                     break;
                 }
-                case kind::commit: break;
             }
         }
 

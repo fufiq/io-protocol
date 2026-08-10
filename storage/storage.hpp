@@ -225,7 +225,7 @@ namespace storage {
     // 2 * capacity of disk.
     template <durability level_v = durability::shared, fixed_string path_v = fixed_string(""), std::size_t capacity_v = 16ull * 1024 * 1024,
               fixed_string data_path_v = fixed_string(""), fixed_string index_path_v = fixed_string(""),
-              fixed_string checkpoint_path_v = fixed_string("")>
+              fixed_string checkpoint_path_v = fixed_string(""), std::size_t index_entries_v = 0>
     struct storage_spec {
         static constexpr durability level = level_v;
         static constexpr auto path = path_v;
@@ -244,7 +244,14 @@ namespace storage {
         // index file. recreate() with a hand-picked id beyond it is refused
         // rather than served, which is the point: an arbitrary id can no
         // longer turn into an arbitrary allocation.
-        static constexpr std::size_t index_entries = capacity_v / 32;
+        // capacity/32 is the true upper bound - a record occupies at least
+        // pad8(sizeof(record_header) + 1) == 32 bytes of log - but it is the
+        // bound for the SMALLEST possible record. A storage holding kilobyte
+        // records will never mint anywhere near that many ids, and reserving
+        // capacity/4 bytes of index file for them is pure waste: at a 28 GB
+        // capacity that is 7 GB of index for perhaps 200 MB of real slots.
+        // index_entries_v overrides it with what the caller actually expects.
+        static constexpr std::size_t index_entries = index_entries_v ? index_entries_v : capacity_v / 32;
 
         // Held as a member so the array outlives every use of data_path;
         // an explicit data_path_v wins over the derived name.
@@ -488,6 +495,26 @@ namespace storage {
                 data_fd = ::open(spec::data_path, O_RDWR | O_CREAT, 0644);
                 ::posix_fallocate(data_fd, 0, spec::capacity);
                 data_base = (std::byte*)(::mmap(nullptr, spec::capacity, PROT_READ | PROT_WRITE, MAP_SHARED, data_fd, 0));
+
+                // NOT madvise(MADV_RANDOM), which looks obviously right and is
+                // not. The access pattern IS random - index[id] -> data_base +
+                // offset says nothing about locality - so disabling the
+                // kernel's readahead should stop it wasting bandwidth on pages
+                // nobody asked for. Measured on 26 GB with 24 GB of RAM
+                // (bench/big_dataset.cpp), it made everything worse:
+                //
+                //   random read     3262 -> 2516 ops/s
+                //   random update  10148 -> 6180 ops/s
+                //   major faults    72k  -> 144k on reads, 14k -> 146k on updates
+                //   fill          228k  -> 150k rec/s
+                //
+                // Two reasons, both obvious in hindsight. The region is
+                // written SEQUENTIALLY during fill and recovery, where
+                // readahead is exactly right, and one advice cannot serve both
+                // phases. And a 128 KB readahead that turns out to be useful
+                // even a fraction of the time beats 32 separate 4 KB faults,
+                // because the device is far better at one large read than at
+                // many small ones.
             } else {
                 base = shared_base;
                 data_base = shared_base;

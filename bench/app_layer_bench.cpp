@@ -14,93 +14,56 @@
 //   L3  + triggers            stock and order totals kept correct on insert
 //   L4  + transactions        undo log, commit markers, aborts
 //
-// MEASURED (50k customers, 20k products, 50k orders x 3 lines, NVMe, gcc -O3):
+// MEASURED (NVMe, gcc -O3). Absolute numbers drift a lot on this box; the
+// CRUD matrix below is the reliable one because all three layers run back to
+// back in one process.
 //
-//   L0  insert customers, no layer                8493338 ops/sec
-//   L0  update balances, no layer                19613673 ops/sec
-//   L1  insert customers, 6 indexes               6189067 ops/sec
-//   L1  update balances, 6 indexes                4905186 ops/sec
-//   L4  insert customers, txn+constraints         4136884 ops/sec
-//   L2  rejected by UNIQUE (nothing written)    225463384 ops/sec
-//   L3  place+pay order (1 order + 3 lines)        281160 ops/sec
-//   L4  abort + undo (8 ops reversed)              214990 ops/sec
-//   L4  delete order ON DELETE CASCADE            1654242 ops/sec
-//   Q   point lookup via UNIQUE index           148057449 ops/sec
-//   Q   same lookup by full scan                      1540 ops/sec
-//   Q   FK navigation, orders of customer        29229702 ops/sec
-//   Q   range query on ORDERED index                40519 ranges/sec (2020 entries each)
-//
-//   durable, one fsync per transaction:
-//   L4d insert customers                              1107 ops/sec
-//   L4d place+pay order                               1030 ops/sec
-//
-// What the numbers say:
-//
-// * Six secondary indexes cost 1.37x on insert. Constraints and transactions
-//   on top of that bring it to 2.05x. So a full schema - UNIQUE, FOREIGN KEY,
-//   CHECK, triggers, undo, commit markers - runs at about half the raw engine,
-//   which is the honest price of being a database rather than a heap.
-//
-// * A place-and-pay order is 281k/sec, and that is 12 records per order: the
-//   order, three lines, six trigger updates (stock and running total per
-//   line), and two payment updates. Per RECORD that is 3.4M/sec - the
-//   transaction is not slow, it is twelve writes.
-//
-// * A rejected constraint costs nothing at all (225M/sec) because it is a
-//   hash lookup that fails before anything is written, and the benchmark
-//   asserts the log did not grow by a single byte.
-//
-// * The point lookup is 96000x faster than the equivalent full scan. That is
-//   the entire argument for maintaining indexes in the observer.
-//
-// * Durability is everything else: 4.1M/sec becomes 1107/sec with one fsync
-//   per transaction. At that point nothing above the engine matters - batch
-//   transactions or accept ~1ms each.
-//
-// ---------------------------------------------------------------------------
-// CRUD AND RECOVERY, LIKE FOR LIKE. Same operations, same recovery, at each
-// layer, 100k records:
+// CRUD AND RECOVERY, 100k records, same operations at each layer:
 //
 //   op        L0 engine     L1 +indexes         L4 +txn+constraints
-//   create    ~9.9M/s       ~7.5M/s   1.32x     ~6.7M/s   1.46x
-//   read      ~96M/s        ~92M/s    ~1x       ~123M/s   ~1x
-//   update    ~52.6M/s      ~20.7M/s  2.54x     ~16.3M/s  3.23x
-//   delete    ~37.8M/s      ~25.0M/s  1.51x     ~18.2M/s  2.08x
-//   recovery  ~1604 MB/s    ~895 MB/s 1.79x     ~888 MB/s 1.81x
+//   create    ~9.7M/s       ~7.3M/s   1.33x     ~6.0M/s   1.63x
+//   read      ~91M/s        ~91M/s    ~1x       ~104M/s   ~1x
+//   update    ~59.5M/s      ~20.1M/s  2.97x     ~14.7M/s  4.06x
+//   delete    ~46.0M/s      ~23.7M/s  1.94x     ~16.9M/s  2.72x
+//   recovery  ~1907 MB/s    ~848 MB/s 2.25x     ~867 MB/s 2.20x
 //   log size   9.9 MB        9.9 MB   1.00x      9.9 MB   1.00x
 //
-// * READS COST NOTHING. The observer is not on the read path at all, so L0 and
-//   L1 run identical code and the spread between them is measurement noise on
-//   this machine. L4's column reads by KEY through the unique index rather
-//   than by primary id, which is the query an application actually issues.
+// AND THE SCHEMA WORKLOAD:
 //
-// * UPDATE IS THE EXPENSIVE ONE, not create - 2.54x against create's 1.32x. On
-//   a create the observer finds nothing to retract and does one hash insert.
-//   On an update it must read the old record, erase its entry, apply the diff
-//   to a copy, and insert the new entry: two hash operations and two record
-//   reads against a raw update that costs 19 ns. The layer's fixed cost simply
-//   has less to hide behind.
+//   place+pay order (12 records)         285474 ops/sec
+//   abort (8 staged ops dropped)        3687190 ops/sec
+//   rejected by UNIQUE                254229489 ops/sec  (log did not grow - asserted)
+//   point lookup via index            ~132000000 ops/sec
+//   the same lookup by full scan            ~3700 ops/sec
+//   durable, one fsync per transaction       ~350-1100 ops/sec
 //
-// * A TRANSACTION IS NOW FREE IN BYTES. The commit boundary used to be a
-//   40-byte marker record that also went through apply() and the observer;
-//   it is now one bit in record_header::flags on the last record the
-//   transaction already wrote. L4's log went from 21.4 MB to 9.9 MB, which is
-//   byte-for-byte the raw engine's, and the transaction layer's cost over bare
-//   index maintenance fell from 2.2-7x to 1.1-1.3x:
+// * READS COST NOTHING. The observer is not on the read path, so L0 and L1 run
+//   identical code and the spread between them is this machine's noise. L4's
+//   column reads by KEY through the unique index, which is the query an
+//   application actually issues.
 //
-//                    with a marker record   with a header flag
-//     create           4.6M/s  (2.21x)       6.7M/s  (1.46x)
-//     update           7.6M/s  (7.05x)      16.3M/s  (3.23x)
-//     delete           7.0M/s  (5.94x)      18.2M/s  (2.08x)
-//     recovery         4.59x wall            1.81x wall
+// * UPDATE IS THE EXPENSIVE OPERATION, not create - 2.97x against create's
+//   1.33x. A create finds nothing to retract and does one hash insert; an
+//   update reads the old record, erases its entry, applies the diff to a copy
+//   and inserts the new entry, against a raw update costing 17 ns.
 //
-// * RECOVERY, measured properly. Replaying the SAME log twice, once with the
-//   observer and once with the default null_observer - not against a different
-//   benchmark with different records, which is how an earlier version of this
-//   file got it wrong by an order of magnitude:
+// * A TRANSACTION COSTS NOTHING IN BYTES. L4's log is byte-for-byte the raw
+//   engine's, because the commit boundary is a bit in record_header::flags on
+//   the last record the transaction already wrote, not a marker record.
 //
-//     100k customers, one index touched   1604 -> 895 MB/s   1.8x
-//     the order workload, all 6 indexes   1570 -> 220 MB/s   7.1x
+// * ABORT IS FREE, and this is what staging bought. Statements go into an
+//   in-memory overlay and reach the log only at commit, so an aborted
+//   transaction writes nothing: 214990 -> 3687190 ops/sec, 17x, and zero bytes
+//   of log against eight undo records before. The commit path pays a little
+//   for it - the transaction layer's cost over bare index maintenance went
+//   from ~1.1-1.4x to ~1.2-1.4x - which is the right way round, since an abort
+//   is work you already decided to throw away.
+//
+// * RECOVERY, measured by replaying the SAME log twice, once with the observer
+//   and once with the default null_observer:
+//
+//     100k customers, one index touched   1907 -> 848 MB/s   2.2x
+//     the order workload, all 6 indexes   1317 -> 230 MB/s   5.7x
 //
 //   Index rebuilding dominates startup and scales with how many indexes a
 //   record touches rather than with log size.
@@ -170,7 +133,7 @@ namespace {
 
         auto t0 = std::chrono::steady_clock::now();
         for (std::size_t i = 0; i < n_customers; ++i)
-            table.create(customer{ rng.next(), 1'000'000, (uint32_t)(i % 40), 0 });
+            table.create(customer{ (uint64_t)i + 1, 1'000'000, (uint32_t)(i % 40), 0 });
         auto t1 = std::chrono::steady_clock::now();
         record("L0", "insert customers, no layer", n_customers, secs(t0, t1));
 
@@ -197,7 +160,7 @@ namespace {
 
         auto t0 = std::chrono::steady_clock::now();
         for (std::size_t i = 0; i < n_customers; ++i)
-            table.create(customer{ rng.next(), 1'000'000, (uint32_t)(i % 40), 0 });
+            table.create(customer{ (uint64_t)i + 1, 1'000'000, (uint32_t)(i % 40), 0 });
         auto t1 = std::chrono::steady_clock::now();
         record("L1", "insert customers, 6 indexes", n_customers, secs(t0, t1));
 
@@ -318,7 +281,7 @@ namespace {
             if (tx.commit(false) != txn_result::committed) ++aborted;
         }
         auto t1 = std::chrono::steady_clock::now();
-        record("L4", "abort + undo (8 ops reversed)", n, secs(t0, t1));
+        record("L4", "abort (8 staged ops dropped)", n, secs(t0, t1));
         if (aborted != n) std::printf("  !! expected every transaction to abort, got %zu\n", aborted);
     }
 
@@ -671,12 +634,17 @@ namespace {
             good.commit(true);
 
             // A second transaction whose records reach the disk - and then the
-            // process dies before the commit marker.
-            txn<app_spec> doomed(table, 2);
-            ghost = doomed.insert_customer(customer{ 2, 200, 0, 0 });
-            ghost_product = doomed.insert_product(product{ 1, 5, 5 });
-            table.sync();      // its records ARE durable
-            doomed.abandon();  // ...but nothing follows them
+            // process dies before the boundary flag is set. Staging makes an
+            // ordinary abort write nothing at all, so a crash has to be
+            // modelled at the only moment where records exist without a flag:
+            // partway through commit()'s flush.
+            ghost = table.reserve_id();
+            ghost_product = table.reserve_id();
+            const customer c{ 2, 200, 0, 0 };
+            const product p{ 1, 5, 5 };
+            table.create_raw(ghost, customer::tag, std::as_bytes(std::span{ &c, 1 }));
+            table.create_raw(ghost_product, product::tag, std::as_bytes(std::span{ &p, 1 }));
+            table.sync();      // its records ARE durable - but unflagged
 
             log_size = table.current_offset();
         }

@@ -493,6 +493,25 @@ namespace storage {
             return alive(id) ? (const T*)(record_ptr(id)) : nullptr;
         }
 
+        // Claims the next id without writing anything. For a caller that must
+        // NAME a record before it is ready to append it - a transaction that
+        // stages its writes and only flushes them at commit needs ids up front
+        // so that records staged later can refer to records staged earlier.
+        // Ids are monotonic and never reused, so one claimed by a transaction
+        // that then aborts is simply skipped, which costs nothing but a gap.
+        [[nodiscard]] record_id reserve_id() noexcept { return next_id++; }
+
+        // Type-erased counterpart of recreate<T>: a CREATE for `id` carrying
+        // `tag` and `bytes`, for a caller holding a record's bytes without
+        // naming its C++ type - a staged transaction flushing its batch, a
+        // migration, any tool driven by tag_of() rather than by a type.
+        record_id create_raw(record_id id, tag_t tag, std::span<const std::byte> bytes) {
+            if (!reserve(id)) return 0;
+            std::byte* logged = write_record<record_op::create>(id, 0, tag, bytes);
+            apply<provenance::local>(*header_of(logged), logged);
+            return id;
+        }
+
         static constexpr std::size_t no_record = (std::size_t)-1;
 
         // Sets bits in record_header::flags on the most recently appended

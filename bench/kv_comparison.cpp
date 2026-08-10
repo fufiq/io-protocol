@@ -94,6 +94,48 @@
 // the log.
 //
 // ---------------------------------------------------------------------------
+// THE TWO ENGINE SHAPES, side by side at a scale where the numbers repeat.
+// 500k records of 64 bytes, everything in RAM, three runs (the spread below is
+// the spread across them):
+//
+//   no fsync            ours       ours-fld        lmdb     rocksdb
+//   insert           8.2-8.6M    19.6-20.1M       1.01M       0.46M
+//   random read      108-121M       65-68M        2.27M       0.42M
+//   random update    36.7-38.7M    21.4-26.4M     0.42M       0.42M
+//
+//   fsync per 1000      ours       ours-fld        lmdb     rocksdb
+//   insert              925K          803K         121K        302K
+//   random read         110M           65M        2.18M       0.50M
+//   random update      1.02M         1.06M          51K        279K
+//
+// ours-fld is storage/field_storage.hpp: one file, nothing patched in place,
+// an update appends the changed field and moves a pointer. THE TWO DESIGNS
+// TRADE PLACES depending on whether the workload is memory-bound or I/O-bound,
+// and this file is the memory-bound half of that answer:
+//
+//   insert  2.4x FASTER for the field engine, and structurally so: it writes
+//           one copy where storage.hpp writes the record to the log and again
+//           to the materialization.
+//
+//   read    1.7x SLOWER. Partly the gather, mostly the copy - storage.hpp's
+//           get<T>() hands back a pointer into the materialization, and the
+//           field engine cannot, because the record is not contiguous
+//           anywhere. It memcpys 64 bytes into the caller's object before
+//           laying the overridden fields on top. That is not an
+//           implementation detail to optimise away; it is what the design
+//           costs.
+//
+//   update  1.6x SLOWER, which is the reverse of what happens out of RAM.
+//           In cache, patching eight bytes in place is cheaper than appending
+//           a 32-byte record and walking a chain. Out of cache, the patch is a
+//           random write into a region larger than memory and the append is
+//           not: bench/big_dataset.cpp measures 0.110 major faults per update
+//           against 0.002, roughly 50x.
+//
+// With durability on, both converge (1.02M vs 1.06M) because the flush
+// dominates everything either design does.
+//
+// ---------------------------------------------------------------------------
 // WHERE THE TIME ACTUALLY GOES. Throughput says who won; hardware counters say
 // why. One engine at a time, pinned to a P-core, 1.5M ops per run
 // (500k insert + 500k read + 500k update):
@@ -168,6 +210,7 @@
 // keeps the strong guarantee that sync_file_range cannot give.
 
 #include "../storage/storage.hpp"
+#include "../storage/field_storage.hpp"
 
 #include <lmdb.h>
 
@@ -219,6 +262,60 @@ std::vector<uint64_t> shuffled_keys(size_t n, uint64_t seed) {
 // Ours
 // =========================================================================
 using bench_spec = storage::storage_spec<storage::durability::local_sync, "kvbench_ours.db", 1ull << 30>;
+
+// The same engine indexed per FIELD instead of per record: one file, nothing
+// patched in place, an update appends the changed field and moves a pointer.
+// See storage/field_storage.hpp. Measured here rather than at 26 GB because
+// this is the scale where the numbers repeat: at 26 GB the same binary varied
+// 5x between consecutive runs.
+//
+// max_depth 8 with a single scalar field means the collapse never fires and
+// the chain never exceeds 1 - an update to an already-overridden field
+// replaces its node. This measures the design's steady state, not its worst
+// case; bench/big_dataset.cpp is where a deeper chain is built.
+using field_bench_spec = storage::field_spec<"kvbench_fields.log", 1ull << 30, "kvbench_fields.idx",
+                                             1'000'000, 1'000'000, 8, 128>;
+
+void bench_ours_fields(bool sync_per_batch) {
+    std::remove("kvbench_fields.log");
+    std::remove("kvbench_fields.idx");
+    const char* dur = sync_per_batch ? "fsync/batch" : "no fsync";
+    {
+        storage::field_storage<field_bench_spec> table;
+        if (!table.ok()) { std::printf("ours-fld: could not map\n"); return; }
+
+        record r{};
+        auto t0 = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < n_records; ++i) {
+            r.key = i + 1;
+            table.create(r);
+            if (sync_per_batch && (i + 1) % batch_size == 0) table.sync();
+        }
+        if (sync_per_batch) table.sync();
+        auto t1 = std::chrono::steady_clock::now();
+        row("ours-fld", "insert", dur, n_records, secs(t0, t1));
+
+        auto keys = shuffled_keys(n_records, 1);
+        uint64_t sink = 0;
+        record got{};
+        auto t2 = std::chrono::steady_clock::now();
+        for (auto k : keys) if (table.get(k, got)) sink += got.key;
+        auto t3 = std::chrono::steady_clock::now();
+        row("ours-fld", "random read", "n/a", n_records, secs(t2, t3));
+        if (sink == 0) std::printf("  (sink=%llu)\n", (unsigned long long)sink);
+
+        auto t4 = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < keys.size(); ++i) {
+            table.update<&record::key>(keys[i], keys[i]);
+            if (sync_per_batch && (i + 1) % batch_size == 0) table.sync();
+        }
+        if (sync_per_batch) table.sync();
+        auto t5 = std::chrono::steady_clock::now();
+        row("ours-fld", "random update", dur, n_records, secs(t4, t5));
+    }
+    std::remove("kvbench_fields.log");
+    std::remove("kvbench_fields.idx");
+}
 
 void bench_ours(bool sync_per_batch) {
     std::remove("kvbench_ours.db");
@@ -436,6 +533,7 @@ int main(int argc, char** argv) {
         if (mode == "sync" && !sync) continue;
         if (!quiet) std::printf("\n--- durability: %s ---\n", sync ? "fsync per batch" : "no fsync");
         if (engine == "all" || engine == "ours") bench_ours(sync);
+        if (engine == "all" || engine == "ours-fields") bench_ours_fields(sync);
         if (engine == "all" || engine == "lmdb") bench_lmdb(sync);
 #ifdef HAVE_ROCKSDB
         if (engine == "all" || engine == "rocksdb") bench_rocksdb(sync);

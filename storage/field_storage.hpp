@@ -22,37 +22,49 @@
 // bytes of a kilobyte record writes eight bytes, where a B+tree or a heap
 // table rewrites the row.
 //
-// WHAT IT BUYS, and what can honestly be claimed about it.
+// WHAT IT BUYS, measured at 26 GB on a 31 GB machine (bench/big_dataset.cpp).
+// Three runs of each, ALTERNATED, with writeback drained between them - which
+// matters more than it sounds: an earlier attempt ran them back to back and
+// saw a 5x spread that was the previous run's dirty pages, not the engine.
+// Alternating and settling brings the spread to 1.1-1.6x.
 //
-// At 26 GB on a 31 GB machine (bench/big_dataset.cpp), TIMINGS ARE NOT
-// TRUSTWORTHY: two consecutive runs of the same binary gave 1345113 and
-// 257805 records/sec for the identical fill, and 29469 and 8608 ops/sec for
-// the identical random read. A 5x spread from page-cache and filesystem state
-// alone, and each engine needs the whole disk, so runs cannot be interleaved
-// to cancel it. Any speed comparison at this scale on this machine is noise
-// dressed as a result.
+//                          storage.hpp      this      ratio
+//   fill (rec/sec)             185662     321555      1.7x
+//   random read                  3168       7987      2.5x
+//   random update                8120      11340      1.4x
+//   read hot, before            10694      26400      2.5x
+//   hot update x5                5419       8583      1.6x
+//   read hot, after          31800000    3830000     0.12x   <- the cost
+//   read hot, collapsed             -    9940000
+//   major faults / read         0.397      0.233      1.7x
+//   major faults / update       0.126     0.0016       78x
+//   RSS                        6.1 GB    19.3 GB      3.2x worse
+//   on disk                   56.2 GB    28.5 GB      2.0x
 //
-// What IS stable, because it is counted rather than timed:
+// UPDATES take 78x fewer major faults, and in two runs of three that was
+// literally ONE fault per 200000 updates. An update appends the field and
+// moves a pointer; it touches no page of the record, so there is nothing to
+// fault on. Patching in place must reach a random page of a 26 GB region.
 //
-//   major faults per update    storage.hpp  22013 / 200000 = 0.110
-//                              this file     1349 / 700000 = 0.002
+// READS get 2.5x faster, and the reason is not the index at all: half the
+// footprint means twice as much of it fits in the page cache. 0.233 faults per
+// read against 0.397. (An earlier version of this file retracted this claim
+// after seeing read faults scatter across 27057, 75523 and 23535. That scatter
+// was the measurement, not the engine - settled and alternated, three runs
+// give 40969, 42292 and 56437 against 72541, 84295 and 81216.)
 //
-//     An update here appends the field and moves a pointer. It touches no
-//     page of the record at all, so there is nothing to fault on. Patching in
-//     place must reach a random page of a 26 GB region every time. Roughly 50x
-//     fewer faults per update, and that ratio holds across every run.
+// WHAT IT COSTS, and this is now visible cleanly: reading a record that has
+// five overridden fields is 8.3x slower than reading the same record from
+// storage.hpp - 3.83M against 31.8M ops/sec, both entirely in cache, so it is
+// pure CPU. The gather assembles from six places and copies a kilobyte into
+// the caller's object where storage.hpp returns a pointer. Collapsing recovers
+// most of it (9.94M) but not all, because the copy remains.
 //
-//   on disk                    56.2 GB  ->  28.5 GB (28.0 log + 0.5 index)
-//
-//     No second copy. The shipping design keeps the log AND a materialization
-//     of every live record.
-//
-// A CLAIM RETRACTED. An earlier version of this file said reads got 3.5x
-// faster because half the footprint means twice the cache hit rate. Repeated
-// runs do not support it: read faults came out at 27057, 75523 and 23535 for
-// the same 200k reads, which straddles storage.hpp's 78472. The mechanism may
-// well be real, but this benchmark cannot show it, and the number should not
-// have been stated.
+// So the two designs trade places, and the axis is whether the workload is
+// I/O-bound: out of RAM this one wins nearly everything, in RAM (500k records,
+// bench/kv_comparison.cpp) it loses reads 1.7x and updates 1.6x, and on a
+// hot record with a deep chain it loses badly either way. spec::max_depth is
+// the dial between those.
 //
 // The other cost is index memory: a slot per id (16 bytes) plus a node per
 // overridden field (24 bytes), against storage.hpp's 8 bytes per id.

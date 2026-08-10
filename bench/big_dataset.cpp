@@ -70,26 +70,28 @@
 //
 // A FIFTH ARM, `ours-fields`, is the same engine indexed per FIELD rather than
 // per record: one file, nothing patched in place, an update appends the
-// changed field and moves a pointer (storage/field_storage.hpp).
+// changed field and moves a pointer (storage/field_storage.hpp). Three runs of
+// each, ALTERNATED, with writeback drained between them:
 //
-// READ THE FAULT COUNTS, NOT THE TIMINGS. Two consecutive runs of the same
-// binary on the same data gave 1345113 and 257805 records/sec for the fill,
-// and 29469 and 8608 ops/sec for the random read - a 5x spread from
-// page-cache and filesystem state. Each engine needs the whole disk, so runs
-// cannot be interleaved to cancel it. At 26 GB on this machine, only counted
-// quantities survive:
+//                             ours   ours-fields    ratio
+//   fill (rec/sec)          185662        321555     1.7x
+//   random read               3168          7987     2.5x
+//   random update             8120         11340     1.4x
+//   read hot, before         10694         26400     2.5x
+//   hot update x5             5419          8583     1.6x
+//   read hot, after       31800000       3830000    0.12x
+//   read hot, collapsed          -       9940000
+//   faults / read            0.397         0.233     1.7x
+//   faults / update          0.126        0.0016      78x
+//   RSS                     6.1 GB       19.3 GB
+//   on disk                56.2 GB       28.5 GB     2.0x
 //
-//   major faults per update    ours 0.110    ours-fields 0.002    ~50x fewer
-//   on disk                    56.2 GB       28.5 GB
-//
-// The first is the design working exactly as intended: an update that touches
-// no page of the record cannot fault on one. The second is the second copy
-// not existing.
-//
-// The same caution applies to the four-engine table above, which was also
-// gathered one run per engine. The ratios there are large enough (30x to
-// 1000x) to survive a 5x spread; anything under about 10x in this file should
-// be treated as unmeasured.
+// ALTERNATING IS WHAT MADE THIS MEASURABLE. Run back to back, the same binary
+// on the same data gave 1345113 and 257805 records/sec for the identical fill
+// - a 5x spread that turned out to be the previous run's dirty pages rather
+// than anything about the engine. Alternating the two engines and waiting for
+// /proc/meminfo's Dirty and Writeback to drain first brings the spread to
+// 1.1-1.6x, which is small enough for every row above to mean something.
 //
 // Postgres, for context, is not the same kind of thing: every operation above
 // is a round trip to another process over a unix socket, and in exchange it

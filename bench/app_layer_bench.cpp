@@ -90,6 +90,18 @@ namespace {
 
     using plain_spec = storage::storage_spec<storage::durability::local_sync, "applayer_plain.db", 1ull << 30>;
     using app_spec = storage::storage_spec<storage::durability::local_sync, "applayer.db", 1ull << 30>;
+    constexpr std::size_t index_capacity = 1'200'000; // every id this benchmark ever issues
+
+    // The secondary indexes live in a mapping, so every table_t needs one
+    // attached before it is used.
+    struct indexed_table {
+        explicit indexed_table(const char* index_path) {
+            if (!store.open(index_path, index_capacity)) { std::printf("could not map %s\n", index_path); std::abort(); }
+            if (!table.observer_state().attach(store.region(), store.region_bytes(), index_capacity)) std::abort();
+        }
+        index_store store;
+        table_t<app_spec> table;
+    };
 
     double secs(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
         return std::chrono::duration<double>(b - a).count();
@@ -113,6 +125,8 @@ namespace {
     void wipe(const char* path) {
         std::remove(path);
         std::remove((std::string(path) + ".data").c_str());
+        std::remove("applayer.sidx");
+        std::remove("applayer2.sidx");
     }
 
     struct xorshift {
@@ -155,7 +169,8 @@ namespace {
     // -----------------------------------------------------------------
     void layer1() {
         wipe(app_spec::path.value);
-        table_t<app_spec> table;
+        indexed_table it("applayer.sidx");
+        auto& table = it.table;
         xorshift rng(1);
 
         auto t0 = std::chrono::steady_clock::now();
@@ -354,12 +369,12 @@ namespace {
     // same indexes, and triggers do NOT fire again while it happens.
     // -----------------------------------------------------------------
     void recovery(const table_t<app_spec>& live) {
-        const std::size_t live_customers = live.observer_state().customer_by_email.size();
-        const std::size_t live_products = live.observer_state().product_by_sku.size();
-        const std::size_t live_price_entries = live.observer_state().products_by_price.size();
-        const std::size_t live_order_owners = live.observer_state().orders_by_customer.size();
-        const std::size_t live_line_owners = live.observer_state().lines_by_order.size();
-        const std::size_t live_indexed = live.observer_state().indexed_records;
+        const std::size_t live_customers = live.observer_state().emails_indexed();
+        const std::size_t live_products = live.observer_state().skus_indexed();
+        const std::size_t live_price_entries = live.observer_state().price_entries();
+        const std::size_t live_order_owners = live.observer_state().customers_with_orders();
+        const std::size_t live_line_owners = live.observer_state().orders_with_lines();
+        const std::size_t live_indexed = live.observer_state().indexed_records();
 
         // A stock level that only a trigger ever changed - if replay re-fired
         // the triggers, this would come back wrong.
@@ -387,7 +402,8 @@ namespace {
             plain_seconds = secs(p0, p1);
         }
 
-        table_t<app_spec> restored;
+        indexed_table restored_it("applayer2.sidx");
+        auto& restored = restored_it.table;
         auto t0 = std::chrono::steady_clock::now();
         std::size_t replayed = recover_to_last_commit(restored, (std::size_t)st.st_size);
         auto t1 = std::chrono::steady_clock::now();
@@ -407,12 +423,12 @@ namespace {
         auto check = [](const char* what, std::size_t a, std::size_t b) {
             std::printf("    %-34s live %9zu   recovered %9zu   %s\n", what, a, b, a == b ? "ok" : "MISMATCH");
         };
-        check("UNIQUE customer_by_email", live_customers, restored.observer_state().customer_by_email.size());
-        check("UNIQUE product_by_sku", live_products, restored.observer_state().product_by_sku.size());
-        check("ORDERED products_by_price", live_price_entries, restored.observer_state().products_by_price.size());
-        check("FK orders_by_customer", live_order_owners, restored.observer_state().orders_by_customer.size());
-        check("FK lines_by_order", live_line_owners, restored.observer_state().lines_by_order.size());
-        check("records indexed", live_indexed, restored.observer_state().indexed_records);
+        check("UNIQUE customer_by_email", live_customers, restored.observer_state().emails_indexed());
+        check("UNIQUE product_by_sku", live_products, restored.observer_state().skus_indexed());
+        check("ORDERED products_by_price", live_price_entries, restored.observer_state().price_entries());
+        check("FK orders_by_customer", live_order_owners, restored.observer_state().customers_with_orders());
+        check("FK lines_by_order", live_line_owners, restored.observer_state().orders_with_lines());
+        check("records indexed", live_indexed, restored.observer_state().indexed_records());
         std::printf("    %-34s live %9lld   recovered %9lld   %s\n", "total stock (triggers only)",
                     (long long)live_stock_total, (long long)restored_stock_total,
                     live_stock_total == restored_stock_total ? "ok - triggers did NOT re-fire" : "MISMATCH");
@@ -483,7 +499,8 @@ namespace {
         wipe(app_spec::path.value);
         std::vector<record_id> ids;
         {
-            table_t<app_spec> table;
+            indexed_table it("applayer.sidx");
+            auto& table = it.table;
             ids.reserve(n_crud);
 
             auto t0 = std::chrono::steady_clock::now();
@@ -514,7 +531,8 @@ namespace {
             r.log_bytes = table.current_offset();
         }
         {
-            table_t<app_spec> restored;
+            indexed_table restored_it("applayer2.sidx");
+            auto& restored = restored_it.table;
             auto t0 = std::chrono::steady_clock::now();
             restored.recover(app_spec::capacity);
             auto t1 = std::chrono::steady_clock::now();
@@ -530,7 +548,8 @@ namespace {
         std::vector<record_id> ids;
         uint64_t txn_id = 1;
         {
-            table_t<app_spec> table;
+            indexed_table it("applayer.sidx");
+            auto& table = it.table;
             ids.reserve(n_crud);
 
             auto t0 = std::chrono::steady_clock::now();
@@ -576,7 +595,8 @@ namespace {
             r.log_bytes = table.current_offset();
         }
         {
-            table_t<app_spec> restored;
+            indexed_table restored_it("applayer2.sidx");
+            auto& restored = restored_it.table;
             auto t0 = std::chrono::steady_clock::now();
             restored.recover(app_spec::capacity);
             auto t1 = std::chrono::steady_clock::now();
@@ -627,7 +647,8 @@ namespace {
         record_id survivor = 0, ghost = 0, ghost_product = 0;
         std::size_t log_size = 0;
         {
-            table_t<app_spec> table;
+            indexed_table it("applayer.sidx");
+            auto& table = it.table;
 
             txn<app_spec> good(table, 1);
             survivor = good.insert_customer(customer{ 1, 100, 0, 0 });
@@ -649,14 +670,15 @@ namespace {
             log_size = table.current_offset();
         }
 
-        table_t<app_spec> restored;
+        indexed_table restored_it("applayer2.sidx");
+        auto& restored = restored_it.table;
         std::size_t replayed = recover_to_last_commit(restored, log_size);
 
         const bool survivor_ok = restored.get<customer>(survivor) != nullptr;
         const bool ghost_gone = restored.get<customer>(ghost) == nullptr;
         const bool ghost_product_gone = restored.get<product>(ghost_product) == nullptr;
-        const bool index_clean = restored.observer_state().customer_by_email.count(2) == 0 &&
-                                 restored.observer_state().product_by_sku.count(1) == 0;
+        const bool index_clean = restored.observer_state().has_email(2) == false &&
+                                 restored.observer_state().has_sku(1) == false;
 
         std::printf("  %-5s %-34s replayed %zu of %zu bytes\n", "TXN", "crash before commit marker", replayed, log_size);
         std::printf("       committed transaction survived   %s\n", survivor_ok ? "ok" : "MISSING");
@@ -680,7 +702,8 @@ int main() {
 
     wipe(app_spec::path.value);
     {
-        table_t<app_spec> table;
+        indexed_table it("applayer.sidx");
+        auto& table = it.table;
         world w = build_catalogue(table, false);
         layer2_uniqueness(table, w);
         layer3_orders(table, w, false);
@@ -694,7 +717,8 @@ int main() {
     std::printf("\n  --- the same work, durable (sync per transaction) ---\n");
     wipe(app_spec::path.value);
     {
-        table_t<app_spec> table;
+        indexed_table it("applayer.sidx");
+        auto& table = it.table;
         world w = build_catalogue(table, true);
         layer3_orders(table, w, true);
     }

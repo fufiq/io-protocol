@@ -44,50 +44,67 @@
 // and a crash loses only the transactions since the last one - never half of
 // one, because each still ends with its own commit record.
 //
-// NO FSYNC AT ALL, 200k records (ops/sec, and how far behind ours):
+// NO FSYNC AT ALL, 200k records (delete is 100k, half the set):
 //
-//   insert + unique index    3846597    lmdb 100887  38x   rocks 127164  30x
-//   read by primary id      49904757    lmdb 4724059 11x   rocks 581371  86x
-//   read by secondary key   85259451    lmdb 5040112 17x   rocks 587696 145x
-//   update non-indexed       6090834    lmdb 131105  46x   rocks 158918  38x
-//   update INDEXED field     6384116    lmdb  69277  92x   rocks  90225  71x
-//   delete + index entry     8656813    lmdb  54509 159x   rocks 111360  78x
-//   REOPEN                    0.057 s   lmdb 0.001 s       rocks 3.873 s
+//   operation                   ours      lmdb    rocksdb    ours ahead
+//   insert + unique index    5291680     98505     129177     54x / 41x
+//   read by primary id      78914671   4727261     579347     17x / 136x
+//   read by secondary key   83575877   5090250     626598     16x / 133x
+//   update non-indexed       8682450    132509     161141     66x / 54x
+//   update INDEXED field     6503439     69427      90795     94x / 72x
+//   delete + index entry     8459074     58861     114397    144x / 74x
+//   REOPEN, replaying         0.042 s         -          -
+//   REOPEN, mapping           0.000 s   0.000 s    3.365 s
 //
-// ONE FSYNC PER TRANSACTION, 20k records: 1215 / 520 / 1208 ops/sec on insert.
-// Everyone lands on the device's commit latency. We tie RocksDB; LMDB is 2.2x
-// behind because its commit writes data pages and then a meta page.
+// GROUP COMMIT, one fsync per 1000 transactions, 200k records:
 //
-// GROUP COMMIT, 100k records:
+//   operation                   ours      lmdb    rocksdb    ours ahead
+//   insert + unique index     801297     80979     103699     9.9x / 7.7x
+//   read by primary id      77197842   4208917     535484      18x / 144x
+//   read by secondary key   79386091   5001921     631355      16x / 126x
+//   update non-indexed        814462    104437     130557     7.8x / 6.2x
+//   update INDEXED field      879765     62604      73713      14x / 12x
+//   delete + index entry      866897     46296      95014      19x / 9.1x
+//   REOPEN, mapping           0.000 s   0.000 s    3.469 s
 //
-//   one fsync per 100 txns      ours      lmdb     rocksdb
-//   insert + unique index      31704     23619       19499
-//   update non-indexed         36094     25009       27649
-//   update INDEXED field       32723     20230       23885
-//   delete + index entry       35172      6418       25615
+// ONE FSYNC PER TRANSACTION, 20k records:
 //
-//   one fsync per 1000 txns     ours      lmdb     rocksdb
-//   insert + unique index     306732     67153       75353
-//   update non-indexed        217473     80972       73396
-//   update INDEXED field      270834     43262       73382
-//   delete + index entry      259835     31366       74137
+//   operation                   ours      lmdb    rocksdb    ours ahead
+//   insert + unique index       1304      1032       1170     1.3x / 1.1x
+//   update non-indexed          1234      1046       1202     1.2x / 1.0x
+//   update INDEXED field        1266      1002       1179     1.3x / 1.1x
+//   delete + index entry        1235       983       1095     1.3x / 1.1x
+//   read by primary id      98333251   7252150     713482      14x / 138x
+//   REOPEN, mapping           0.000 s   0.000 s    0.305 s
 //
-// THE BATCH SIZE DECIDES WHO WINS, and that is the real answer to "which is
-// faster":
+// THREE ANSWERS, NOT ONE, and the batch size picks which one applies:
 //
-//   1 txn per fsync      nobody - all three are the device, within 2.2x
-//   100 txns per fsync   we are 1.3-1.6x ahead (5.5x on delete, an LMDB
-//                        outlier where its freelist work shows)
-//   1000 txns per fsync  we are 3-8x ahead
-//   no fsync             we are 30-160x ahead
+//   1 txn per fsync      nobody wins. All three are within 1.3x, because all
+//                        three are the device: ~1 ms per commit, and no
+//                        engine gets under that.
+//   1000 per fsync       we are 6-19x ahead on writes.
+//   no fsync             we are 16-144x ahead.
 //
-// As the batch grows the fsync stops dominating and CPU work starts to matter
-// again, so the ranking converges on the no-fsync column. Which means the
-// honest statement is not "we are faster" but "we are faster in proportion to
-// how little the disk is in the way".
+// Reads never move, in any mode: they touch no disk.
 //
-// Absolute numbers on this box drift a great deal between runs - btrfs at 80%
-// full. Compare columns within a block, never across blocks.
+// RESTART. The secondary indexes now live in a mapping of their own
+// (bench/flat_index.hpp) rather than in std::unordered_map and std::multimap,
+// which cannot be mapped at all. A clean shutdown msyncs that mapping
+// alongside the engine's checkpoint, and a restart maps both back:
+//
+//   ours, replaying the log and rebuilding    0.042 s
+//   ours, mapping both regions                0.000 s   <- usable immediately
+//   lmdb                                      0.000 s
+//   rocksdb                                   3.365 s
+//
+// The benchmark checks that the mapped indexes agree with the ones a replay
+// would have built, and says so out loud if they ever differ.
+//
+// WHAT THE FLAT INDEXES COST on the write path, because they are not free:
+// open addressing with backward-shift deletion, and a mapped region rather
+// than the heap, moved non-durable updates from ~14.2M/s to ~8.7M/s and
+// deletes from ~19.4M/s to ~8.5M/s. That is the price of a restart that
+// costs nothing, and it disappears entirely the moment any durability is on.
 //
 // FOUR CAVEATS, all of which cut against us:
 //
@@ -167,7 +184,10 @@ namespace {
         std::remove("schemacmp_ours.db.data");
         std::remove("schemacmp_ours.idx");
         std::remove("schemacmp_ours.ck");
+        std::remove("schemacmp_ours.sidx");
     }
+    // Ids are monotonic, so the ceiling is every id the run will ever issue.
+    std::size_t index_capacity() { return n_records * 4 + 1024; }
     void wipe_lmdb() {
         std::remove("schemacmp_lmdb.mdb");
         std::remove("schemacmp_lmdb.mdb-lock");
@@ -200,12 +220,18 @@ namespace {
         wipe_ours();
         std::vector<record_id> ids;
         ids.reserve(n_records);
-        double reopen_seconds = 0, restart_seconds = 0, rebuild_seconds = 0;
+        double reopen_seconds = 0, restart_seconds = 0;
         bool checkpoint_ok = false;
         std::size_t log_bytes = 0;
 
         {
             table_t<bench_spec> table;
+            index_store store;
+            if (!store.open("schemacmp_ours.sidx", index_capacity()) ||
+                !table.observer_state().attach(store.region(), store.region_bytes(), index_capacity())) {
+                std::printf("ours: could not map the secondary indexes\n");
+                return;
+            }
             uint64_t txn_id = 1;
             // The transaction always ends with its commit marker; whether the
             // marker is on disk yet is a separate decision, taken here.
@@ -274,41 +300,52 @@ namespace {
             table.sync();
             log_bytes = table.current_offset();
             // A clean shutdown: flush the log, the materialized records and
-            // the index together, then name the offset they all agree at.
+            // the engine's index together and name the offset they agree at -
+            // and flush the secondary indexes, which live in their own
+            // mapping, alongside it.
+            store.sync();
             checkpoint_ok = table.checkpoint();
         }
+        std::size_t emails_before = 0, emails_after = 0;
         {
-            // How a restart goes with no checkpoint to lean on: replay the
-            // whole log and rebuild every index from it.
+            // A restart with no checkpoint to lean on: replay the whole log
+            // and rebuild every index from it.
             table_t<bench_spec> restored;
+            index_store store;
+            store.open("schemacmp_ours.sidx.replay", index_capacity());
+            restored.observer_state().attach(store.region(), store.region_bytes(), index_capacity());
             auto t0 = std::chrono::steady_clock::now();
             restored.recover(bench_spec::capacity);
             auto t1 = std::chrono::steady_clock::now();
             reopen_seconds = secs(t0, t1);
+            emails_before = restored.observer_state().emails_indexed();
         }
+        std::remove("schemacmp_ours.sidx.replay");
         {
-            // And with one: the engine comes back without replaying a single
-            // record, and the secondary indexes are rebuilt from live records
-            // instead of from the log.
+            // And with one. Both mappings are simply opened: the engine's
+            // state comes back from its checkpoint, the secondary indexes
+            // come back from their own file, and nothing is replayed or
+            // rebuilt at all.
             table_t<bench_spec> restored;
+            index_store store;
             auto t0 = std::chrono::steady_clock::now();
+            store.open("schemacmp_ours.sidx", index_capacity());
+            restored.observer_state().attach(store.region(), store.region_bytes(), index_capacity());
             restored.restart(bench_spec::capacity);
-            const bool fast = restored.started_from_checkpoint();
             auto t1 = std::chrono::steady_clock::now();
-            const std::size_t reindexed = rebuild_indexes(restored);
-            auto t2 = std::chrono::steady_clock::now();
-            if (reindexed == 0) std::printf("  !! nothing live at reopen - the rebuild column is meaningless\n");
             restart_seconds = secs(t0, t1);
-            rebuild_seconds = secs(t1, t2);
-            if (!fast) std::printf("  !! the checkpoint was refused (written=%d)\n", (int)checkpoint_ok);
+            emails_after = restored.observer_state().emails_indexed();
+            if (!restored.started_from_checkpoint())
+                std::printf("  !! the checkpoint was refused (written=%d)\n", (int)checkpoint_ok);
+            if (emails_after != emails_before)
+                std::printf("  !! the mapped indexes disagree with the replayed ones: %zu vs %zu\n",
+                            emails_after, emails_before);
         }
         std::printf("%-9s %-26s %-12s %9.1f MB %8.3f s  %12.0f MB/sec\n",
                     "ours", "REOPEN replaying the log", d, log_bytes / 1048576.0, reopen_seconds,
                     log_bytes / 1048576.0 / reopen_seconds);
-        std::printf("%-9s %-26s %-12s %9s %8.3f s  %12s\n",
-                    "ours", "REOPEN from a checkpoint", d, "-", restart_seconds, "engine only");
-        std::printf("%-9s %-26s %-12s %9s %8.3f s  %12s\n",
-                    "ours", "  + rebuild the indexes", d, "-", restart_seconds + rebuild_seconds, "usable");
+        std::printf("%-9s %-26s %-12s %9zu idx %8.3f s  %12s\n",
+                    "ours", "REOPEN mapping everything", d, emails_after, restart_seconds, "usable");
         wipe_ours();
     }
 

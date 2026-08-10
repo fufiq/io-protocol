@@ -154,8 +154,7 @@ namespace app {
         bool delete_customer(record_id id) {
             slot* s = resolve(id);
             if (!s || s->dead || s->tag != customer::tag) return fail_bool();
-            auto it = idx().orders_by_customer.find(id);
-            if (it != idx().orders_by_customer.end() && !it->second.empty()) return fail_bool();
+            if (idx().customer_has_orders(id)) return fail_bool();
             return stage_destroy(id);
         }
 
@@ -163,8 +162,8 @@ namespace app {
         bool delete_order(record_id id) {
             slot* s = resolve(id);
             if (!s || s->dead || s->tag != order::tag) return fail_bool();
-            auto it = idx().lines_by_order.find(id);
-            std::vector<record_id> lines = (it == idx().lines_by_order.end()) ? std::vector<record_id>{} : it->second;
+            std::vector<record_id> lines;
+            idx().each_line_of(id, [&](uint64_t line) { lines.push_back((record_id)line); });
             for (record_id line : lines)
                 if (!stage_destroy(line)) return false;
             return stage_destroy(id);
@@ -318,13 +317,13 @@ namespace app {
         // own staged rows - two inserts of the same email inside one
         // transaction must collide even though neither is in the index yet.
         bool email_taken(uint64_t email) const {
-            if (idx().customer_by_email.count(email)) return true;
+            if (idx().has_email(email)) return true;
             for (const slot& s : overlay)
                 if (!s.dead && s.tag == customer::tag && ((const customer*)s.bytes)->email_hash == email) return true;
             return false;
         }
         bool sku_taken(uint64_t sku) const {
-            if (idx().product_by_sku.count(sku)) return true;
+            if (idx().has_sku(sku)) return true;
             for (const slot& s : overlay)
                 if (!s.dead && s.tag == product::tag && ((const product*)s.bytes)->sku_hash == sku) return true;
             return false;
@@ -363,14 +362,15 @@ namespace app {
     // replaying anything; this is the part that still has to be paid for,
     // and it costs live data rather than log.
     template <typename spec>
-    std::size_t rebuild_indexes(table_t<spec>& table) {
-        schema_index fresh;
+    std::size_t rebuild_indexes(table_t<spec>& table, index_store& store, std::size_t capacity) {
+        // Zeroing the header is what makes attach() treat the region as fresh.
+        std::memset(store.region(), 0, sizeof(index_header));
+        table.observer_state().attach(store.region(), store.region_bytes(), capacity);
         std::size_t seen = 0;
         table.for_each_raw([&](typename table_t<spec>::raw_view rv) {
-            fresh.index_existing(rv.id, rv.tag, rv.bytes.data());
+            table.observer_state().index_existing(rv.id, rv.tag, rv.bytes.data());
             ++seen;
         });
-        table.observer_state() = std::move(fresh);
         return seen;
     }
 
@@ -378,9 +378,7 @@ namespace app {
 
     template <typename spec>
     record_id find_customer_by_email(const table_t<spec>& table, uint64_t email_hash) {
-        const auto& m = table.observer_state().customer_by_email;
-        auto it = m.find(email_hash);
-        return it == m.end() ? 0 : it->second;
+        return table.observer_state().customer_by_email(email_hash);
     }
 
     template <typename spec>
@@ -394,18 +392,15 @@ namespace app {
 
     template <typename spec>
     std::size_t count_products_in_price_range(const table_t<spec>& table, int64_t lo, int64_t hi) {
-        const auto& m = table.observer_state().products_by_price;
-        return (std::size_t)std::distance(m.lower_bound(lo), m.upper_bound(hi));
+        return table.observer_state().products_in_price_range(lo, hi);
     }
 
     template <typename spec>
     int64_t sum_customer_order_totals(const table_t<spec>& table, record_id customer_id) {
-        const auto& m = table.observer_state().orders_by_customer;
-        auto it = m.find(customer_id);
-        if (it == m.end()) return 0;
         int64_t total = 0;
-        for (record_id o : it->second)
-            if (const order* rec = table.template get<order>(o)) total += rec->total;
+        table.observer_state().each_order_of(customer_id, [&](uint64_t o) {
+            if (const order* rec = table.template get<order>((record_id)o)) total += rec->total;
+        });
         return total;
     }
 

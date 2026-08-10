@@ -127,6 +127,7 @@
 //       -llmdb -lrocksdb -lpq -I/usr/include/postgresql -DHAVE_ROCKSDB -DHAVE_POSTGRES
 #include "../storage/storage.hpp"
 #include "../storage/field_storage.hpp"
+#include "deferred_storage.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -570,6 +571,86 @@ namespace {
         std::remove("big_fields.log"); std::remove("big_fields.idx");
     }
 
+    // =================================================================
+    // ours-deferred - storage.hpp's two regions and pointer-returning reads,
+    // but an update only appends and marks the record dirty; the writes are
+    // applied later, in address order. See bench/deferred_storage.hpp.
+    // =================================================================
+    void run_ours_deferred() {
+        std::remove("big_def.log"); std::remove("big_def.data");
+        deferred::store t("big_def.log", "big_def.data", log_capacity, max_ids);
+        if (!t.ok()) { std::printf("ours-def: could not map\n"); return; }
+
+        blob b{};
+        std::memset(b.payload, 0xAB, sizeof(b.payload));
+
+        auto t0 = std::chrono::steady_clock::now();
+        std::vector<storage::record_id> ids;
+        ids.reserve(n_records);
+        for (std::size_t i = 0; i < n_records; ++i) {
+            b.key = i + 1; b.counter = i;
+            ids.push_back(t.create(b));
+            if ((i + 1) % (n_records / 10) == 0)
+                progress(i + 1, n_records, secs(t0, std::chrono::steady_clock::now()), t.current_offset() * 2);
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        report("ours-def", "fill", n_records, secs(t0, t1));
+
+        const pressure before = sample();
+        xorshift rng(9);
+        volatile uint64_t sink = 0;
+        t0 = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n_random; ++i) sink = t.get<blob>(ids[rng.range(n_records)])->counter;
+        t1 = std::chrono::steady_clock::now();
+        report("ours-def", "random read", n_random, secs(t0, t1));
+        const pressure after_read = sample();
+
+        // The flush is inside the timing: deferring the writes does not make
+        // them go away, and a comparison that left them out would be a lie.
+        t0 = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n_random; ++i) t.update<&blob::counter>(ids[rng.range(n_records)], (uint64_t)i);
+        t.flush();
+        t1 = std::chrono::steady_clock::now();
+        report("ours-def", "random update", n_random, secs(t0, t1));
+        const pressure after_update = sample();
+
+        std::vector<storage::record_id> hot;
+        hot.reserve(n_hot);
+        for (std::size_t i = 0; i < n_hot; ++i) hot.push_back(ids[rng.range(n_records)]);
+
+        t0 = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n_hot; ++i) sink = t.get<blob>(hot[i])->f1;
+        t1 = std::chrono::steady_clock::now();
+        report("ours-def", "read hot, before", n_hot, secs(t0, t1));
+
+        t0 = std::chrono::steady_clock::now();
+        for (std::size_t r = 0; r < hot_rounds; ++r)
+            for (std::size_t i = 0; i < n_hot; ++i)
+                switch (r) {
+                    case 0: t.update<&blob::counter>(hot[i], r); break;
+                    case 1: t.update<&blob::f1>(hot[i], r); break;
+                    case 2: t.update<&blob::f2>(hot[i], r); break;
+                    case 3: t.update<&blob::f3>(hot[i], r); break;
+                    default: t.update<&blob::f4>(hot[i], r); break;
+                }
+        t.flush();
+        t1 = std::chrono::steady_clock::now();
+        report("ours-def", "hot update x5", n_hot * hot_rounds, secs(t0, t1));
+
+        t0 = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n_hot; ++i) sink = t.get<blob>(hot[i])->f1;
+        t1 = std::chrono::steady_clock::now();
+        report("ours-def", "read hot, after", n_hot, secs(t0, t1));
+        (void)sink;
+
+        std::printf("      RSS %zu MB, major faults: %zu during reads, %zu during updates\n",
+                    sample().rss_mb, after_read.major - before.major, after_update.major - after_read.major);
+        std::printf("      settled on read: %zu\n", t.settles());
+        std::printf("      on disk: %.1f GB (log + materialized records)\n",
+                    (dir_bytes("big_def.log") + dir_bytes("big_def.data")) / 1073741824.0);
+        std::remove("big_def.log"); std::remove("big_def.data");
+    }
+
 #ifdef HAVE_POSTGRES
     // =================================================================
     // postgres - a different class of system, and the comparison has to say
@@ -684,6 +765,7 @@ int main(int argc, char** argv) {
 
     if (engine == "ours") run_ours();
     else if (engine == "ours-fields") run_ours_fields();
+    else if (engine == "ours-deferred") run_ours_deferred();
     else if (engine == "lmdb") run_lmdb();
 #ifdef HAVE_ROCKSDB
     else if (engine == "rocksdb") run_rocksdb();

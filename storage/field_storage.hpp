@@ -71,6 +71,7 @@
 
 #include "storage.hpp"
 
+#include <optional>
 #include <string>
 
 namespace storage {
@@ -201,8 +202,36 @@ namespace storage {
             const record_id id = head->next_id++;
             if (id >= spec::max_ids) return 0;
             std::byte* logged = append<record_op::create>(id, 0, T::tag, std::as_bytes(std::span{&value, 1}));
-            apply<provenance::local>(*header_of(logged), logged);
+            apply_local<record_op::create>(*header_of(logged), logged);
             return id;
+        }
+
+        // Claims an id without writing, for a caller that must name a record
+        // before it is ready to append it - a staged transaction assigning ids
+        // to records that later staged records refer to.
+        [[nodiscard]] record_id reserve_id() noexcept { return head->next_id++; }
+
+        // Type-erased recreate, for a caller holding a record's bytes and its
+        // tag without naming its C++ type.
+        record_id create_raw(record_id id, tag_t tag, std::span<const std::byte> bytes) {
+            if (id >= spec::max_ids || bytes.size() > spec::max_record_bytes) return 0;
+            std::byte* logged = append<record_op::create>(id, 0, tag, bytes);
+            apply_local<record_op::create>(*header_of(logged), logged);
+            return id;
+        }
+
+        // Sets bits in record_header::flags on the most recently appended
+        // record and refreshes its checksum, so a layer above can mark a
+        // boundary - the end of a transaction, say - without spending a
+        // record on it. Same argument as storage.hpp's: the record was
+        // appended since the last sync(), so its page is already dirty and
+        // already inside the range the next msync covers.
+        bool set_last_record_flags(uint8_t bits) noexcept {
+            if (last_record_offset == no_record_yet) return false;
+            record_header* h = (record_header*)(base + last_record_offset);
+            h->flags |= bits;
+            h->checksum = checksum_of(*h, base + last_record_offset + sizeof(record_header), h->len);
+            return true;
         }
 
         template <tagged_aggregate T>
@@ -210,7 +239,7 @@ namespace storage {
             static_assert(sizeof(T) <= spec::max_record_bytes, "raise field_spec::max_record_bytes for this type");
             if (id >= spec::max_ids) return 0;
             std::byte* logged = append<record_op::create>(id, 0, T::tag, std::as_bytes(std::span{&value, 1}));
-            apply<provenance::local>(*header_of(logged), logged);
+            apply_local<record_op::create>(*header_of(logged), logged);
             return id;
         }
 
@@ -220,7 +249,7 @@ namespace storage {
             if (!alive(id)) return;
             const std::size_t off = (std::size_t)&(((member_class_t<member> const volatile*)0)->*member);
             std::byte* logged = append<record_op::update>(id, (uint32_t)off, tag_t{0}, std::as_bytes(std::span{&value, 1}));
-            apply<provenance::local>(*header_of(logged), logged);
+            apply_local<record_op::update>(*header_of(logged), logged);
         }
 
         // Run-time-offset counterpart of update<member>, for a caller holding
@@ -229,13 +258,13 @@ namespace storage {
             if (!alive(id)) return;
             if ((std::size_t)offset + bytes.size() > record_len(id)) return;
             std::byte* logged = append<record_op::update>(id, offset, tag_t{0}, bytes);
-            apply<provenance::local>(*header_of(logged), logged);
+            apply_local<record_op::update>(*header_of(logged), logged);
         }
 
         void destroy(record_id id) {
             if (!alive(id)) return;
             std::byte* logged = append<record_op::destroy>(id, 0, tag_t{0}, {});
-            apply<provenance::local>(*header_of(logged), logged);
+            apply_local<record_op::destroy>(*header_of(logged), logged);
         }
 
         // ---- reads ------------------------------------------------------
@@ -244,6 +273,18 @@ namespace storage {
         // whole design: the record is the base CREATE plus its overrides, and
         // those live wherever the log happened to be when each was written.
         // There is no address at which the current record exists.
+
+        // The by-value counterpart, so a caller written against storage.hpp's
+        // pointer-returning get() compiles here too: `auto v = t.get<T>(id)`
+        // and then `v->field` or `*v` mean the same thing for a pointer and
+        // for an optional. That is the whole compatibility story - the layers
+        // above this engine had to stop naming `const T*` and say `auto`.
+        template <tagged_aggregate T>
+        [[nodiscard]] std::optional<T> get(record_id id) const {
+            T value;
+            if (!get(id, value)) return std::nullopt;
+            return value;
+        }
 
         template <tagged_aggregate T>
         [[nodiscard]] bool get(record_id id, T& out) const {
@@ -289,44 +330,29 @@ namespace storage {
 
         // ---- the single application point --------------------------------
 
+        // TWO ENTRY POINTS, ONE IMPLEMENTATION PER OP - the same split
+        // storage.hpp makes, for the same measured reason. Bytes off a disk or
+        // a wire carry their op in the header and dispatch at run time; a
+        // record this process just wrote does not, and saying so in the type
+        // is what lets the switch disappear. Left at run time it cost clang
+        // 1.27x on the update path against gcc, purely from a function it
+        // declined to inline because it carried all three cases.
         template <provenance from = provenance::external>
         void apply(record_header hdr, const std::byte* data) {
             if (hdr.id >= spec::max_ids) return;
-            const std::size_t payload_at = (std::size_t)(data - base);
-
-            if (hdr.op == record_op::create) {
-                if (hdr.len > spec::max_record_bytes) return;
-                if (hdr.id >= head->slot_count) head->slot_count = hdr.id + 1;
-                if (head->next_id <= hdr.id) head->next_id = hdr.id + 1;
-                field_slot& s = slots[hdr.id];
-                if (s.base) head->live_byte_count -= header_of(base + s.base)->len;
-
-                obs.on_record(*this, hdr, data);
-                free_chain(hdr.id);
-                s.base = payload_at;
-                head->live_byte_count += hdr.len;
-                return;
+            switch (hdr.op) {
+                case record_op::create:  apply_create(hdr, data); break;
+                case record_op::update:  apply_update<from>(hdr, data); break;
+                case record_op::destroy: apply_destroy(hdr); break;
             }
+        }
 
-            if (!alive(hdr.id)) return;
-            if (hdr.op == record_op::update) {
-                // A diff has to land inside the record it claims to patch.
-                // For a local update the offset came from a pointer-to-member
-                // and there is nothing to re-derive; for a record off the disk
-                // or a wire it is just a number that happened to checksum.
-                if constexpr (from == provenance::external) {
-                    if ((std::size_t)hdr.offset + hdr.len > record_len(hdr.id)) return;
-                }
-                obs.on_record(*this, hdr, data);
-                set_override(hdr.id, hdr.offset, hdr.len, payload_at);
-                maybe_collapse(hdr.id);
-                return;
-            }
-
-            obs.on_record(*this, hdr, data);
-            head->live_byte_count -= record_len(hdr.id);
-            free_chain(hdr.id);
-            slots[hdr.id].base = 0;
+        template <record_op op>
+        void apply_local(record_header hdr, const std::byte* data) {
+            if (hdr.id >= spec::max_ids) return;
+            if constexpr (op == record_op::create) apply_create(hdr, data);
+            else if constexpr (op == record_op::update) apply_update<provenance::local>(hdr, data);
+            else apply_destroy(hdr);
         }
 
         // ---- depth ------------------------------------------------------
@@ -371,6 +397,7 @@ namespace storage {
         // an observer maintained above cannot drift from the data.
         std::size_t recover(std::size_t file_size) {
             reset_header();
+            last_record_offset = no_record_yet;
             const std::size_t pos = scan(base, 0, file_size, [this](record_header hdr, const std::byte* payload) {
                 apply(hdr, payload);
                 return true;
@@ -484,6 +511,42 @@ namespace storage {
         std::byte* raw_base() const noexcept { return base; }
 
     private:
+        // The three op bodies. Every path into the storage - a live write, a
+        // replayed record, a replicated one - ends in exactly one of these.
+        void apply_create(const record_header& hdr, const std::byte* data) {
+            if (hdr.len > spec::max_record_bytes) return;
+            if (hdr.id >= head->slot_count) head->slot_count = hdr.id + 1;
+            if (head->next_id <= hdr.id) head->next_id = hdr.id + 1;
+            field_slot& s = slots[hdr.id];
+            if (s.base) head->live_byte_count -= header_of(base + s.base)->len;
+            obs.on_record(*this, hdr, data);
+            free_chain(hdr.id);
+            s.base = (std::size_t)(data - base);
+            head->live_byte_count += hdr.len;
+        }
+
+        template <provenance from>
+        void apply_update(const record_header& hdr, const std::byte* data) {
+            if (!alive(hdr.id)) return;
+            // A diff has to land inside the record it claims to patch. For a
+            // local update the offset came from a pointer-to-member; for a
+            // record off the disk or a wire it is a number that checksummed.
+            if constexpr (from == provenance::external) {
+                if ((std::size_t)hdr.offset + hdr.len > record_len(hdr.id)) return;
+            }
+            obs.on_record(*this, hdr, data);
+            set_override(hdr.id, hdr.offset, hdr.len, (std::size_t)(data - base));
+            maybe_collapse(hdr.id);
+        }
+
+        void apply_destroy(const record_header& hdr) {
+            if (!alive(hdr.id)) return;
+            obs.on_record(*this, hdr, nullptr);
+            head->live_byte_count -= record_len(hdr.id);
+            free_chain(hdr.id);
+            slots[hdr.id].base = 0;
+        }
+
         static record_header* header_of(std::byte* data) noexcept { return (record_header*)(data - sizeof(record_header)); }
         static const record_header* header_of(const std::byte* data) noexcept {
             return (const record_header*)(data - sizeof(record_header));
@@ -617,7 +680,8 @@ namespace storage {
         std::byte* base = nullptr;
         std::size_t write_offset = 0;
         std::size_t last_synced = 0;
-        std::size_t last_record_offset = 0;
+        static constexpr std::size_t no_record_yet = (std::size_t)-1;
+        std::size_t last_record_offset = no_record_yet;
         std::size_t collapses = 0;
         bool from_checkpoint = false;
         int fd = -1, index_fd = -1;

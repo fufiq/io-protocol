@@ -542,7 +542,7 @@ namespace storage {
             // to the log.
             if (!reserve(id)) return 0; // index full - 0 is never a valid record id
             std::byte* logged = write_record<record_op::create>(id, 0, T::tag, std::as_bytes(std::span{&value, 1}));
-            apply<provenance::local>(*header_of(logged), logged);
+            apply_local<record_op::create>(*header_of(logged), logged);
             return id;
         }
 
@@ -553,7 +553,7 @@ namespace storage {
         record_id recreate(record_id id, const T& value) {
             if (!reserve(id)) return 0;
             std::byte* logged = write_record<record_op::create>(id, 0, T::tag, std::as_bytes(std::span{&value, 1}));
-            apply<provenance::local>(*header_of(logged), logged);
+            apply_local<record_op::create>(*header_of(logged), logged);
             return id;
         }
 
@@ -563,13 +563,13 @@ namespace storage {
             if (!alive(id)) return;
             const std::size_t off = member_offset<member>();
             std::byte* logged = write_record<record_op::update>(id, (uint32_t)(off), tag_t{0}, std::as_bytes(std::span{&value, 1}));
-            apply<provenance::local>(*header_of(logged), logged);
+            apply_local<record_op::update, sizeof(member_value_t<member>)>(*header_of(logged), logged);
         }
 
         void destroy(record_id id) {
             if (!alive(id)) return;
             std::byte* logged = write_record<record_op::destroy>(id, 0, tag_t{0}, {});
-            apply<provenance::local>(*header_of(logged), logged);
+            apply_local<record_op::destroy>(*header_of(logged), logged);
         }
 
         template <tagged_aggregate T>
@@ -592,7 +592,7 @@ namespace storage {
         record_id create_raw(record_id id, tag_t tag, std::span<const std::byte> bytes) {
             if (!reserve(id)) return 0;
             std::byte* logged = write_record<record_op::create>(id, 0, tag, bytes);
-            apply<provenance::local>(*header_of(logged), logged);
+            apply_local<record_op::create>(*header_of(logged), logged);
             return id;
         }
 
@@ -643,7 +643,9 @@ namespace storage {
             if (!alive(id)) return;
             if ((std::size_t)offset + bytes.size() > header_of(record_ptr(id))->len) return;
             std::byte* logged = write_record<record_op::update>(id, offset, tag_t{0}, bytes);
-            apply(*header_of(logged), logged);
+            // local: the range was already checked above, so the external
+            // path would only check it a second time.
+            apply_local<record_op::update>(*header_of(logged), logged);
         }
 
         void for_each_raw(auto&& fn) const requires std::invocable<decltype(fn), raw_view> {
@@ -672,62 +674,37 @@ namespace storage {
         // allowed to alias anything - so the compiler would have to reload
         // hdr.id/op/offset/len from memory after each one. Measured on random
         // updates: 9.2M ops/s with a reference, 32.2M with a copy of the same
-        // 24 bytes. Same reason record_ptr() is hoisted into `rec` instead of
-        // being called twice: the second call would reload index[id].
+        // 24 bytes.
+        //
+        // TWO ENTRY POINTS, ONE IMPLEMENTATION PER OP. Bytes off a disk or a
+        // wire carry their op in the header, so they dispatch at run time. A
+        // record this process just wrote does not: update<member> always writes
+        // an update whose payload is exactly sizeof the member. Saying so in
+        // the type lets the switch and the length dispatch vanish, and the
+        // three op bodies are still the only implementations there are - what
+        // is specialised is which one is reached, not what it does.
+        //
+        // Not micro-tuning for its own sake. With the op left at run time,
+        // clang emitted 70% more instructions than gcc on the identical update
+        // loop (160.8M against 94.4M, IPC 0.93 against 0.84 - more work, not
+        // more stalls) and ran 1.8x slower, because it declined to inline a
+        // function carrying all three paths.
         template <provenance from = provenance::external>
         void apply(record_header hdr, const std::byte* data) {
-            // Every reason to refuse comes first, so that by the time the
-            // observer is called the record is certain to be applied.
-            index_entry* slot = nullptr;
-            std::byte* rec = nullptr;
-            if (hdr.op == record_op::create) {
-                slot = reserve(hdr.id);
-                if (!slot) return; // id beyond a file-backed index's capacity
-            } else {
-                if (!alive(hdr.id)) return; // dead or never existed
-                rec = record_ptr(hdr.id);
-                // An UPDATE has to land inside the record it claims to patch.
-                // For external bytes nothing guarantees that: the checksum
-                // only proves they are the bytes that were sent, and for a
-                // replica they were sent by a primary that may be compromised
-                // or simply buggy (see tests/fuzz/fuzz_wal_apply_range.cpp).
-                //
-                // A local UPDATE's offset comes from member_offset<member>(),
-                // a compile-time offset into member_class_t<member>, so there
-                // is nothing to re-derive. It does NOT prove the record is a
-                // member_class_t - nothing in this engine ties a record's tag
-                // to a type, and get<T>(id) reinterprets just as freely (see
-                // HEAP_API.md: "no type registry, so a stale tag on old data
-                // is silently misread"). Calling update<&user::balance> on an
-                // id holding some other type is the same class of mistake as
-                // get<user> on it, and is the caller's to avoid. Catching it
-                // here would mean loading a header that sits 24 bytes before
-                // the payload, often in another cache line - measured at 19%
-                // of the update path - to defend against a mistake the rest
-                // of this API already trusts the caller not to make.
-                if constexpr (from == provenance::external) {
-                    if (hdr.op == record_op::update &&
-                        (std::size_t)hdr.offset + hdr.len > header_of(rec)->len) return;
-                }
-            }
-
-            obs.on_record(*this, hdr, data);
-
             switch (hdr.op) {
-                case record_op::create:
-                    if (slot->offset) live_byte_count -= header_of(data_base + slot->offset)->len;
-                    slot->offset = offset_in_data(materialize(hdr.id, hdr.tag, data, hdr.len));
-                    live_byte_count += hdr.len;
-                    break;
-                case record_op::update:
-                    copy_field(rec + hdr.offset, data, hdr.len);
-                    refresh_after_patch(hdr.id);
-                    break;
-                case record_op::destroy:
-                    live_byte_count -= header_of(rec)->len;
-                    index[hdr.id].offset = 0;
-                    break;
+                case record_op::create:  apply_create(hdr, data); break;
+                case record_op::update:  apply_update<from, 0>(hdr, data); break;
+                case record_op::destroy: apply_destroy(hdr); break;
             }
+        }
+
+        // payload_len is the payload's size when the caller knows it, and 0
+        // when it does not - patch(), whose length is a run-time argument.
+        template <record_op op, std::size_t payload_len = 0>
+        void apply_local(record_header hdr, const std::byte* data) {
+            if constexpr (op == record_op::create) apply_create(hdr, data);
+            else if constexpr (op == record_op::update) apply_update<provenance::local, payload_len>(hdr, data);
+            else apply_destroy(hdr);
         }
 
         // Walks the verified records of [from, to) and hands each to fn
@@ -1207,6 +1184,44 @@ namespace storage {
         }
 
     private:
+        // The three op bodies. Every path into the storage - a live write, a
+        // replayed record, a replicated one - ends in exactly one of these.
+        void apply_create(const record_header& hdr, const std::byte* data) {
+            index_entry* slot = reserve(hdr.id);
+            if (!slot) return; // id beyond a file-backed index's capacity
+            obs.on_record(*this, hdr, data);
+            if (slot->offset) live_byte_count -= header_of(data_base + slot->offset)->len;
+            slot->offset = offset_in_data(materialize(hdr.id, hdr.tag, data, hdr.len));
+            live_byte_count += hdr.len;
+        }
+
+        template <provenance from, std::size_t payload_len>
+        void apply_update(const record_header& hdr, const std::byte* data) {
+            if (!alive(hdr.id)) return;
+            std::byte* rec = record_ptr(hdr.id);
+            // A diff has to land inside the record it claims to patch. For a
+            // local update the offset came from a pointer-to-member and there
+            // is nothing to re-derive; for a record off the disk or a wire it
+            // is just a number that happened to checksum.
+            if constexpr (from == provenance::external) {
+                if ((std::size_t)hdr.offset + hdr.len > header_of(rec)->len) return;
+            }
+            obs.on_record(*this, hdr, data);
+            // A known length is one load and one store. An unknown one has to
+            // dispatch on it, which is what copy_field exists for.
+            if constexpr (payload_len != 0) std::memcpy(rec + hdr.offset, data, payload_len);
+            else copy_field(rec + hdr.offset, data, hdr.len);
+            refresh_after_patch(hdr.id);
+        }
+
+        void apply_destroy(const record_header& hdr) {
+            if (!alive(hdr.id)) return;
+            std::byte* rec = record_ptr(hdr.id);
+            obs.on_record(*this, hdr, nullptr);
+            live_byte_count -= header_of(rec)->len;
+            index[hdr.id].offset = 0;
+        }
+
         static record_header* header_of(std::byte* data) noexcept {
             return (record_header*)(data - sizeof(record_header));
         }

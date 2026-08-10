@@ -40,6 +40,7 @@
 // recover_to_last_commit() stops before it.
 
 #include "app_layer.hpp"
+#include "../storage/field_storage.hpp"
 
 #include <cstdio>
 #include <optional>
@@ -50,6 +51,11 @@ namespace app {
     template <typename spec>
     using table_t = storage::storage<spec, schema_index>;
 
+    // And the same schema over the field-granular engine, so the two can be
+    // compared carrying identical indexes, constraints and triggers.
+    template <typename spec>
+    using field_table_t = storage::field_storage<spec, schema_index>;
+
     // How a transaction ended, so a benchmark can count outcomes rather than
     // guess at them.
     enum class txn_result { committed, aborted_constraint, aborted_by_caller };
@@ -57,10 +63,13 @@ namespace app {
     // The widest record in the schema; every staged value fits in one of these.
     inline constexpr std::size_t max_record_bytes = sizeof(order_line);
 
-    template <typename spec>
+    // Templated on the TABLE, not on the spec, so one transaction layer drives
+    // either engine. Class template argument deduction means call sites still
+    // read `txn tx(table, id)`.
+    template <typename table_type>
     class txn {
     public:
-        explicit txn(table_t<spec>& table, uint64_t id) : t(table), txn_id(id) {}
+        explicit txn(table_type& table, uint64_t id) : t(table), txn_id(id) {}
         ~txn() = default; // an unflushed transaction simply never happened
 
         txn(const txn&) = delete;
@@ -305,10 +314,11 @@ namespace app {
 
         uint32_t copy_committed(record_id id, tag_t what, std::byte* out) const {
             switch ((kind)what) {
-                case kind::customer:   std::memcpy(out, t.template get<customer>(id), sizeof(customer)); return sizeof(customer);
-                case kind::product:    std::memcpy(out, t.template get<product>(id), sizeof(product)); return sizeof(product);
-                case kind::order:      std::memcpy(out, t.template get<order>(id), sizeof(order)); return sizeof(order);
-                case kind::order_line: std::memcpy(out, t.template get<order_line>(id), sizeof(order_line)); return sizeof(order_line);
+                // &* works for both a pointer and an optional.
+                case kind::customer:   { auto v = t.template get<customer>(id); std::memcpy(out, &*v, sizeof(customer)); return sizeof(customer); }
+                case kind::product:    { auto v = t.template get<product>(id); std::memcpy(out, &*v, sizeof(product)); return sizeof(product); }
+                case kind::order:      { auto v = t.template get<order>(id); std::memcpy(out, &*v, sizeof(order)); return sizeof(order); }
+                case kind::order_line: { auto v = t.template get<order_line>(id); std::memcpy(out, &*v, sizeof(order_line)); return sizeof(order_line); }
             }
             return 0;
         }
@@ -329,7 +339,7 @@ namespace app {
             return false;
         }
 
-        table_t<spec>& t;
+        table_type& t;
         uint64_t txn_id;
         std::vector<staged> ops;
         std::vector<slot> overlay;
@@ -342,8 +352,7 @@ namespace app {
     // ended, then replay only that far. The engine contributes both halves
     // already; the transaction semantics are a dozen lines on top.
     // =====================================================================
-    template <typename spec>
-    std::size_t recover_to_last_commit(table_t<spec>& table, std::size_t log_size) {
+    std::size_t recover_to_last_commit(auto& table, std::size_t log_size) {
         // Pass one walks the log without applying anything, looking for the
         // boundary flag. Cheap: it verifies checksums and reads headers, and
         // never looks at a payload.
@@ -361,13 +370,12 @@ namespace app {
     // over the live records. The engine's own state came back without
     // replaying anything; this is the part that still has to be paid for,
     // and it costs live data rather than log.
-    template <typename spec>
-    std::size_t rebuild_indexes(table_t<spec>& table, index_store& store, std::size_t capacity) {
+    std::size_t rebuild_indexes(auto& table, index_store& store, std::size_t capacity) {
         // Zeroing the header is what makes attach() treat the region as fresh.
         std::memset(store.region(), 0, sizeof(index_header));
         table.observer_state().attach(store.region(), store.region_bytes(), capacity);
         std::size_t seen = 0;
-        table.for_each_raw([&](typename table_t<spec>::raw_view rv) {
+        table.for_each_raw([&](auto rv) {
             table.observer_state().index_existing(rv.id, rv.tag, rv.bytes.data());
             ++seen;
         });
@@ -376,13 +384,11 @@ namespace app {
 
     // ---- queries, to show what the indexes are for ----------------------
 
-    template <typename spec>
-    record_id find_customer_by_email(const table_t<spec>& table, uint64_t email_hash) {
+    record_id find_customer_by_email(const auto& table, uint64_t email_hash) {
         return table.observer_state().customer_by_email(email_hash);
     }
 
-    template <typename spec>
-    record_id scan_customer_by_email(const table_t<spec>& table, uint64_t email_hash) {
+    record_id scan_customer_by_email(const auto& table, uint64_t email_hash) {
         record_id found = 0;
         table.template for_each<customer>([&](record_id id, const customer& c) {
             if (!found && c.email_hash == email_hash && table.tag_of(id) == customer::tag) found = id;
@@ -390,16 +396,14 @@ namespace app {
         return found;
     }
 
-    template <typename spec>
-    std::size_t count_products_in_price_range(const table_t<spec>& table, int64_t lo, int64_t hi) {
+    std::size_t count_products_in_price_range(const auto& table, int64_t lo, int64_t hi) {
         return table.observer_state().products_in_price_range(lo, hi);
     }
 
-    template <typename spec>
-    int64_t sum_customer_order_totals(const table_t<spec>& table, record_id customer_id) {
+    int64_t sum_customer_order_totals(const auto& table, record_id customer_id) {
         int64_t total = 0;
         table.observer_state().each_order_of(customer_id, [&](uint64_t o) {
-            if (const order* rec = table.template get<order>((record_id)o)) total += rec->total;
+            if (auto rec = table.template get<order>((record_id)o)) total += rec->total;
         });
         return total;
     }

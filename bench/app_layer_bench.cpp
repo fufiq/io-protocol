@@ -208,7 +208,7 @@ namespace {
 
         auto t0 = std::chrono::steady_clock::now();
         for (std::size_t i = 0; i < n_customers; ++i) {
-            txn<app_spec> tx(table, txn_id++);
+            txn tx(table, txn_id++);
             record_id id = tx.insert_customer(customer{ (uint64_t)i + 1, 1'000'000'000, (uint32_t)(i % 40), 0 });
             if (tx.commit(durable) == txn_result::committed) w.customers.push_back(id);
         }
@@ -217,7 +217,7 @@ namespace {
 
         t0 = std::chrono::steady_clock::now();
         for (std::size_t i = 0; i < n_products; ++i) {
-            txn<app_spec> tx(table, txn_id++);
+            txn tx(table, txn_id++);
             record_id id = tx.insert_product(product{ (uint64_t)i + 1, (int64_t)(rng.range(1000) + 1), 1'000'000 });
             if (tx.commit(durable) == txn_result::committed) w.products.push_back(id);
         }
@@ -235,7 +235,7 @@ namespace {
         const std::size_t before = table.current_offset();
         auto t0 = std::chrono::steady_clock::now();
         for (std::size_t i = 0; i < n; ++i) {
-            txn<app_spec> tx(table, txn_id++);
+            txn tx(table, txn_id++);
             tx.insert_customer(customer{ (uint64_t)(i % n_customers) + 1, 5, 0, 0 });
             if (tx.commit(false) != txn_result::committed) ++rejected;
         }
@@ -257,7 +257,7 @@ namespace {
         const std::size_t log_before = table.current_offset();
         auto t0 = std::chrono::steady_clock::now();
         for (std::size_t i = 0; i < n_orders; ++i) {
-            txn<app_spec> tx(table, txn_id++);
+            txn tx(table, txn_id++);
             record_id customer = w.customers[rng.range(w.customers.size())];
             record_id o = tx.insert_order(customer);
             for (std::size_t l = 0; l < lines_per_order && o; ++l)
@@ -288,7 +288,7 @@ namespace {
 
         auto t0 = std::chrono::steady_clock::now();
         for (std::size_t i = 0; i < n; ++i) {
-            txn<app_spec> tx(table, txn_id++);
+            txn tx(table, txn_id++);
             record_id o = tx.insert_order(w.customers[rng.range(w.customers.size())]);
             for (std::size_t l = 0; l < lines_per_order && o; ++l)
                 tx.insert_line(o, w.products[rng.range(w.products.size())], 1);
@@ -308,7 +308,7 @@ namespace {
 
         auto t0 = std::chrono::steady_clock::now();
         for (std::size_t i = 0; i < n; ++i) {
-            txn<app_spec> tx(table, txn_id++);
+            txn tx(table, txn_id++);
             if (tx.delete_order(w.orders[i]) && tx.commit(false) == txn_result::committed) ++deleted;
         }
         auto t1 = std::chrono::steady_clock::now();
@@ -554,7 +554,7 @@ namespace {
 
             auto t0 = std::chrono::steady_clock::now();
             for (std::size_t i = 0; i < n_crud; ++i) {
-                txn<app_spec> tx(table, txn_id++);
+                txn tx(table, txn_id++);
                 record_id id = tx.insert_customer(customer{ (uint64_t)i + 1, 1000, 0, 0 });
                 tx.commit(false);
                 ids.push_back(id);
@@ -575,7 +575,7 @@ namespace {
 
             t0 = std::chrono::steady_clock::now();
             for (std::size_t i = 0; i < n_crud; ++i) {
-                txn<app_spec> tx(table, txn_id++);
+                txn tx(table, txn_id++);
                 tx.update<&customer::balance>(ids[i], (int64_t)i);
                 tx.commit(false);
             }
@@ -584,7 +584,7 @@ namespace {
 
             t0 = std::chrono::steady_clock::now();
             for (std::size_t i = 0; i < n_crud; ++i) {
-                txn<app_spec> tx(table, txn_id++);
+                txn tx(table, txn_id++);
                 tx.delete_customer(ids[i]);
                 tx.commit(false);
             }
@@ -650,7 +650,7 @@ namespace {
             indexed_table it("applayer.sidx");
             auto& table = it.table;
 
-            txn<app_spec> good(table, 1);
+            txn good(table, 1);
             survivor = good.insert_customer(customer{ 1, 100, 0, 0 });
             good.commit(true);
 

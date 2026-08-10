@@ -136,6 +136,37 @@
 // dominates everything either design does.
 //
 // ---------------------------------------------------------------------------
+// GCC AND CLANG, and a real bug found by trying both. 500k records, no fsync,
+// alternated runs, clang 20.1.8 against gcc 14.3.1, both -O3 -march=native:
+//
+//                            gcc      clang (before)   clang (after)
+//   ours   insert          8.4M          8.2M              8.5M
+//   ours   random read      114M          114M              114M
+//   ours   random update     36M         19.5M              36.5M
+//
+// Everything matched except the update path, where clang ran 1.8x slower and
+// did so with unusual consistency (19.7 / 19.2 / 19.5 across runs). perf said
+// it was not stalling: 160.8M instructions against gcc's 94.4M at a BETTER
+// IPC, 0.93 to 0.84. More work, not slower work - the signature of a function
+// one compiler inlines and the other does not.
+//
+// The function was apply(), which switched on hdr.op at run time and therefore
+// carried the create, update and destroy paths together. But a local write
+// knows its op at compile time: update<member> always writes an update whose
+// payload is exactly sizeof the member. Saying so in the type (apply_local<op,
+// len>) removes the switch and the length dispatch from that path, and clang
+// went to 36.5M - level with gcc.
+//
+// Worth recording honestly: the instruction count only fell 10% (160.8M to
+// 144.3M) while the time halved, so instruction count is not the whole
+// explanation and I did not isolate the rest. clang still emits ~54% more
+// instructions than gcc here and now runs them just as fast.
+//
+// Under the full application schema (bench/schema_comparison.cpp) the two
+// compilers are within noise on every column, for the same reason the two
+// engines are: the layer above dominates.
+//
+// ---------------------------------------------------------------------------
 // WHERE THE TIME ACTUALLY GOES. Throughput says who won; hardware counters say
 // why. One engine at a time, pinned to a P-core, 1.5M ops per run
 // (500k insert + 500k read + 500k update):
@@ -211,6 +242,7 @@
 
 #include "../storage/storage.hpp"
 #include "../storage/field_storage.hpp"
+#include "deferred_storage.hpp"
 
 #include <lmdb.h>
 
@@ -315,6 +347,51 @@ void bench_ours_fields(bool sync_per_batch) {
     }
     std::remove("kvbench_fields.log");
     std::remove("kvbench_fields.idx");
+}
+
+// The third option: an update writes nothing but the log and a pending chain,
+// a read settles the record it touches, and a flush applies what is left in
+// ADDRESS order. See bench/deferred_storage.hpp.
+void bench_ours_deferred(bool sync_per_batch) {
+    std::remove("kvbench_def.log");
+    std::remove("kvbench_def.data");
+    const char* dur = sync_per_batch ? "fsync/batch" : "no fsync";
+    {
+        deferred::store table("kvbench_def.log", "kvbench_def.data", 1ull << 30, 1'000'000);
+        if (!table.ok()) { std::printf("ours-def: could not map\n"); return; }
+
+        record r{};
+        auto t0 = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < n_records; ++i) {
+            r.key = i + 1;
+            table.create(r);
+            if (sync_per_batch && (i + 1) % batch_size == 0) table.sync();
+        }
+        if (sync_per_batch) table.sync();
+        auto t1 = std::chrono::steady_clock::now();
+        row("ours-def", "insert", dur, n_records, secs(t0, t1));
+
+        auto keys = shuffled_keys(n_records, 1);
+        uint64_t sink = 0;
+        auto t2 = std::chrono::steady_clock::now();
+        for (auto k : keys) { const record* got = table.get<record>(k); if (got) sink += got->key; }
+        auto t3 = std::chrono::steady_clock::now();
+        row("ours-def", "random read", "n/a", n_records, secs(t2, t3));
+        if (sink == 0) std::printf("  (sink=%llu)\n", (unsigned long long)sink);
+
+        auto t4 = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < keys.size(); ++i) {
+            table.update<&record::key>(keys[i], keys[i]);
+            if (sync_per_batch && (i + 1) % batch_size == 0) table.sync();
+        }
+        if (!sync_per_batch) table.flush();   // the merge is part of the update cost
+        else table.sync();
+        auto t5 = std::chrono::steady_clock::now();
+        row("ours-def", "random update", dur, n_records, secs(t4, t5));
+        std::printf("  (settled on read: %zu)\n", table.settles());
+    }
+    std::remove("kvbench_def.log");
+    std::remove("kvbench_def.data");
 }
 
 void bench_ours(bool sync_per_batch) {
@@ -534,6 +611,7 @@ int main(int argc, char** argv) {
         if (!quiet) std::printf("\n--- durability: %s ---\n", sync ? "fsync per batch" : "no fsync");
         if (engine == "all" || engine == "ours") bench_ours(sync);
         if (engine == "all" || engine == "ours-fields") bench_ours_fields(sync);
+        if (engine == "all" || engine == "ours-deferred") bench_ours_deferred(sync);
         if (engine == "all" || engine == "lmdb") bench_lmdb(sync);
 #ifdef HAVE_ROCKSDB
         if (engine == "all" || engine == "rocksdb") bench_rocksdb(sync);

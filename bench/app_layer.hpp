@@ -268,7 +268,10 @@ namespace app {
                     emails.erase(table.template get<customer>(id)->email_hash);
                     break;
                 case kind::product: {
-                    const product* p = table.template get<product>(id);
+                    // auto, not const product* - this file is compiled against
+                    // both engines, and get() hands back a pointer from one
+                    // and an optional from the other. Both spell -> the same.
+                    auto p = table.template get<product>(id);
                     skus.erase(p->sku_hash);
                     prices.erase(p->price, id);
                     break;
@@ -277,7 +280,7 @@ namespace app {
                     orders_of_customer.erase(table.template get<order>(id)->customer_id, id);
                     break;
                 case kind::order_line: {
-                    const order_line* l = table.template get<order_line>(id);
+                    auto l = table.template get<order_line>(id);
                     lines_of_order.erase(l->order_id, id);
                     const uint64_t* n = lines_per_product.find(l->product_id);
                     if (n && *n > 1) lines_per_product.insert(l->product_id, *n - 1);

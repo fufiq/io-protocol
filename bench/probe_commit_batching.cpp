@@ -83,7 +83,7 @@ namespace {
 
         auto t0 = std::chrono::steady_clock::now();
         for (std::size_t i = 0; i < n_ops; ++i) {
-            txn<probe_spec> tx(table, txn_id++);
+            txn tx(table, txn_id++);
             tx.insert_customer(customer{ (uint64_t)i + 1, 1'000'000, 0, 0 });
             tx.commit(false);                       // the transaction ends...
             if ((i + 1) % batch == 0) table.sync(); // ...durability is a separate decision

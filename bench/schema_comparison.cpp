@@ -106,6 +106,33 @@
 // deletes from ~19.4M/s to ~8.5M/s. That is the price of a restart that
 // costs nothing, and it disappears entirely the moment any durability is on.
 //
+// THE SAME SCHEMA ON BOTH OF OUR ENGINES. Identical unique index, identical
+// constraints, identical transactions, one carried by storage.hpp and one by
+// field_storage.hpp. 200k records, no fsync, three alternated runs:
+//
+//   operation                     ours   ours-fld
+//   insert + unique index      5250000    7060000    field 1.35x
+//   read by primary id        79000000   54600000    ours  1.45x
+//   read by secondary key     80000000   81700000    equal
+//   update non-indexed         7800000    6890000    ours  1.13x
+//   update INDEXED field       6250000    5150000    ours  1.21x
+//   delete + index entry       8050000    6710000    ours  1.20x
+//
+// With group commit at 1 per 1000 both land near 0.8-1.0M on everything and
+// the difference disappears into the flush.
+//
+// THE POINT IS HOW SMALL THESE GAPS ARE. On the bare engines
+// (bench/kv_comparison.cpp) the same two differ by 2.3x on insert, 1.8x on
+// read and 1.5x on update. Under a real schema the observer maintaining six
+// indexes, the constraint checks and the transaction staging dominate, and
+// the engine becomes a smaller share of the total. Reading by secondary key
+// is identical to three digits because the engine is not involved at all -
+// that is a probe into the shared flat index.
+//
+// So the engine choice matters where it was measured to matter - above RAM,
+// where field_storage takes 78x fewer major faults per update and half the
+// disk - and much less than it looks under an application.
+//
 // FOUR CAVEATS, all of which cut against us:
 //
 // * RocksDB runs on defaults here - no bloom filters on the column families,
@@ -214,6 +241,88 @@ namespace {
         return "fsync/" + std::to_string(batch);
     }
 
+    // The identical schema - same unique index, same constraints, same
+    // transactions - carried by the field-granular engine instead. One file,
+    // nothing patched in place.
+    using field_bench_spec = storage::field_spec<"schemacmp_fld.log", 2ull << 30, "schemacmp_fld.idx",
+                                                 4'000'000, 4'000'000, 8, 128>;
+
+    void bench_ours_fields(std::size_t batch) {
+        const std::string dl = label(batch);
+        const char* d = dl.c_str();
+        std::remove("schemacmp_fld.log"); std::remove("schemacmp_fld.idx"); std::remove("schemacmp_fld.sidx");
+        std::vector<record_id> ids;
+        ids.reserve(n_records);
+        {
+            field_table_t<field_bench_spec> table;
+            index_store store;
+            if (!table.ok() || !store.open("schemacmp_fld.sidx", index_capacity()) ||
+                !table.observer_state().attach(store.region(), store.region_bytes(), index_capacity())) {
+                std::printf("ours-fld: could not map\n"); return;
+            }
+            uint64_t txn_id = 1;
+            auto group_commit = [&](std::size_t i) { if (batch && (i + 1) % batch == 0) table.sync(); };
+
+            auto t0 = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < n_records; ++i) {
+                txn tx(table, txn_id++);
+                ids.push_back(tx.insert_customer(customer{ (uint64_t)i + 1, 1'000'000, (uint32_t)(i % 40), 0 }));
+                tx.commit(false);
+                group_commit(i);
+            }
+            auto t1 = std::chrono::steady_clock::now();
+            line("ours-fld", "insert + unique index", d, n_records, secs(t0, t1));
+
+            xorshift rng(5);
+            volatile int64_t sink = 0;
+            t0 = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < n_records; ++i) sink = table.get<customer>(ids[rng.range(n_records)])->balance;
+            t1 = std::chrono::steady_clock::now();
+            line("ours-fld", "read by primary id", "n/a", n_records, secs(t0, t1));
+
+            volatile record_id id_sink = 0;
+            t0 = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < n_records; ++i) id_sink = find_customer_by_email(table, rng.range(n_records) + 1);
+            t1 = std::chrono::steady_clock::now();
+            line("ours-fld", "read by secondary key", "n/a", n_records, secs(t0, t1));
+            (void)sink; (void)id_sink;
+
+            t0 = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < n_records; ++i) {
+                txn tx(table, txn_id++);
+                tx.update<&customer::balance>(ids[i], (int64_t)i);
+                tx.commit(false);
+                group_commit(i);
+            }
+            t1 = std::chrono::steady_clock::now();
+            line("ours-fld", "update non-indexed field", d, n_records, secs(t0, t1));
+
+            t0 = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < n_records; ++i) {
+                txn tx(table, txn_id++);
+                tx.update<&customer::email_hash>(ids[i], (uint64_t)(i + 1 + n_records));
+                tx.commit(false);
+                group_commit(i);
+            }
+            t1 = std::chrono::steady_clock::now();
+            line("ours-fld", "update INDEXED field", d, n_records, secs(t0, t1));
+
+            const std::size_t n_deleted = n_records / 2;
+            t0 = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < n_deleted; ++i) {
+                txn tx(table, txn_id++);
+                tx.delete_customer(ids[i]);
+                tx.commit(false);
+                group_commit(i);
+            }
+            t1 = std::chrono::steady_clock::now();
+            line("ours-fld", "delete + index entry", d, n_deleted, secs(t0, t1));
+            table.sync();
+            store.sync();
+        }
+        std::remove("schemacmp_fld.log"); std::remove("schemacmp_fld.idx"); std::remove("schemacmp_fld.sidx");
+    }
+
     void bench_ours(std::size_t batch) {
         const std::string dl = label(batch);
         const char* d = dl.c_str();
@@ -239,7 +348,7 @@ namespace {
 
             auto t0 = std::chrono::steady_clock::now();
             for (std::size_t i = 0; i < n_records; ++i) {
-                txn<bench_spec> tx(table, txn_id++);
+                txn tx(table, txn_id++);
                 ids.push_back(tx.insert_customer(customer{ (uint64_t)i + 1, 1'000'000, (uint32_t)(i % 40), 0 }));
                 tx.commit(false);
                 group_commit(i);
@@ -263,7 +372,7 @@ namespace {
 
             t0 = std::chrono::steady_clock::now();
             for (std::size_t i = 0; i < n_records; ++i) {
-                txn<bench_spec> tx(table, txn_id++);
+                txn tx(table, txn_id++);
                 tx.update<&customer::balance>(ids[i], (int64_t)i);
                 tx.commit(false);
                 group_commit(i);
@@ -275,7 +384,7 @@ namespace {
             // entry has to be retracted and re-inserted.
             t0 = std::chrono::steady_clock::now();
             for (std::size_t i = 0; i < n_records; ++i) {
-                txn<bench_spec> tx(table, txn_id++);
+                txn tx(table, txn_id++);
                 tx.update<&customer::email_hash>(ids[i], (uint64_t)(i + 1 + n_records));
                 tx.commit(false);
                 group_commit(i);
@@ -289,7 +398,7 @@ namespace {
             const std::size_t n_deleted = n_records / 2;
             t0 = std::chrono::steady_clock::now();
             for (std::size_t i = 0; i < n_deleted; ++i) {
-                txn<bench_spec> tx(table, txn_id++);
+                txn tx(table, txn_id++);
                 tx.delete_customer(ids[i]);
                 tx.commit(false);
                 group_commit(i);
@@ -690,6 +799,7 @@ int main(int argc, char** argv) {
                     batch == 0 ? "none" : batch == 1 ? "one fsync per transaction"
                                                      : ("one fsync per " + std::to_string(batch) + " transactions").c_str());
         if (engine == "all" || engine == "ours") bench_ours(batch);
+        if (engine == "all" || engine == "ours-fields") bench_ours_fields(batch);
         if (engine == "all" || engine == "lmdb") bench_lmdb(batch);
 #ifdef HAVE_ROCKSDB
         if (engine == "all" || engine == "rocksdb") bench_rocksdb(batch);

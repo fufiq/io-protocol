@@ -68,6 +68,24 @@
 // occasionally beats many small faults, because the device is much better at
 // one big read than at thirty-two small ones.
 //
+// A FIFTH ARM, `ours-fields`, is a prototype of a different shape for our own
+// engine: one file, no in-place patching, and an index that points at
+// individual FIELDS rather than whole records (bench/field_log.hpp). Same
+// 26 GB workload:
+//
+//                          shipping   ours-fields
+//   fill (rec/sec)           247213        236050
+//   random read                2920         10104
+//   random update              8828      11357195
+//   hot update x5              5536      19914309
+//   major faults, updates     22013             0
+//   on disk                  56.2 GB       28.0 GB
+//
+// It is a prototype, not a comparable implementation: no recovery, no
+// compaction, and its index is on the heap rather than in a mapping. But the
+// two numbers it was built to test both came out, and one of them came out
+// backwards from the prediction - see field_log.hpp.
+//
 // Postgres, for context, is not the same kind of thing: every operation above
 // is a round trip to another process over a unix socket, and in exchange it
 // gives SQL, a planner, MVCC and concurrent writers. It is configured to
@@ -79,6 +97,7 @@
 //   g++ -std=c++23 -O3 -march=native -o big_dataset bench/big_dataset.cpp \
 //       -llmdb -lrocksdb -lpq -I/usr/include/postgresql -DHAVE_ROCKSDB -DHAVE_POSTGRES
 #include "../storage/storage.hpp"
+#include "field_log.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -109,14 +128,20 @@ namespace {
     constexpr std::size_t log_capacity = 28ull << 30;
     constexpr std::size_t max_ids = 32'000'000;
     constexpr std::size_t n_random = 200'000;
+    constexpr std::size_t n_hot = 100'000;      // records updated over and over
+    constexpr std::size_t hot_rounds = 5;       // distinct fields touched per hot record
 
     std::size_t n_records = 0; // set from argv
 
+    // Several scalar fields, not one: the field-granular prototype is only
+    // interesting when a record accumulates overrides on DIFFERENT fields,
+    // and one counter would never build a chain deeper than 1.
     struct blob {
         static constexpr storage::tag_t tag = 1;
         uint64_t key;
         uint64_t counter;
-        uint8_t payload[value_bytes - 16];
+        uint64_t f1, f2, f3, f4;
+        uint8_t payload[value_bytes - 48];
     };
     static_assert(sizeof(blob) == value_bytes);
     static_assert(storage::tagged_aggregate<blob>);
@@ -225,8 +250,41 @@ namespace {
             report("ours", "random update", n_random, secs(t0, t1));
             const pressure after_update = sample();
 
+            // A hot subset, read before and after being updated many times.
+            // This is what separates the two designs: patching in place keeps
+            // a record contiguous no matter how often it changes, so reading
+            // it must cost the same afterwards as before.
+            std::vector<storage::record_id> hot;
+            hot.reserve(n_hot);
+            for (std::size_t i = 0; i < n_hot; ++i) hot.push_back(ids[rng.range(n_records)]);
+
+            t0 = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < n_hot; ++i) sink = table.get<blob>(hot[i])->f1;
+            t1 = std::chrono::steady_clock::now();
+            report("ours", "read hot, before", n_hot, secs(t0, t1));
+
+            t0 = std::chrono::steady_clock::now();
+            for (std::size_t r = 0; r < hot_rounds; ++r)
+                for (std::size_t i = 0; i < n_hot; ++i) {
+                    const storage::record_id id = hot[i];
+                    switch (r) {
+                        case 0: table.update<&blob::counter>(id, r); break;
+                        case 1: table.update<&blob::f1>(id, r); break;
+                        case 2: table.update<&blob::f2>(id, r); break;
+                        case 3: table.update<&blob::f3>(id, r); break;
+                        default: table.update<&blob::f4>(id, r); break;
+                    }
+                }
+            t1 = std::chrono::steady_clock::now();
+            report("ours", "hot update x5", n_hot * hot_rounds, secs(t0, t1));
+
+            t0 = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < n_hot; ++i) sink = table.get<blob>(hot[i])->f1;
+            t1 = std::chrono::steady_clock::now();
+            report("ours", "read hot, after", n_hot, secs(t0, t1));
+
             std::printf("      RSS %zu MB, major faults: %zu during reads, %zu during updates\n",
-                        after_update.rss_mb, after_read.major - before.major, after_update.major - after_read.major);
+                        sample().rss_mb, after_read.major - before.major, after_update.major - after_read.major);
         }
         std::printf("      on disk: %.1f GB (log + materialized records + index)\n",
                     (dir_bytes("big_ours.db") + dir_bytes("big_ours.db.data") + dir_bytes("big_ours.idx")) / 1073741824.0);
@@ -390,6 +448,96 @@ namespace {
     }
 #endif
 
+    // =================================================================
+    // ours-fields - the same log, indexed per FIELD, with no second region
+    // and nothing patched in place. See bench/field_log.hpp.
+    // =================================================================
+    void run_ours_fields() {
+        std::remove("big_fields.log");
+        fieldlog::store fs("big_fields.log", log_capacity, max_ids, 2'000'000);
+        if (!fs.ok()) { std::printf("ours-fields: could not map the log\n"); return; }
+
+        blob b{};
+        std::memset(b.payload, 0xAB, sizeof(b.payload));
+        blob out{};
+
+        auto t0 = std::chrono::steady_clock::now();
+        std::vector<storage::record_id> ids;
+        ids.reserve(n_records);
+        for (std::size_t i = 0; i < n_records; ++i) {
+            b.key = i + 1; b.counter = i;
+            ids.push_back(fs.create(blob::tag, &b, sizeof(b)));
+            if ((i + 1) % (n_records / 10) == 0)
+                progress(i + 1, n_records, secs(t0, std::chrono::steady_clock::now()), fs.current_offset());
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        report("ours-fld", "fill", n_records, secs(t0, t1));
+
+        const pressure before = sample();
+        xorshift rng(9);
+        volatile uint64_t sink = 0;
+        t0 = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n_random; ++i) { fs.get(ids[rng.range(n_records)], &out, sizeof(out)); sink = out.counter; }
+        t1 = std::chrono::steady_clock::now();
+        report("ours-fld", "random read", n_random, secs(t0, t1));
+        const pressure after_read = sample();
+
+        t0 = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n_random; ++i) {
+            const uint64_t v = i;
+            fs.update(ids[rng.range(n_records)], offsetof(blob, counter), &v, sizeof(v));
+        }
+        t1 = std::chrono::steady_clock::now();
+        report("ours-fld", "random update", n_random, secs(t0, t1));
+        const pressure after_update = sample();
+
+        std::vector<storage::record_id> hot;
+        hot.reserve(n_hot);
+        for (std::size_t i = 0; i < n_hot; ++i) hot.push_back(ids[rng.range(n_records)]);
+
+        t0 = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n_hot; ++i) { fs.get(hot[i], &out, sizeof(out)); sink = out.f1; }
+        t1 = std::chrono::steady_clock::now();
+        report("ours-fld", "read hot, before", n_hot, secs(t0, t1));
+
+        static const uint32_t field_at[hot_rounds] = {
+            offsetof(blob, counter), offsetof(blob, f1), offsetof(blob, f2),
+            offsetof(blob, f3), offsetof(blob, f4),
+        };
+        t0 = std::chrono::steady_clock::now();
+        for (std::size_t r = 0; r < hot_rounds; ++r) {
+            const uint64_t v = r;
+            for (std::size_t i = 0; i < n_hot; ++i) fs.update(hot[i], field_at[r], &v, sizeof(v));
+        }
+        t1 = std::chrono::steady_clock::now();
+        report("ours-fld", "hot update x5", n_hot * hot_rounds, secs(t0, t1));
+
+        t0 = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n_hot; ++i) { fs.get(hot[i], &out, sizeof(out)); sink = out.f1; }
+        t1 = std::chrono::steady_clock::now();
+        report("ours-fld", "read hot, after", n_hot, secs(t0, t1));
+        (void)sink;
+
+        // And with the safety valve applied: collapse every hot record back
+        // into one contiguous CREATE, then read them again.
+        t0 = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n_hot; ++i) fs.collapse(hot[i], &out, sizeof(out), blob::tag);
+        t1 = std::chrono::steady_clock::now();
+        report("ours-fld", "collapse hot", n_hot, secs(t0, t1));
+
+        t0 = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n_hot; ++i) { fs.get(hot[i], &out, sizeof(out)); sink = out.f1; }
+        t1 = std::chrono::steady_clock::now();
+        report("ours-fld", "read hot, collapsed", n_hot, secs(t0, t1));
+
+        std::printf("      RSS %zu MB, major faults: %zu during reads, %zu during updates\n",
+                    sample().rss_mb, after_read.major - before.major, after_update.major - after_read.major);
+        std::printf("      overrides live: %zu, index %.0f MB (heap here, not a mapping)\n",
+                    fs.overrides_used(), fs.index_bytes() / 1048576.0);
+        std::printf("      on disk: %.1f GB (one log, nothing else)\n", dir_bytes("big_fields.log") / 1073741824.0);
+        std::remove("big_fields.log");
+    }
+
 #ifdef HAVE_POSTGRES
     // =================================================================
     // postgres - a different class of system, and the comparison has to say
@@ -503,6 +651,7 @@ int main(int argc, char** argv) {
     std::fflush(stdout);
 
     if (engine == "ours") run_ours();
+    else if (engine == "ours-fields") run_ours_fields();
     else if (engine == "lmdb") run_lmdb();
 #ifdef HAVE_ROCKSDB
     else if (engine == "rocksdb") run_rocksdb();

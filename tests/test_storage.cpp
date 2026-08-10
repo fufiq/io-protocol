@@ -1103,3 +1103,55 @@ TEST_CASE("an UPDATE whose diff falls outside its record is refused") {
     CHECK(t.get<user>(id)->balance == 4242);
     CHECK(t.get<user>(id)->age == 7);
 }
+
+TEST_CASE("recover also refuses an UPDATE whose diff falls outside its record") {
+    // apply_wal_range is one way external bytes get in; a file on disk is the
+    // other. Both must reject the same record, and both must keep everything
+    // that came before it.
+    std::vector<std::byte> region(region_bytes);
+    record_id id;
+    std::size_t after_create;
+    {
+        storage::storage<> t(region.data());
+        id = t.create(user{4242, 7});
+        after_create = t.current_offset();
+    }
+
+    // Append a well-formed, correctly checksummed UPDATE that patches far
+    // past the end of the record.
+    uint64_t poison = 0xBADC0FFEE0DDF00Dull;
+    storage::record_header hdr{ id, (uint32_t)(sizeof(user) + 4096), (uint32_t)sizeof(poison),
+                                storage::record_op::update, 0, 0 };
+    hdr.checksum = storage::checksum_of(hdr, &poison, sizeof(poison));
+    std::memcpy(region.data() + after_create, &hdr, sizeof(hdr));
+    std::memcpy(region.data() + after_create + sizeof(hdr), &poison, sizeof(poison));
+    const std::size_t total = after_create + storage::pad8(sizeof(hdr) + sizeof(poison));
+
+    storage::storage<> restored(region.data());
+    // The record verifies, so the scan consumes it - it is simply not applied.
+    CHECK(restored.recover(total) == total);
+    REQUIRE(restored.get<user>(id) != nullptr);
+    CHECK(restored.get<user>(id)->balance == 4242);
+    CHECK(restored.get<user>(id)->age == 7);
+}
+
+TEST_CASE("a local update is applied on the path that skips the range check") {
+    // provenance::local elides the bound check, so the ordinary path has to
+    // be pinned down separately: it must still apply, and apply correctly, at
+    // every field offset of the record.
+    fixture f;
+    auto id = f.table.create(user{1, 2});
+    f.table.update<&user::balance>(id, 111);      // offset 0
+    CHECK(f.table.get<user>(id)->balance == 111);
+    CHECK(f.table.get<user>(id)->age == 2);
+    f.table.update<&user::age>(id, 222);          // offset 8, the last field
+    CHECK(f.table.get<user>(id)->balance == 111);
+    CHECK(f.table.get<user>(id)->age == 222);
+
+    // And it survives a round trip through the checked path.
+    const std::size_t written = f.table.current_offset();
+    storage::storage<> restored(f.region.data());
+    CHECK(restored.recover(written) == written);
+    CHECK(restored.get<user>(id)->balance == 111);
+    CHECK(restored.get<user>(id)->age == 222);
+}

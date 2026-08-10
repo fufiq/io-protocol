@@ -254,6 +254,35 @@ scratch on every start.
   its payload together.** No exceptions.
 - `recover(file_size)` scans the file strictly sequentially and stops at
   the first checksum mismatch. Nothing past that point is read or applied.
+### What a checksum does not prove
+
+That the bytes are the ones that were sent - nothing more. It says nothing
+about whether the numbers inside them are sane. An `UPDATE` record carries
+`id`, `offset`, `len` and the new bytes, i.e. "in record `id`, at byte
+`offset`, write these `len` bytes"; applying it is a copy to
+`record_ptr(id) + offset`. An `offset` past the end of that record writes into
+its neighbour or off the end of the region, and a primary that is compromised
+or merely buggy will happily compute a valid checksum over one.
+
+So the range is checked wherever bytes come from **outside** - `recover()`
+reading a file, `apply_wal_range()` taking a replication batch. Both refuse
+such a record and keep everything before it.
+
+It is **not** checked on the local path (`update<member>`), where the offset
+comes from `member_offset<member>()` and is a compile-time offset into
+`member_class_t<member>`. That is expressed as `storage::provenance`, a
+template parameter on `apply()` whose default is `external`, so a new call
+site gets the checks by omission rather than by remembering.
+
+The residual hazard is worth naming: a compile-time offset does not prove the
+record *is* a `member_class_t`. Calling `update<&user::balance>` on an id
+holding a different type writes at `user`'s layout regardless - the same class
+of mistake as `get<user>` on that id, which this engine already permits (§1:
+no type registry). Re-deriving the record's length to catch it costs a load of
+a header sitting 24 bytes before the payload, measured at 19% of the update
+path, to defend against something the rest of the API already trusts the
+caller not to do.
+
 - A `local_sync` storage never patches its log, so its CREATE checksums are
   written once and stay valid. An unsplit (`shared` / `replicated`) storage
   aliases its index into the log, so `update()` rewrites bytes the CREATE's

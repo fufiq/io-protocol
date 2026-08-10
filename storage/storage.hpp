@@ -170,6 +170,17 @@ namespace storage {
     // would have been.
     enum class record_op : uint8_t { create = 0, update = 1, destroy = 2 };
 
+    // Where a record came from, and therefore how much of it still has to be
+    // questioned. `local` - this process just built it from a typed call, so
+    // its fields are as trustworthy as the call site. `external` - the bytes
+    // arrived from a file or a network peer, so nothing about them is known
+    // beyond their checksum matching, which only proves they are the bytes
+    // that were sent, not that the numbers in them are sane.
+    //
+    // external is the DEFAULT, so a new call site gets the checks by omission
+    // rather than by remembering to ask for them.
+    enum class provenance : uint8_t { local, external };
+
     // =====================================================================
     // durability is now a property of the WHOLE storage, not of a single type
     // - a storage can hold any number of types, all sharing one durability
@@ -441,7 +452,7 @@ namespace storage {
             // to the log.
             if (!reserve(id)) return 0; // index full - 0 is never a valid record id
             std::byte* logged = write_record<record_op::create>(id, 0, T::tag, std::as_bytes(std::span{&value, 1}));
-            apply(*header_of(logged), logged);
+            apply<provenance::local>(*header_of(logged), logged);
             return id;
         }
 
@@ -452,7 +463,7 @@ namespace storage {
         record_id recreate(record_id id, const T& value) {
             if (!reserve(id)) return 0;
             std::byte* logged = write_record<record_op::create>(id, 0, T::tag, std::as_bytes(std::span{&value, 1}));
-            apply(*header_of(logged), logged);
+            apply<provenance::local>(*header_of(logged), logged);
             return id;
         }
 
@@ -462,13 +473,13 @@ namespace storage {
             if (!alive(id)) return;
             const std::size_t off = member_offset<member>();
             std::byte* logged = write_record<record_op::update>(id, (uint32_t)(off), tag_t{0}, std::as_bytes(std::span{&value, 1}));
-            apply(*header_of(logged), logged);
+            apply<provenance::local>(*header_of(logged), logged);
         }
 
         void destroy(record_id id) {
             if (!alive(id)) return;
             std::byte* logged = write_record<record_op::destroy>(id, 0, tag_t{0}, {});
-            apply(*header_of(logged), logged);
+            apply<provenance::local>(*header_of(logged), logged);
         }
 
         template <tagged_aggregate T>
@@ -504,6 +515,7 @@ namespace storage {
         // updates: 9.2M ops/s with a reference, 32.2M with a copy of the same
         // 24 bytes. Same reason record_ptr() is hoisted into `rec` instead of
         // being called twice: the second call would reload index[id].
+        template <provenance from = provenance::external>
         void apply(record_header hdr, const std::byte* data) {
             // Every reason to refuse comes first, so that by the time the
             // observer is called the record is certain to be applied.
@@ -515,13 +527,29 @@ namespace storage {
             } else {
                 if (!alive(hdr.id)) return; // dead or never existed
                 rec = record_ptr(hdr.id);
-                // A diff has to land inside the record it claims to patch.
-                // Nothing upstream guarantees that: the checksum only proves
-                // the bytes are the ones that were sent, and for a replica
-                // they were sent by a primary that may be compromised or
-                // simply buggy (see tests/fuzz/fuzz_wal_apply_range.cpp).
-                if (hdr.op == record_op::update &&
-                    (std::size_t)hdr.offset + hdr.len > header_of(rec)->len) return;
+                // An UPDATE has to land inside the record it claims to patch.
+                // For external bytes nothing guarantees that: the checksum
+                // only proves they are the bytes that were sent, and for a
+                // replica they were sent by a primary that may be compromised
+                // or simply buggy (see tests/fuzz/fuzz_wal_apply_range.cpp).
+                //
+                // A local UPDATE's offset comes from member_offset<member>(),
+                // a compile-time offset into member_class_t<member>, so there
+                // is nothing to re-derive. It does NOT prove the record is a
+                // member_class_t - nothing in this engine ties a record's tag
+                // to a type, and get<T>(id) reinterprets just as freely (see
+                // HEAP_API.md: "no type registry, so a stale tag on old data
+                // is silently misread"). Calling update<&user::balance> on an
+                // id holding some other type is the same class of mistake as
+                // get<user> on it, and is the caller's to avoid. Catching it
+                // here would mean loading a header that sits 24 bytes before
+                // the payload, often in another cache line - measured at 19%
+                // of the update path - to defend against a mistake the rest
+                // of this API already trusts the caller not to make.
+                if constexpr (from == provenance::external) {
+                    if (hdr.op == record_op::update &&
+                        (std::size_t)hdr.offset + hdr.len > header_of(rec)->len) return;
+                }
             }
 
             obs.on_record(*this, hdr, data);

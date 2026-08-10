@@ -487,6 +487,31 @@ namespace storage {
             return alive(id) ? (const T*)(record_ptr(id)) : nullptr;
         }
 
+        // The tag a record was created with, or 0 if the id is not live.
+        // UPDATE and DESTROY records carry no tag of their own - they name an
+        // id and a byte range, nothing more - so this is how an observer
+        // learns what KIND of record a diff is patching, and therefore which
+        // of its indexes the diff belongs to.
+        [[nodiscard]] tag_t tag_of(record_id id) const noexcept {
+            return alive(id) ? header_of(record_ptr(id))->tag : tag_t{0};
+        }
+
+        // Run-time-offset counterpart of update<member>: patches `bytes` at
+        // `offset` inside a record whose type the call site does not name.
+        // What update<member> cannot express - an undo log restoring bytes it
+        // saved earlier, a migration, any generic tool that works off tag_of()
+        // rather than a C++ type.
+        //
+        // The offset is a run-time value here, so unlike update<member> this
+        // takes the checked path: a patch that would reach past the end of the
+        // record is refused, not applied.
+        void patch(record_id id, uint32_t offset, std::span<const std::byte> bytes) {
+            if (!alive(id)) return;
+            if ((std::size_t)offset + bytes.size() > header_of(record_ptr(id))->len) return;
+            std::byte* logged = write_record<record_op::update>(id, offset, tag_t{0}, bytes);
+            apply(*header_of(logged), logged);
+        }
+
         void for_each_raw(auto&& fn) const requires std::invocable<decltype(fn), raw_view> {
             for (record_id id = 1; id < index.size(); ++id) {
                 if (!index[id].offset) continue;

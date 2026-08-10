@@ -1155,3 +1155,76 @@ TEST_CASE("a local update is applied on the path that skips the range check") {
     CHECK(restored.get<user>(id)->balance == 111);
     CHECK(restored.get<user>(id)->age == 222);
 }
+
+// =====================================================================
+// tag_of() and patch() - the two primitives that turned out to be missing
+// once something real was built on the engine (see bench/app_layer.hpp:
+// an observer cannot tell what KIND of record a diff patches, because an
+// UPDATE carries no tag; and an undo log cannot restore bytes it saved
+// without a run-time-offset write).
+// =====================================================================
+
+TEST_CASE("tag_of reports the kind a record was created with") {
+    fixture f;
+    auto u = f.table.create(user{1, 2});
+    auto o = f.table.create(order{u, 5});
+
+    CHECK(f.table.tag_of(u) == (tag_t)kind::user);
+    CHECK(f.table.tag_of(o) == (tag_t)kind::order);
+    CHECK(f.table.tag_of(9999) == 0);   // never existed
+
+    // An update carries no tag of its own; the record keeps the one it had.
+    f.table.update<&user::balance>(u, 42);
+    CHECK(f.table.tag_of(u) == (tag_t)kind::user);
+
+    // recreate() with a different type changes it.
+    f.table.recreate(u, order{7, 7});
+    CHECK(f.table.tag_of(u) == (tag_t)kind::order);
+
+    f.table.destroy(o);
+    CHECK(f.table.tag_of(o) == 0);
+}
+
+TEST_CASE("patch writes at a run-time offset and survives recovery") {
+    std::vector<std::byte> region(region_bytes);
+    record_id id;
+    std::size_t written;
+    {
+        storage::storage<> t(region.data());
+        id = t.create(user{100, 30});
+
+        uint64_t balance = 555;
+        t.patch(id, offsetof(user, balance), std::as_bytes(std::span{&balance, 1}));
+        uint32_t age = 31;
+        t.patch(id, offsetof(user, age), std::as_bytes(std::span{&age, 1}));
+
+        CHECK(t.get<user>(id)->balance == 555);
+        CHECK(t.get<user>(id)->age == 31);
+        written = t.current_offset();
+    }
+    storage::storage<> restored(region.data());
+    CHECK(restored.recover(written) == written);
+    CHECK(restored.get<user>(id)->balance == 555);
+    CHECK(restored.get<user>(id)->age == 31);
+}
+
+TEST_CASE("patch refuses a range that leaves the record, and a dead id") {
+    fixture f;
+    auto id = f.table.create(user{100, 30});
+    const std::size_t before = f.table.current_offset();
+
+    uint64_t v = 7;
+    f.table.patch(id, sizeof(user), std::as_bytes(std::span{&v, 1}));      // starts at the end
+    f.table.patch(id, sizeof(user) - 4, std::as_bytes(std::span{&v, 1})); // overruns by 4
+    f.table.patch(id, 4096, std::as_bytes(std::span{&v, 1}));             // far outside
+    f.table.patch(4242, 0, std::as_bytes(std::span{&v, 1}));              // no such record
+
+    CHECK(f.table.get<user>(id)->balance == 100); // untouched
+    CHECK(f.table.get<user>(id)->age == 30);
+    CHECK(f.table.current_offset() == before);    // and nothing was logged
+
+    // The largest patch that does fit is accepted.
+    uint32_t tail = 9;
+    f.table.patch(id, sizeof(user) - sizeof(tail), std::as_bytes(std::span{&tail, 1}));
+    CHECK(f.table.current_offset() > before);
+}

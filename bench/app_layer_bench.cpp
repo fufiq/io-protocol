@@ -90,7 +90,10 @@ namespace {
 
     using plain_spec = storage::storage_spec<storage::durability::local_sync, "applayer_plain.db", 1ull << 30>;
     using app_spec = storage::storage_spec<storage::durability::local_sync, "applayer.db", 1ull << 30>;
-    constexpr std::size_t index_capacity = 1'200'000; // every id this benchmark ever issues
+    // id_space is every id this benchmark ever issues; entries is how many of
+    // them are actually indexed. This one exercises all four entities, so the
+    // two are closer together than in schema_comparison.
+    constexpr app::schema_index::sizing index_capacity{ 1'200'000, 600'000 };
 
     // The secondary indexes live in a mapping, so every table_t needs one
     // attached before it is used.

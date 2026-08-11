@@ -29,6 +29,7 @@
 #include <fcntl.h>
 #include <span>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
 
@@ -110,51 +111,127 @@ namespace app {
         uint64_t magic;
         uint64_t capacity;
         std::size_t emails, skus, lines_per_product_count, prices, indexed;
+        std::size_t entries;
         flat::list_state orders_of_customer, lines_of_order;
+
+        // THE LOG POSITION THIS INDEX DESCRIBES, and the reason the whole
+        // barrier has an order to it. The index is derived state: every entry
+        // in it was put there by a record in the log. Persisting it without
+        // saying WHICH prefix of the log it corresponds to makes it unusable
+        // on restart - you would not know what still has to be replayed.
+        //
+        // valid_to is only ever advanced to an offset already durable in the
+        // log. A crash then leaves an index describing a PREFIX of what is on
+        // disk, which is safe and merely stale: the tail gets replayed. The
+        // reverse order - index first, log second - would leave an index
+        // referring to log offsets that contain nothing, and that is not
+        // staleness, it is corruption.
+        uint64_t valid_to;
+        uint32_t checksum;
+        uint32_t reserved;
+    };
+
+    // The same fields, written to a FILE OF ITS OWN rather than living in the
+    // mapping - and that is the entire fix.
+    //
+    // Taking valid_to from the header and replaying the log's tail is the right
+    // algorithm. It only works if the header is honest, and a header inside a
+    // MAP_SHARED region cannot be: the kernel writes those pages back on its
+    // own schedule, so after a crash the on-disk header may be from a moment
+    // LATER than the msync that stamped it. Replay would then start from a
+    // valid_to whose arena state (high_water, free_head) had already moved on,
+    // hand out nodes that are already in use, and two lists would share them.
+    //
+    // Written with pwrite + fsync + rename, this file has no mapped pages for
+    // the kernel to leak. It is exactly as of the commit, always.
+    //
+    // The BODY of the index needs no such treatment: it is a mix of pages from
+    // various moments, and that is fine, because (this record, log[valid_to..])
+    // reconstructs it deterministically - replay runs in log order, the arena
+    // hands out the same nodes in the same sequence, and on_record retracts
+    // before it adds. Whatever leaked is overwritten with what it should have
+    // been. Idempotent state stays in the mapping; the state that is not
+    // idempotent is written by hand.
+    struct index_commit {
+        uint64_t magic;
+        uint64_t valid_to;
+        uint64_t capacity;
+        std::size_t emails, skus, lines_per_product_count, prices, indexed, entries;
+        flat::list_state orders_of_customer, lines_of_order;
+        uint32_t checksum;   // over this record with checksum zeroed
+        uint32_t reserved;
     };
     inline constexpr uint64_t index_magic = 0x5844495f414d4548ull; // "HEMA_IDX"
 
     class schema_index {
     public:
-        // Bytes a region must have to index `capacity` ids. Everything is
-        // sized off that one number, and nothing grows afterwards.
-        static std::size_t bytes_needed(std::size_t capacity) noexcept {
-            const std::size_t buckets = flat::round_pow2(capacity * 2);
+        // TWO numbers, not one, and the difference is the whole cost of this
+        // structure.
+        //
+        //   id_space  how many record ids may ever be issued. The head arrays
+        //             of the two multi_lists are addressed BY ID, so they are
+        //             forced to this - there is no way around it while ids come
+        //             from one sequence shared by every entity.
+        //
+        //   entries   how many things are actually INDEXED. Emails belong to
+        //             customers, skus to products; a run that inserts only
+        //             customers leaves two of the three hashes empty and every
+        //             node arena unused.
+        //
+        // Sizing everything off id_space, as this did, spends eight hash slots
+        // per expected record: four because ids are shared across four tags,
+        // two more for load-factor headroom. Measured on a 960 MB machine, that
+        // put 500000 customers into a 313 MB structure holding 8 MB of real
+        // entries - a 12% load factor whose lookups land on a random page of
+        // the whole thing, so the entire 313 MB has to be resident to stop
+        // faulting. LMDB kept the same 500000 entries AND the records in
+        // 33.2 MB. The problem was never disk versus memory, both are mapped
+        // files; it was density.
+        struct sizing {
+            std::size_t id_space;
+            std::size_t entries;
+        };
+
+        static std::size_t bytes_needed(sizing s) noexcept {
+            const std::size_t buckets = flat::round_pow2(s.entries * 2);
             std::size_t n = flat::align_up(sizeof(index_header), 64);
             n += 3 * buckets * sizeof(flat::hash_slot);
-            n += 2 * capacity * sizeof(uint32_t);
-            n += 2 * capacity * sizeof(flat::list_node);
-            n += capacity * sizeof(flat::ordered_entry);
+            n += 2 * s.id_space * sizeof(uint32_t);
+            n += 2 * s.entries * sizeof(flat::list_node);
+            n += s.entries * sizeof(flat::ordered_entry);
             return flat::align_up(n, 4096);
         }
 
         // Lays the structures out over `base`. A region whose header already
         // carries the right magic and capacity is adopted AS IS - that is the
         // restart path, and the reason none of this can be an STL container.
-        bool attach(void* base, std::size_t bytes, std::size_t capacity) noexcept {
-            if (bytes < bytes_needed(capacity)) return false;
+        bool attach(void* base, std::size_t bytes, sizing s) noexcept {
+            if (bytes < bytes_needed(s)) return false;
             std::byte* p = (std::byte*)base;
             head = (index_header*)p;
 
-            const bool fresh = (head->magic != index_magic || head->capacity != capacity);
+            const bool fresh = (head->magic != index_magic || head->capacity != s.id_space
+                                                           || head->entries != s.entries);
             if (fresh) {
                 std::memset(head, 0, sizeof(index_header));
                 head->magic = index_magic;
-                head->capacity = capacity;
+                head->capacity = s.id_space;
+                head->entries = s.entries;
             }
 
-            const std::size_t buckets = flat::round_pow2(capacity * 2);
+            const std::size_t capacity = s.id_space;
+            const std::size_t buckets = flat::round_pow2(s.entries * 2);
             p += flat::align_up(sizeof(index_header), 64);
             auto take = [&](std::size_t n) { std::byte* at = p; p += n; return at; };
 
             flat::hash_slot* email_slots = (flat::hash_slot*)take(buckets * sizeof(flat::hash_slot));
             flat::hash_slot* sku_slots = (flat::hash_slot*)take(buckets * sizeof(flat::hash_slot));
             flat::hash_slot* lpp_slots = (flat::hash_slot*)take(buckets * sizeof(flat::hash_slot));
-            uint32_t* order_heads = (uint32_t*)take(capacity * sizeof(uint32_t));
-            uint32_t* line_heads = (uint32_t*)take(capacity * sizeof(uint32_t));
-            flat::list_node* order_nodes = (flat::list_node*)take(capacity * sizeof(flat::list_node));
-            flat::list_node* line_nodes = (flat::list_node*)take(capacity * sizeof(flat::list_node));
-            flat::ordered_entry* price_entries = (flat::ordered_entry*)take(capacity * sizeof(flat::ordered_entry));
+            uint32_t* order_heads = (uint32_t*)take(capacity * sizeof(uint32_t));   // addressed by id
+            uint32_t* line_heads = (uint32_t*)take(capacity * sizeof(uint32_t));    // addressed by id
+            flat::list_node* order_nodes = (flat::list_node*)take(s.entries * sizeof(flat::list_node));
+            flat::list_node* line_nodes = (flat::list_node*)take(s.entries * sizeof(flat::list_node));
+            flat::ordered_entry* price_entries = (flat::ordered_entry*)take(s.entries * sizeof(flat::ordered_entry));
 
             if (fresh) {
                 std::memset(email_slots, 0, buckets * sizeof(flat::hash_slot));
@@ -167,13 +244,81 @@ namespace app {
             emails.attach(email_slots, buckets, &head->emails);
             skus.attach(sku_slots, buckets, &head->skus);
             lines_per_product.attach(lpp_slots, buckets, &head->lines_per_product_count);
-            orders_of_customer.attach(order_heads, capacity, order_nodes, capacity, &head->orders_of_customer);
-            lines_of_order.attach(line_heads, capacity, line_nodes, capacity, &head->lines_of_order);
-            prices.attach(price_entries, capacity, &head->prices);
+            orders_of_customer.attach(order_heads, capacity, order_nodes, s.entries, &head->orders_of_customer);
+            lines_of_order.attach(line_heads, capacity, line_nodes, s.entries, &head->lines_of_order);
+            prices.attach(price_entries, s.entries, &head->prices);
             return true;
         }
 
         bool attached() const noexcept { return head != nullptr; }
+
+        // How far the mapped index can be trusted. Zero means "not at all" -
+        // either it was never committed or its header did not survive - and
+        // the caller must replay the whole log. Anything else is the offset to
+        // replay FROM.
+        // The one field the snapshot needs beyond the structures themselves:
+        // which prefix of the log this state corresponds to. Written into the
+        // region right before it is dumped, read back out after it is loaded.
+        void stamp(std::size_t log_offset) noexcept { if (head) head->valid_to = log_offset; }
+        std::size_t stamped() const noexcept {
+            return (head && head->magic == index_magic) ? (std::size_t)head->valid_to : 0;
+        }
+
+        index_commit snapshot(std::size_t log_offset) const noexcept {
+            index_commit r{};
+            r.magic = index_magic;
+            r.valid_to = log_offset;
+            r.capacity = head->capacity;
+            r.emails = head->emails; r.skus = head->skus;
+            r.lines_per_product_count = head->lines_per_product_count;
+            r.prices = head->prices; r.indexed = head->indexed; r.entries = head->entries;
+            r.orders_of_customer = head->orders_of_customer;
+            r.lines_of_order = head->lines_of_order;
+            r.checksum = 0;
+            r.checksum = storage::crc32c(&r, sizeof(r)) ^ 0xFFFFFFFFu;
+            return r;
+        }
+
+        // Puts a validated snapshot back, so the arena resumes from exactly the
+        // point the log will be replayed from.
+        void adopt(const index_commit& r) noexcept {
+            head->emails = r.emails; head->skus = r.skus;
+            head->lines_per_product_count = r.lines_per_product_count;
+            head->prices = r.prices; head->indexed = r.indexed;
+            head->orders_of_customer = r.orders_of_customer;
+            head->lines_of_order = r.lines_of_order;
+        }
+
+        // The sweep that makes a restart-from-mapping honest.
+        //
+        // After replaying the log's tail the index CONTENT is already right -
+        // on_record retracts before it adds, so every replayed record lands
+        // correctly whether or not its entry had leaked to disk. Two things are
+        // still wrong and neither is reachable incrementally:
+        //
+        //   * counts. A replayed record whose entry had leaked gets erased and
+        //     re-inserted, a net change of zero, when it should have been +1.
+        //     Measured: 20000 counted where 23000 entries existed.
+        //   * phantoms. An entry can survive for a record the log lost - the
+        //     append was not durable, recovery discarded it, but the index page
+        //     had already been written back.
+        //
+        // One pass over the buckets fixes both: drop what is not alive, then
+        // recount from what remains.
+        template <typename table_type>
+        void reconcile(const table_type& t) noexcept {
+            if (!head) return;
+            emails.retain([&](uint64_t, uint64_t id) { return t.tag_of((record_id)id) != tag_t{0}; });
+            skus.retain([&](uint64_t, uint64_t id) { return t.tag_of((record_id)id) != tag_t{0}; });
+        }
+
+        static bool valid(const index_commit& r) noexcept {
+            if (r.magic != index_magic) return false;
+            index_commit copy = r;
+            const uint32_t stored = copy.checksum;
+            copy.checksum = 0;
+            return (storage::crc32c(&copy, sizeof(copy)) ^ 0xFFFFFFFFu) == stored;
+        }
 
         void on_record(auto& table, const storage::record_header& hdr, const std::byte* payload) {
             if (!head) return;
@@ -315,19 +460,84 @@ namespace app {
         index_store(const index_store&) = delete;
         index_store& operator=(const index_store&) = delete;
 
-        bool open(const char* path, std::size_t capacity) noexcept {
+        // TWO ZONES IN ONE FILE. Page 0 holds the commit record and is only
+        // ever touched by pwrite; everything from page 1 on is the mapping.
+        //
+        // That split is the whole point: the kernel writes mapped pages back
+        // whenever it likes, so anything inside the mapping can reach the disk
+        // at a moment we did not choose. Page 0 is not mapped, so it cannot.
+        // It is exactly what the last commit wrote, which is what lets a
+        // restart trust the offset it names.
+        bool open(const char* path, schema_index::sizing s) noexcept {
             close();
-            bytes = schema_index::bytes_needed(capacity);
+            bytes = schema_index::bytes_needed(s);
+            file = path;
             fd = ::open(path, O_RDWR | O_CREAT, 0644);
             if (fd < 0) return false;
-            if (::posix_fallocate(fd, 0, (off_t)bytes) != 0) { close(); return false; }
-            void* m = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            // Only allocate when the file is not already big enough. This is
+            // the RESTART path as much as the create path, and posix_fallocate
+            // over an existing 86 MB file walks its extents every time - which
+            // is most of what a checkpointed restart was spending: the index
+            // was already on disk, already correct, and the open was
+            // re-allocating it before mapping it.
+            void* m = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (m == MAP_FAILED) { close(); return false; }
             base = m;
             return true;
         }
 
-        void sync() noexcept { if (base) ::msync(base, bytes, MS_SYNC); }
+        // ONE SEQUENTIAL WRITE OF THE WHOLE REGION, into a temporary file that
+        // is then renamed over the old one. No msync and no per-page anything:
+        // the region is anonymous memory, so this is the only route its
+        // contents ever take to the disk, and they take it as one stream.
+        //
+        // tmp + fsync + rename rather than a checksum over 88 MB. Rename is
+        // atomic, so what survives a crash is either the whole previous
+        // snapshot or the whole new one, never a mixture - and checksumming the
+        // body would cost a pass over it on every checkpoint to catch a case
+        // the rename has already made impossible.
+        //
+        // MUST be called on the writer with the log already durable to
+        // log_offset and no write in flight. Then the region holds exactly the
+        // state at that offset and the snapshot needs no reconciliation
+        // afterwards. That is the difference from a mapping, which the kernel
+        // writes back whenever it likes and which therefore ends up a superset
+        // of whatever its header claims.
+        bool checkpoint(std::size_t log_offset, schema_index& ix) noexcept {
+            if (!base || file.empty()) return false;
+            ix.stamp(log_offset);
+            const std::string tmp = file + ".tmp";
+            int f = ::open(tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+            if (f < 0) return false;
+            const std::byte* p = (const std::byte*)base;
+            std::size_t left = bytes, at = 0;
+            while (left) {
+                const ssize_t n = ::pwrite(f, p + at, left, (off_t)at);
+                if (n <= 0) { ::close(f); ::remove(tmp.c_str()); return false; }
+                at += (std::size_t)n; left -= (std::size_t)n;
+            }
+            const bool ok = ::fsync(f) == 0;
+            ::close(f);
+            if (!ok) { ::remove(tmp.c_str()); return false; }
+            return ::rename(tmp.c_str(), file.c_str()) == 0;
+        }
+
+        // Reads a snapshot back over the region. Returns the log offset it
+        // describes, or 0 for "nothing usable here, replay the whole log".
+        std::size_t restore(schema_index& ix) noexcept {
+            if (!base || fd < 0) return 0;
+            struct stat st{};
+            if (::fstat(fd, &st) != 0 || (std::size_t)st.st_size < bytes) return 0;
+            std::byte* p = (std::byte*)base;
+            std::size_t left = bytes, at = 0;
+            while (left) {
+                const ssize_t n = ::pread(fd, p + at, left, (off_t)at);
+                if (n <= 0) return 0;
+                at += (std::size_t)n; left -= (std::size_t)n;
+            }
+            return ix.stamped();
+        }
+
         void* region() const noexcept { return base; }
         std::size_t region_bytes() const noexcept { return bytes; }
 
@@ -341,6 +551,7 @@ namespace app {
         void* base = nullptr;
         std::size_t bytes = 0;
         int fd = -1;
+        std::string file;
     };
 
 } // namespace app

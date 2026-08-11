@@ -194,8 +194,13 @@ namespace {
 
     // index_path and checkpoint_path turn on the fast-restart path; without
     // them this spec behaves exactly as before and recover() replays the log.
-    using bench_spec = storage::storage_spec<storage::durability::local_sync, "schemacmp_ours.db", 2ull << 30,
-                                             "", "schemacmp_ours.idx", "schemacmp_ours.ck">;
+    // 900 MB rather than 2 GB: the in-place engine fallocates its capacity
+    // TWICE (log + materialization), and the machine this now runs on has
+    // 4.2 GB of disk. index_entries is named explicitly for the same reason -
+    // left to default it is capacity/32, which at 900 MB would be a 236 MB
+    // index file for a run that never issues three million ids.
+    using bench_spec = storage::storage_spec<storage::durability::local_sync, "schemacmp_ours.db", 900ull << 20,
+                                             "", "schemacmp_ours.idx", "schemacmp_ours.ck", 2'500'000>;
 
     double secs(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
         return std::chrono::duration<double>(b - a).count();
@@ -214,7 +219,12 @@ namespace {
         std::remove("schemacmp_ours.sidx");
     }
     // Ids are monotonic, so the ceiling is every id the run will ever issue.
-    std::size_t index_capacity() { return n_records * 4 + 1024; }
+    // TWO numbers now. id_space stays generous because the head arrays are
+    // addressed by record id and ids come from one sequence shared by all four
+    // entities. entries is what is actually INDEXED - and this benchmark
+    // inserts customers only, so two of the three hashes and every node arena
+    // stay empty. Sizing those off id_space put 500000 entries into 313 MB.
+    app::schema_index::sizing index_sizing() { return { n_records * 4 + 1024, n_records + 1024 }; }
     void wipe_lmdb() {
         std::remove("schemacmp_lmdb.mdb");
         std::remove("schemacmp_lmdb.mdb-lock");
@@ -244,24 +254,30 @@ namespace {
     // The identical schema - same unique index, same constraints, same
     // transactions - carried by the field-granular engine instead. One file,
     // nothing patched in place.
-    using field_bench_spec = storage::field_spec<"schemacmp_fld.log", 2ull << 30, "schemacmp_fld.idx",
-                                                 4'000'000, 4'000'000, 8, 128>;
+    using field_bench_spec = storage::field_spec<"schemacmp_fld.log", 900ull << 20, "schemacmp_fld.idx",
+                                                 2'500'000, 5'000'000, 8, 128>;
 
     void bench_ours_fields(std::size_t batch) {
         const std::string dl = label(batch);
         const char* d = dl.c_str();
-        std::remove("schemacmp_fld.log"); std::remove("schemacmp_fld.idx"); std::remove("schemacmp_fld.sidx");
+        std::remove("schemacmp_fld.log"); std::remove("schemacmp_fld.idx"); std::remove("schemacmp_fld.sidx"); 
         std::vector<record_id> ids;
         ids.reserve(n_records);
         {
             field_table_t<field_bench_spec> table;
             index_store store;
-            if (!table.ok() || !store.open("schemacmp_fld.sidx", index_capacity()) ||
-                !table.observer_state().attach(store.region(), store.region_bytes(), index_capacity())) {
+            if (!table.ok() || !store.open("schemacmp_fld.sidx", index_sizing()) ||
+                !table.observer_state().attach(store.region(), store.region_bytes(), index_sizing())) {
                 std::printf("ours-fld: could not map\n"); return;
             }
             uint64_t txn_id = 1;
-            auto group_commit = [&](std::size_t i) { if (batch && (i + 1) % batch == 0) table.sync(); };
+            // ONE barrier for both. The log goes first and the index second,
+            // and the index is stamped with the offset the log just reached -
+            // never a larger one. See app_layer.hpp's index_header::valid_to.
+            auto group_commit = [&](std::size_t i) {
+                if (!batch || (i + 1) % batch != 0) return;
+                table.sync();   // the log carries everything between checkpoints
+            };
 
             auto t0 = std::chrono::steady_clock::now();
             for (std::size_t i = 0; i < n_records; ++i) {
@@ -318,9 +334,9 @@ namespace {
             t1 = std::chrono::steady_clock::now();
             line("ours-fld", "delete + index entry", d, n_deleted, secs(t0, t1));
             table.sync();
-            store.sync();
+            store.checkpoint(table.current_offset(), table.observer_state());
         }
-        std::remove("schemacmp_fld.log"); std::remove("schemacmp_fld.idx"); std::remove("schemacmp_fld.sidx");
+        std::remove("schemacmp_fld.log"); std::remove("schemacmp_fld.idx"); std::remove("schemacmp_fld.sidx"); 
     }
 
     void bench_ours(std::size_t batch) {
@@ -336,15 +352,21 @@ namespace {
         {
             table_t<bench_spec> table;
             index_store store;
-            if (!store.open("schemacmp_ours.sidx", index_capacity()) ||
-                !table.observer_state().attach(store.region(), store.region_bytes(), index_capacity())) {
+            if (!store.open("schemacmp_ours.sidx", index_sizing()) ||
+                !table.observer_state().attach(store.region(), store.region_bytes(), index_sizing())) {
                 std::printf("ours: could not map the secondary indexes\n");
                 return;
             }
             uint64_t txn_id = 1;
             // The transaction always ends with its commit marker; whether the
             // marker is on disk yet is a separate decision, taken here.
-            auto group_commit = [&](std::size_t i) { if (batch && (i + 1) % batch == 0) table.sync(); };
+            // ONE barrier for both. The log goes first and the index second,
+            // and the index is stamped with the offset the log just reached -
+            // never a larger one. See app_layer.hpp's index_header::valid_to.
+            auto group_commit = [&](std::size_t i) {
+                if (!batch || (i + 1) % batch != 0) return;
+                table.sync();   // the log carries everything between checkpoints
+            };
 
             auto t0 = std::chrono::steady_clock::now();
             for (std::size_t i = 0; i < n_records; ++i) {
@@ -412,7 +434,7 @@ namespace {
             // the engine's index together and name the offset they agree at -
             // and flush the secondary indexes, which live in their own
             // mapping, alongside it.
-            store.sync();
+            store.checkpoint(table.current_offset(), table.observer_state());
             checkpoint_ok = table.checkpoint();
         }
         std::size_t emails_before = 0, emails_after = 0;
@@ -421,8 +443,8 @@ namespace {
             // and rebuild every index from it.
             table_t<bench_spec> restored;
             index_store store;
-            store.open("schemacmp_ours.sidx.replay", index_capacity());
-            restored.observer_state().attach(store.region(), store.region_bytes(), index_capacity());
+            store.open("schemacmp_ours.sidx.replay", index_sizing());
+            restored.observer_state().attach(store.region(), store.region_bytes(), index_sizing());
             auto t0 = std::chrono::steady_clock::now();
             restored.recover(bench_spec::capacity);
             auto t1 = std::chrono::steady_clock::now();
@@ -438,9 +460,19 @@ namespace {
             table_t<bench_spec> restored;
             index_store store;
             auto t0 = std::chrono::steady_clock::now();
-            store.open("schemacmp_ours.sidx", index_capacity());
-            restored.observer_state().attach(store.region(), store.region_bytes(), index_capacity());
+            store.open("schemacmp_ours.sidx", index_sizing());
+            // The region is anonymous now, so it starts empty and the snapshot
+            // has to be read into it. Order matters: allocate, load, adopt.
+            const std::size_t indexed_to = store.restore(restored.observer_state());
+            restored.observer_state().attach(store.region(), store.region_bytes(), index_sizing());
             restored.restart(bench_spec::capacity);
+            // Anything the log has past the snapshot is replayed through the
+            // same apply() a live write uses.
+            if (indexed_to && indexed_to < restored.current_offset())
+                restored.for_each_record(indexed_to, restored.current_offset(),
+                    [&](storage::record_header hdr, std::span<const std::byte> payload) {
+                        restored.apply(hdr, payload.data());
+                    });
             auto t1 = std::chrono::steady_clock::now();
             restart_seconds = secs(t0, t1);
             emails_after = restored.observer_state().emails_indexed();

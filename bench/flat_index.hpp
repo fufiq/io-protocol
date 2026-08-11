@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 namespace flat {
 
@@ -84,6 +85,31 @@ namespace flat {
         }
 
         std::size_t size() const noexcept { return *used; }
+
+        // Walks every occupied slot. Needed by the restart path: an index
+        // mapping is a SUPERSET of the state its header describes, because the
+        // kernel writes mapped pages back on its own schedule, so entries can
+        // survive for records the log no longer has. Only a sweep can find
+        // them - they are not reachable from anything.
+        template <typename fn>
+        void for_each(fn&& f) const noexcept {
+            for (std::size_t i = 0; i <= mask; ++i)
+                if (table[i].key) f(table[i].key, table[i].value);
+        }
+
+        // Drops every entry the predicate rejects and recounts what is left.
+        // Recounting rather than adjusting, because the stored count and the
+        // slots can disagree by an unknown amount after a crash.
+        template <typename pred>
+        void retain(pred&& keep) noexcept {
+            std::vector<uint64_t> doomed;
+            for (std::size_t i = 0; i <= mask; ++i)
+                if (table[i].key && !keep(table[i].key, table[i].value)) doomed.push_back(table[i].key);
+            for (uint64_t k : doomed) erase(k);
+            std::size_t n = 0;
+            for (std::size_t i = 0; i <= mask; ++i) n += table[i].key != 0;
+            *used = n;
+        }
 
     private:
         std::size_t probe(uint64_t key) const noexcept {

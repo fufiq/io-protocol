@@ -1,5 +1,8 @@
 #include <doctest/doctest.h>
 #include <memory>
+#include "../storage/prefetch_gather.hpp"
+#include <thread>
+#include <atomic>
 #include <sys/mman.h>
 
 #include "../storage/field_storage.hpp"
@@ -299,6 +302,44 @@ TEST_CASE("a checkpoint is refused once anything was written after it") {
     CHECK_FALSE(restored.started_from_checkpoint());
     CHECK(restored.alive(a));
     CHECK(restored.alive(b)); // the write past the checkpoint survived the replay
+    wipe();
+}
+
+TEST_CASE("several threads may read at once while no writer runs") {
+    // The claim this pins down is narrower than "single-threaded": the whole
+    // read path is const - alive(), record_len() and assemble() only read the
+    // slot, walk the node arena and memcpy out of the mapping - so readers do
+    // not need a writer to be absent from the PROCESS, only from the moment.
+    // Verified under ThreadSanitizer separately; this checks the answers.
+    fixture f;
+    constexpr int n = 2000;
+    for (int i = 0; i < n; ++i) f.table->create(quad{(uint64_t)i, 0, 0, 0});
+    for (int i = 0; i < n; ++i) f.table->update<&quad::b>(i + 1, 100 + i);
+    for (int i = 0; i < n; i += 3) f.table->update<&quad::c>(i + 1, 200 + i);
+    // the writer stops here; everything below is readers only
+
+    std::atomic<int> wrong{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 8; ++t) {
+        threads.emplace_back([&, t] {
+            storage::prefetch_gather g(32);         // one gatherer per thread
+            std::vector<record_id> ids;
+            for (int i = 0; i < n; ++i) ids.push_back((record_id)(((i * 7919 + t * 13) % n) + 1));
+            std::vector<std::byte> out(ids.size() * sizeof(quad));
+            g.read_many(*f.table, std::span<const record_id>{ids}, out.data(), sizeof(quad));
+            for (std::size_t k = 0; k < ids.size(); ++k) {
+                quad q{};
+                std::memcpy(&q, out.data() + k * sizeof(quad), sizeof(quad));
+                if (q.b != 100 + q.a) ++wrong;
+                if (q.c != ((q.a % 3 == 0) ? 200 + q.a : 0)) ++wrong;
+                if ((record_id)(q.a + 1) != ids[k]) ++wrong;
+                auto v = f.table->get<quad>(ids[k]);   // and the single-record path
+                if (!v || v->b != 100 + v->a) ++wrong;
+            }
+        });
+    }
+    for (auto& t : threads) t.join();
+    CHECK(wrong.load() == 0);
     wipe();
 }
 

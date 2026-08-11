@@ -1,9 +1,9 @@
 # FIELD_STORAGE.md - `field_storage.hpp` specification
 
 > One append-only log over mmap, indexed per **field** rather than per record.
-> Nothing is ever patched in place. Strictly single-writer, no concurrent
-> readers, no MVCC. Owns its log and its index; owns no threads; blocks only
-> where documented below.
+> Nothing is ever patched in place. Single-writer; **concurrent readers are
+> safe while no writer runs** (§12); no MVCC. Owns its log and its index; owns
+> no threads; blocks only where documented below.
 
 ## 0. What it is, and when to choose it
 
@@ -379,7 +379,30 @@ void prefetch(record_id) const noexcept;
 bool pin_index() noexcept;
 ```
 
-See `uring_gather.hpp` and `direct_gather.hpp`.
+Three backends implement the same `read_many(engine, ids, out, stride)` - batch
+in, batch out, so the backend is swappable and nothing leaks outward.
+
+| | portability | measured, 512 MB under a 320 MB cap |
+|---|---|---|
+| `prefetch_gather.hpp` | **POSIX, no threads, no pread** | **156,597** |
+| `direct_gather.hpp` | Linux (io_uring + O_DIRECT) | 148,121 |
+| `uring_gather.hpp` | Linux (io_uring) | 99,365 |
+| plain `get()` in a loop | anywhere | 1,082 |
+
+**`prefetch_gather` is the one to reach for.** It is a single
+`posix_madvise(POSIX_MADV_WILLNEED)` over the coalesced page ranges a window of
+records is about to touch, issued while the previous window is being assembled.
+No threads, no `pread`, no rings - and it beat both Linux-specific paths.
+
+It works by removing two of the three multipliers at once. Queue depth stops
+being 1 because the kernel is handed a whole window's pages, and - the part that
+surprised the author - **major faults drop to zero**, because the page is
+already in the cache by the time the assemble touches it. A 275 µs major fault
+becomes a ~1 µs minor one.
+
+The catch is that it only helps when you read in **batches**: a lone `get(id)`
+still runs at ~1,100/sec out of RAM, because there is nothing to tell the kernel
+in advance when the next id is not yet known.
 
 `for_each_piece` emits the record as **disjoint** pieces in file offsets. Disjoint
 is a correctness requirement, not tidiness: `assemble()` gets away with reading
@@ -440,10 +463,31 @@ a snapshot applied 25,992 of 51,984 and discarded the rest.
 
 ## 12. Limits
 
-**Single writer, no concurrent readers, no MVCC, no snapshots.** There is no
-locking anywhere in this file. Two threads calling `create()` is undefined
-behaviour, and a reader running concurrently with a writer can observe a torn
-record.
+**One writer, and readers only while it is idle.** There is no locking anywhere
+in this file. The boundary is narrower than "single-threaded", and it was
+checked rather than assumed:
+
+| | |
+|---|---|
+| several readers, no writer running | **safe** - verified with ThreadSanitizer, 8 threads × 96,000 reads, clean |
+| a reader concurrent with a writer | **data race**, undefined |
+| more than one writer | never |
+
+Concurrent reads work because the whole read path is genuinely `const`:
+`alive()`, `record_len()` and `assemble()` only read the slot, walk the node
+arena and memcpy out of the mapping. No counters, no lazy fields, nothing
+`mutable`.
+
+They stop working the moment a writer moves. ThreadSanitizer puts it at
+`field_slot::head()` inside `assemble()`: `set_override` rewrites `chain` - the
+list head and the depth share one word - while a reader is reading it, so the
+reader can follow a head to a node the writer has not finished filling.
+
+Practically: **split the phases.** A writer runs, stops, and then any number of
+threads read in parallel. For analytics over a settled snapshot that is a
+working arrangement today with no new code. For readers *during* writes you need
+MVCC, and the log already holds every version - the missing piece is an index
+per snapshot offset, not a change to this file.
 
 **The index must be resident.** 16 bytes per id *ever issued* plus 24 per live
 override. A destroyed record's slot is never reclaimed, so index size tracks

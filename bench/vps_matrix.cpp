@@ -1,0 +1,463 @@
+// vps_matrix.cpp - the same workload on three engines, at two sizes, with and
+// without a durability barrier. One binary, one process per cell, so nothing a
+// previous cell left in the page cache can be mistaken for a result.
+//
+// THE BARRIER IS PLACED BY TIME, NOT BY OPERATION COUNT, and that is the
+// point. "Every 1000 operations" is an arbitrary number that means something
+// different for every engine and every dataset size - at 200 MB it fired 200
+// times during a fill that took one second, at 1200 MB it fired 1200 times
+// during six. What a device can actually absorb is a fixed number of
+// durability barriers per second, and that number is measured, not guessed
+// (see bench/msync_probe.c). So a cell that syncs issues at most one barrier
+// per `barrier_us` microseconds, where barrier_us is that measured latency:
+// the engine never asks the device to commit faster than it can, and never
+// waits longer than it must.
+//
+// This is what real group commit does, and it adapts on its own - under load
+// more operations fall into one barrier, at low rates each barrier covers
+// fewer. An operation-count barrier does the opposite of adapting.
+//
+// Every cell that syncs places ONE durability barrier per barrier_us:
+//
+//   in-place   sync() - msync of the log's dirty range
+//   field      sync() - the same
+//   postgres   COMMIT with synchronous_commit = on, so the commit waits for
+//              its WAL flush
+//
+// and every cell that does not sync removes exactly that: our engines never
+// call sync(), postgres runs the same transaction shape with
+// synchronous_commit = off, so it still groups but never waits. That is not
+// the same as fsync=off - it is the closest thing that keeps the transaction
+// structure identical between the two columns.
+//
+// MEASURED, AND THE ASSUMPTION WAS WRONG. A commit was expected to cost about
+// the same regardless of payload. On this device (QEMU virtio, so hypervisor
+// overhead is in every number) msync_probe.c says otherwise:
+//
+//     4 KB dirty     80.7 us    12396 barriers/sec
+//    64 KB dirty    246.7 us     4054
+//     1 MB dirty    958.9 us     1043
+//     8 MB dirty   7567.7 us      132
+//
+// Above 64 KB the cost is linear in bytes - roughly 1 GB/sec - so the barrier
+// is BANDWIDTH-bound there, not commit-rate-bound. Only the floor is fixed, at
+// about 80 us for a single page.
+//
+// That floor is what barrier_us is set to. It is the honest reading of "one
+// msync": the shortest a durability barrier can possibly take here. It also
+// means the sync column pays heavily, because at a fill rate near 220 MB/sec
+// each 80 us window accumulates ~18 KB and flushing that costs more than the
+// floor. That is not a flaw in the measurement, it is what durability costs
+// when it is demanded at the device's own latency.
+
+#include "../storage/storage.hpp"
+#include "../storage/field_storage.hpp"
+
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <memory>
+#include <string>
+#include <sys/resource.h>
+#include <vector>
+
+#ifdef HAVE_POSTGRES
+#include <libpq-fe.h>
+#endif
+#ifdef HAVE_LMDB
+#include <lmdb.h>
+#endif
+
+namespace {
+
+    constexpr std::size_t value_bytes = 1024;
+    constexpr std::size_t log_capacity = 1200ull << 20;  // in-place maps this TWICE, and the VPS has 3.5 GB free
+    constexpr std::size_t max_ids = 1'500'000;
+    std::size_t n_records = 0, n_ops = 10'000;
+    bool do_sync = false;
+    std::chrono::microseconds barrier_us{1000};
+
+    // One barrier per barrier_us at most. The clock is read on every operation
+    // - clock_gettime is a vDSO call of a few tens of nanoseconds, so at 200000
+    // operations it costs single-digit milliseconds against a phase that runs
+    // for seconds, and reading it less often would smuggle an operation count
+    // back in through the side door.
+    struct barrier_clock {
+        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+        std::size_t fired = 0;
+        bool due() {
+            if (!do_sync) return false;
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last < barrier_us) return false;
+            last = now;
+            ++fired;
+            return true;
+        }
+    };
+
+    struct blob {
+        static constexpr storage::tag_t tag = 1;
+        uint64_t key, counter, f1, f2;
+        uint8_t payload[value_bytes - 32];
+    };
+    static_assert(sizeof(blob) == value_bytes);
+
+    using inplace_spec = storage::storage_spec<storage::durability::local_sync, "vm_ip.db", log_capacity,
+                                               "", "vm_ip.idx", "", max_ids>;
+    using field_bench = storage::field_spec<"vm_fd.log", log_capacity, "vm_fd.idx", max_ids, 400'000, 8, value_bytes>;
+
+    double secs(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+        return std::chrono::duration<double>(b - a).count();
+    }
+
+    struct xorshift {
+        uint64_t s;
+        explicit xorshift(uint64_t seed) : s(seed) {}
+        uint64_t next() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; }
+        uint64_t range(uint64_t n) { return next() % n; }
+    };
+
+    // THREE sources, because no one of them covers the field. getrusage sees
+    // only this process, which is everything for our engines and almost
+    // nothing for postgres - there the work happens in a backend the server
+    // forked. /proc/stat sees the whole machine, which catches that backend but
+    // also catches any noise. On a 1-core idle VPS the two agree for our
+    // engines, and where they disagree for postgres the difference IS the
+    // server's share.
+    //
+    // iowait is the reason this is worth measuring at all: it separates "the
+    // engine is computing" from "the engine is stopped in front of the device",
+    // and those two look identical in an ops/sec column.
+    struct cpu_self { double user = 0, sys = 0; };
+    cpu_self self_cpu() {
+        struct rusage ru;
+        if (::getrusage(RUSAGE_SELF, &ru) != 0) return {};
+        return { ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6,
+                 ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6 };
+    }
+
+    struct cpu_all { double user = 0, sys = 0, idle = 0, iowait = 0, steal = 0; };
+    cpu_all system_cpu() {
+        std::ifstream f("/proc/stat");
+        std::string tag;
+        f >> tag;
+        if (tag != "cpu") return {};
+        double v[10]{};
+        for (int i = 0; i < 10 && f >> v[i]; ++i) {}
+        const double hz = 100.0; // USER_HZ
+        return { (v[0] + v[1]) / hz, v[2] / hz, v[3] / hz, v[4] / hz, v[7] / hz };
+    }
+
+    std::size_t major_faults() {
+        struct rusage ru;
+        return ::getrusage(RUSAGE_SELF, &ru) == 0 ? (std::size_t)ru.ru_majflt : 0;
+    }
+    std::size_t rss_mb() {
+        std::ifstream f("/proc/self/status");
+        std::string k;
+        while (f >> k) { if (k == "VmRSS:") { std::size_t v; f >> v; return v / 1024; } }
+        return 0;
+    }
+
+    const char* engine_name = "";
+    struct phase_marks { cpu_self s0; cpu_all a0; std::size_t f0; std::chrono::steady_clock::time_point t0; };
+    phase_marks mark() { return { self_cpu(), system_cpu(), major_faults(), std::chrono::steady_clock::now() }; }
+
+    void row(const char* phase, std::size_t ops, const phase_marks& m, std::size_t barriers = 0) {
+        const auto t1 = std::chrono::steady_clock::now();
+        const cpu_self s1 = self_cpu();
+        const cpu_all a1 = system_cpu();
+        const double wall = std::chrono::duration<double>(t1 - m.t0).count();
+        const double su = s1.user - m.s0.user, ss = s1.sys - m.s0.sys;
+        const double au = a1.user - m.a0.user, as = a1.sys - m.a0.sys, aw = a1.iowait - m.a0.iowait;
+        std::printf("%-8s %-4s %-14s %8zu ops %7.2f s %10.0f ops/s | self u%6.2f s%6.2f (%5.1f%% cpu) "
+                    "| sys u%6.2f s%6.2f io%6.2f (%5.1f%% busy) | %6zu majflt %4zu MB %6zu barr\n",
+                    engine_name, do_sync ? "sync" : "raw", phase, ops, wall, ops / wall,
+                    su, ss, 100.0 * (su + ss) / wall,
+                    au, as, aw, 100.0 * (au + as) / wall,
+                    major_faults() - m.f0, rss_mb(), barriers);
+        std::fflush(stdout);
+    }
+
+    // ---------------------------------------------------------------- ours
+    template <typename table>
+    void run_ours(table& t) {
+        blob b{};
+        std::memset(b.payload, 0xAB, sizeof(b.payload));
+        std::vector<storage::record_id> ids;
+        ids.reserve(n_records);
+
+        barrier_clock bc;
+        auto m = mark();
+        for (std::size_t i = 0; i < n_records; ++i) {
+            b.key = i + 1; b.counter = i;
+            ids.push_back(t.create(b));
+            if (bc.due()) t.sync();
+        }
+        if (do_sync) { t.sync(); ++bc.fired; }
+        row("fill", n_records, m, bc.fired);
+
+        xorshift rng(9);
+        volatile uint64_t sink = 0;
+        blob out{};
+        m = mark();
+        for (std::size_t i = 0; i < n_ops; ++i) {
+            const storage::record_id id = ids[rng.range(n_records)];
+            if constexpr (requires { t.template get<blob>(id, out); }) {
+                (void)t.template get<blob>(id, out);
+                sink = out.counter;
+            } else {
+                const blob* p = t.template get<blob>(id);
+                if (p) sink = p->counter;
+            }
+        }
+        row("random read", n_ops, m);
+
+        bc = barrier_clock{};
+        m = mark();
+        for (std::size_t i = 0; i < n_ops; ++i) {
+            t.template update<&blob::counter>(ids[rng.range(n_records)], (uint64_t)i);
+            if (bc.due()) t.sync();
+        }
+        if (do_sync) { t.sync(); ++bc.fired; }
+        row("random update", n_ops, m, bc.fired);
+        (void)sink;
+    }
+
+    // ------------------------------------------------------------ postgres
+#ifdef HAVE_POSTGRES
+    void die(PGconn* c, const char* what) {
+        std::printf("postgres: %s: %s\n", what, PQerrorMessage(c));
+        std::exit(1);
+    }
+    void exec(PGconn* c, const char* sql) {
+        PGresult* r = PQexec(c, sql);
+        if (PQresultStatus(r) != PGRES_COMMAND_OK && PQresultStatus(r) != PGRES_TUPLES_OK) { PQclear(r); die(c, sql); }
+        PQclear(r);
+    }
+
+    void run_postgres(const char* conninfo) {
+        PGconn* c = PQconnectdb(conninfo);
+        if (PQstatus(c) != CONNECTION_OK) die(c, "connect");
+
+        exec(c, do_sync ? "SET synchronous_commit = on" : "SET synchronous_commit = off");
+        exec(c, "DROP TABLE IF EXISTS vm");
+        exec(c, "CREATE TABLE vm (id bigint PRIMARY KEY, counter bigint, payload bytea)");
+
+        std::vector<char> payload(value_bytes - 32, (char)0xAB);
+        exec(c, "PREPARE ins (bigint, bigint, bytea) AS INSERT INTO vm VALUES ($1, $2, $3)");
+        exec(c, "PREPARE sel (bigint) AS SELECT counter FROM vm WHERE id = $1");
+        exec(c, "PREPARE upd (bigint, bigint) AS UPDATE vm SET counter = $2 WHERE id = $1");
+
+        barrier_clock bc;
+        auto m = mark();
+        exec(c, "BEGIN");
+        for (std::size_t i = 0; i < n_records; ++i) {
+            const std::string id = std::to_string(i + 1), ctr = std::to_string(i);
+            const char* vals[3] = { id.c_str(), ctr.c_str(), payload.data() };
+            const int lens[3] = { 0, 0, (int)payload.size() };
+            const int fmts[3] = { 0, 0, 1 };
+            PGresult* r = PQexecPrepared(c, "ins", 3, vals, lens, fmts, 0);
+            if (PQresultStatus(r) != PGRES_COMMAND_OK) { PQclear(r); die(c, "insert"); }
+            PQclear(r);
+            // The transaction is the barrier here, so a cell that does not sync
+            // still has to commit sometimes - otherwise it would be one
+            // gigantic transaction and would measure something else entirely.
+            if (bc.due() || (!do_sync && (i + 1) % 10000 == 0)) { exec(c, "COMMIT"); exec(c, "BEGIN"); }
+        }
+        exec(c, "COMMIT");
+        row("fill", n_records, m, bc.fired);
+
+        // Index and table both freshly written; ANALYZE so the planner does not
+        // pick a sequential scan for a point lookup and turn this into a
+        // measurement of the planner.
+        exec(c, "ANALYZE vm");
+
+        xorshift rng(9);
+        volatile uint64_t sink = 0;
+        m = mark();
+        for (std::size_t i = 0; i < n_ops; ++i) {
+            const std::string id = std::to_string(rng.range(n_records) + 1);
+            const char* v[1] = { id.c_str() };
+            PGresult* r = PQexecPrepared(c, "sel", 1, v, nullptr, nullptr, 0);
+            if (PQresultStatus(r) != PGRES_TUPLES_OK) { PQclear(r); die(c, "select"); }
+            if (PQntuples(r) > 0) sink = (uint64_t)std::strtoull(PQgetvalue(r, 0, 0), nullptr, 10);
+            PQclear(r);
+        }
+        row("random read", n_ops, m);
+
+        bc = barrier_clock{};
+        m = mark();
+        exec(c, "BEGIN");
+        for (std::size_t i = 0; i < n_ops; ++i) {
+            const std::string id = std::to_string(rng.range(n_records) + 1), ctr = std::to_string(i);
+            const char* v[2] = { id.c_str(), ctr.c_str() };
+            PGresult* r = PQexecPrepared(c, "upd", 2, v, nullptr, nullptr, 0);
+            if (PQresultStatus(r) != PGRES_COMMAND_OK) { PQclear(r); die(c, "update"); }
+            PQclear(r);
+            if (bc.due() || (!do_sync && (i + 1) % 10000 == 0)) { exec(c, "COMMIT"); exec(c, "BEGIN"); }
+        }
+        exec(c, "COMMIT");
+        row("random update", n_ops, m, bc.fired);
+        (void)sink;
+
+        PGresult* r = PQexec(c, "SELECT pg_size_pretty(pg_total_relation_size('vm'))");
+        if (PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r)) std::printf("         table+index on disk: %s\n", PQgetvalue(r, 0, 0));
+        PQclear(r);
+        exec(c, "DROP TABLE vm");
+        PQfinish(c);
+    }
+#endif
+
+    // ------------------------------------------------------------- lmdb
+    //
+    // Here because it is the fastest READER among the general-purpose engines
+    // measured earlier (2.20M/sec against RocksDB's 0.43M), and because it is
+    // the only one that is mmap-based like ours - so its major-fault counts
+    // mean the same thing in the same column, which is not true of postgres or
+    // rocksdb, whose misses are read() calls the kernel never reports as faults.
+    //
+    // Sync maps cleanly: a write transaction commits durably by default, and
+    // MDB_NOSYNC removes exactly that and nothing else. Same barrier as
+    // everywhere else - one commit per barrier_us - so the transaction shape
+    // does not change between the two columns.
+#ifdef HAVE_LMDB
+    // BIG-ENDIAN KEYS, and not for style. LMDB's default comparator is
+    // memcmp over the raw bytes, so a native little-endian uint64 sorts by its
+    // LOW byte first: 256 (00 01 ..) lands before 255 (FF 00 ..). Ascending
+    // numbers stop being ascending keys at exactly i = 256, which is where
+    // MDB_APPEND - a bulk load's whole point, since it appends to the rightmost
+    // page instead of searching - refuses with MDB_KEYEXIST. Byte-swapping
+    // makes the tree order the numeric order.
+    inline uint64_t be_key(uint64_t k) { return __builtin_bswap64(k); }
+
+    void lmdb_check(int rc, const char* what) {
+        if (rc) { std::printf("lmdb: %s: %s\n", what, mdb_strerror(rc)); std::exit(1); }
+    }
+
+    void run_lmdb() {
+        ::system("rm -rf vm_lmdb && mkdir -p vm_lmdb");
+        MDB_env* env = nullptr;
+        lmdb_check(mdb_env_create(&env), "env_create");
+        // NOT log_capacity. A B+tree needs more room than the bytes it stores:
+        // page headers, splits leaving pages half full, and a free list that
+        // only returns space at the next commit. Measured at 200 MB of records
+        // it occupied 276 MB, a factor of 1.38, and setting the map to the data
+        // size made a 1000 MB run die with MDB_MAP_FULL partway through the
+        // fill. The map is address space, not disk - the file grows to what is
+        // actually used - so it costs nothing to leave headroom.
+        lmdb_check(mdb_env_set_mapsize(env, 2560ull << 20), "set_mapsize");
+        // MDB_WRITEMAP so writes go through the mapping rather than through
+        // write(), which is what makes the fault counts comparable to ours.
+        const unsigned flags = MDB_WRITEMAP | (do_sync ? 0u : (unsigned)MDB_NOSYNC);
+        lmdb_check(mdb_env_open(env, "vm_lmdb", flags, 0644), "env_open");
+
+        MDB_txn* txn = nullptr;
+        MDB_dbi dbi;
+        lmdb_check(mdb_txn_begin(env, nullptr, 0, &txn), "txn_begin");
+        lmdb_check(mdb_dbi_open(txn, nullptr, 0, &dbi), "dbi_open");
+
+        blob b{};
+        std::memset(b.payload, 0xAB, sizeof(b.payload));
+
+        barrier_clock bc;
+        auto m = mark();
+        for (std::size_t i = 0; i < n_records; ++i) {
+            b.key = i + 1; b.counter = i;
+            uint64_t k = be_key(i + 1);
+            MDB_val mk{ sizeof(k), &k }, mv{ sizeof(b), &b };
+            lmdb_check(mdb_put(txn, dbi, &mk, &mv, MDB_APPEND), "put");
+            if (bc.due() || (!do_sync && (i + 1) % 10000 == 0)) {
+                lmdb_check(mdb_txn_commit(txn), "commit");
+                lmdb_check(mdb_txn_begin(env, nullptr, 0, &txn), "txn_begin");
+            }
+        }
+        lmdb_check(mdb_txn_commit(txn), "commit");
+        row("fill", n_records, m, bc.fired);
+
+        xorshift rng(9);
+        volatile uint64_t sink = 0;
+        lmdb_check(mdb_txn_begin(env, nullptr, MDB_RDONLY, &txn), "rtxn");
+        m = mark();
+        for (std::size_t i = 0; i < n_ops; ++i) {
+            uint64_t k = be_key(rng.range(n_records) + 1);
+            MDB_val mk{ sizeof(k), &k }, mv{};
+            if (mdb_get(txn, dbi, &mk, &mv) == 0) sink = ((const blob*)mv.mv_data)->counter;
+        }
+        row("random read", n_ops, m);
+        mdb_txn_abort(txn);
+
+        bc = barrier_clock{};
+        lmdb_check(mdb_txn_begin(env, nullptr, 0, &txn), "txn_begin");
+        m = mark();
+        for (std::size_t i = 0; i < n_ops; ++i) {
+            uint64_t k = be_key(rng.range(n_records) + 1);
+            MDB_val mk{ sizeof(k), &k }, mv{};
+            if (mdb_get(txn, dbi, &mk, &mv) == 0) {
+                blob cur;
+                std::memcpy(&cur, mv.mv_data, sizeof(cur));
+                cur.counter = i;
+                MDB_val nv{ sizeof(cur), &cur };
+                lmdb_check(mdb_put(txn, dbi, &mk, &nv, 0), "put_upd");
+            }
+            if (bc.due() || (!do_sync && (i + 1) % 10000 == 0)) {
+                lmdb_check(mdb_txn_commit(txn), "commit");
+                lmdb_check(mdb_txn_begin(env, nullptr, 0, &txn), "txn_begin");
+            }
+        }
+        lmdb_check(mdb_txn_commit(txn), "commit");
+        row("random update", n_ops, m, bc.fired);
+        (void)sink;
+
+        MDB_stat st{};
+        lmdb_check(mdb_env_stat(env, &st), "stat");
+        std::printf("         lmdb pages %zu of %u bytes = %.0f MB\n",
+                    (std::size_t)(st.ms_branch_pages + st.ms_leaf_pages + st.ms_overflow_pages),
+                    st.ms_psize,
+                    (st.ms_branch_pages + st.ms_leaf_pages + st.ms_overflow_pages) * (double)st.ms_psize / 1048576.0);
+        mdb_env_close(env);
+        ::system("rm -rf vm_lmdb");
+    }
+#endif
+
+} // namespace
+
+int main(int argc, char** argv) {
+    const std::string engine = argc > 1 ? argv[1] : "field";
+    const double mb = argc > 2 ? std::strtod(argv[2], nullptr) : 200.0;
+    do_sync = argc > 3 && std::string(argv[3]) == "sync";
+    n_ops = argc > 4 ? (std::size_t)std::strtoull(argv[4], nullptr, 10) : 10'000;
+    barrier_us = std::chrono::microseconds(argc > 5 ? std::strtoull(argv[5], nullptr, 10) : 1000);
+    n_records = (std::size_t)(mb * 1048576.0 / value_bytes);
+    if (n_records >= max_ids) { std::printf("too many records for max_ids\n"); return 1; }
+
+    engine_name = engine.c_str();
+    std::printf("# %s / %s / %.0f MB / %zu records / %zu ops / barrier every %lld us\n",
+                engine.c_str(), do_sync ? "sync" : "raw", mb, n_records, n_ops, (long long)barrier_us.count());
+
+    if (engine == "inplace") {
+        std::remove("vm_ip.db"); std::remove("vm_ip.db.data"); std::remove("vm_ip.idx");
+        { auto t = std::make_unique<storage::storage<inplace_spec>>(); run_ours(*t); }
+        std::remove("vm_ip.db"); std::remove("vm_ip.db.data"); std::remove("vm_ip.idx");
+    } else if (engine == "field") {
+        std::remove("vm_fd.log"); std::remove("vm_fd.idx");
+        { auto t = std::make_unique<storage::field_storage<field_bench>>();
+          if (!t->ok()) { std::printf("could not map\n"); return 1; }
+          run_ours(*t); }
+        std::remove("vm_fd.log"); std::remove("vm_fd.idx");
+#ifdef HAVE_LMDB
+    } else if (engine == "lmdb") {
+        run_lmdb();
+#endif
+#ifdef HAVE_POSTGRES
+    } else if (engine == "pg") {
+        run_postgres(argc > 6 ? argv[6] : "host=/var/run/postgresql port=5433 user=postgres dbname=postgres");
+#endif
+    } else {
+        std::printf("unknown engine: %s\n", engine.c_str());
+        return 1;
+    }
+    return 0;
+}

@@ -127,6 +127,8 @@
 //       -llmdb -lrocksdb -lpq -I/usr/include/postgresql -DHAVE_ROCKSDB -DHAVE_POSTGRES
 #include "../storage/storage.hpp"
 #include "../storage/field_storage.hpp"
+#include "../storage/hybrid_storage.hpp"
+#include "../storage/cached_storage.hpp"
 #include "deferred_storage.hpp"
 
 #include <chrono>
@@ -134,6 +136,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <sys/resource.h>
 #include <vector>
@@ -182,6 +185,22 @@ namespace {
     // gather is measured at its real depth rather than being optimised away.
     using field_bench_spec = storage::field_spec<"big_fields.log", log_capacity, "big_fields.idx",
                                                  max_ids, 2'000'000, 8, 2048>;
+
+    // The unified engine. Same log capacity, plus a materialization the same
+    // size, plus the fault probe: 20 major faults per 1000 updates is the
+    // budget, which at 1 GB is never reached and at 26 GB is reached almost
+    // immediately - that is the whole experiment.
+    using hybrid_bench_spec = storage::hybrid_spec<"big_hyb.log", log_capacity, "big_hyb.dat", log_capacity,
+                                                   "big_hyb.idx", max_ids, 2'000'000, 8, 2048, "", 4096, 20>;
+
+    // The cache is sized by a BUDGET, not by the dataset - that is the whole
+    // difference from the hybrid above. 2 GB against 26 GB of records: the
+    // 100k hot records (102 MB) fit many times over, a uniformly random read
+    // over 27M records mostly does not, and both of those are meant to show.
+    template <std::size_t cache_bytes, bool admit_on_create, bool admit_on_second = false>
+    using cached_bench_spec = storage::cached_spec<"big_cch.log", log_capacity, "big_cch.idx",
+                                                   max_ids, 2'000'000, "big_cch.cache", cache_bytes,
+                                                   8, value_bytes, admit_on_create, admit_on_second>;
 
     double secs(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
         return std::chrono::duration<double>(b - a).count();
@@ -572,6 +591,202 @@ namespace {
     }
 
     // =================================================================
+    // ours-hybrid - one index shape for both designs, and a fault probe that
+    // decides per update which one each record gets. See
+    // storage/hybrid_storage.hpp. The number that matters here is not any one
+    // rate but whether the engine LEAVES in-place mode when the region stops
+    // fitting, and what it costs on either side of that.
+    // =================================================================
+    void run_ours_hybrid() {
+        std::remove("big_hyb.log"); std::remove("big_hyb.dat"); std::remove("big_hyb.idx");
+        auto hs_holder = std::make_unique<storage::hybrid_storage<hybrid_bench_spec>>();
+        auto& hs = *hs_holder;
+        if (!hs.ok()) { std::printf("ours-hybrid: could not map the regions\n"); return; }
+
+        blob b{};
+        std::memset(b.payload, 0xAB, sizeof(b.payload));
+        blob out{};
+
+        auto t0 = std::chrono::steady_clock::now();
+        std::vector<storage::record_id> ids;
+        ids.reserve(n_records);
+        for (std::size_t i = 0; i < n_records; ++i) {
+            b.key = i + 1; b.counter = i;
+            ids.push_back(hs.create(b));
+            if ((i + 1) % (n_records / 10) == 0)
+                progress(i + 1, n_records, secs(t0, std::chrono::steady_clock::now()), hs.current_offset());
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        report("ours-hyb", "fill", n_records, secs(t0, t1));
+
+        const pressure before = sample();
+        xorshift rng(9);
+        volatile uint64_t sink = 0;
+        t0 = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n_random; ++i) { (void)hs.get(ids[rng.range(n_records)], out); sink = out.counter; }
+        t1 = std::chrono::steady_clock::now();
+        report("ours-hyb", "random read", n_random, secs(t0, t1));
+        const pressure after_read = sample();
+
+        const std::size_t in_place_before = hs.in_place_update_count();
+        t0 = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n_random; ++i) hs.update<&blob::counter>(ids[rng.range(n_records)], (uint64_t)i);
+        t1 = std::chrono::steady_clock::now();
+        report("ours-hyb", "random update", n_random, secs(t0, t1));
+        const pressure after_update = sample();
+        std::printf("      after the random updates: in place %s, %zu of %zu updates patched, %zu switches\n",
+                    hs.in_place_active() ? "STILL ON" : "given up",
+                    hs.in_place_update_count() - in_place_before, n_random, hs.mode_switch_count());
+
+        std::vector<storage::record_id> hot;
+        hot.reserve(n_hot);
+        for (std::size_t i = 0; i < n_hot; ++i) hot.push_back(ids[rng.range(n_records)]);
+
+        t0 = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n_hot; ++i) { (void)hs.get(hot[i], out); sink = out.f1; }
+        t1 = std::chrono::steady_clock::now();
+        report("ours-hyb", "read hot, before", n_hot, secs(t0, t1));
+
+        t0 = std::chrono::steady_clock::now();
+        for (std::size_t r = 0; r < hot_rounds; ++r)
+            for (std::size_t i = 0; i < n_hot; ++i)
+                switch (r) {
+                    case 0: hs.update<&blob::counter>(hot[i], r); break;
+                    case 1: hs.update<&blob::f1>(hot[i], r); break;
+                    case 2: hs.update<&blob::f2>(hot[i], r); break;
+                    case 3: hs.update<&blob::f3>(hot[i], r); break;
+                    default: hs.update<&blob::f4>(hot[i], r); break;
+                }
+        t1 = std::chrono::steady_clock::now();
+        report("ours-hyb", "hot update x5", n_hot * hot_rounds, secs(t0, t1));
+
+        t0 = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n_hot; ++i) { (void)hs.get(hot[i], out); sink = out.f1; }
+        t1 = std::chrono::steady_clock::now();
+        report("ours-hyb", "read hot, after", n_hot, secs(t0, t1));
+
+        // The pointer read, counted separately because it only exists for
+        // records that are still contiguous - which is exactly the thing the
+        // mode switch takes away.
+        std::size_t hits = 0;
+        t0 = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n_hot; ++i) { const blob* p = hs.peek<blob>(hot[i]); if (p) { sink = p->f1; ++hits; } }
+        t1 = std::chrono::steady_clock::now();
+        if (hits) report("ours-hyb", "read hot, by pointer", hits, secs(t0, t1));
+        std::printf("      pointer reads available for %zu of %zu hot records\n", hits, n_hot);
+        (void)sink;
+
+        std::printf("      RSS %zu MB, major faults: %zu during reads, %zu during updates\n",
+                    sample().rss_mb, after_read.major - before.major, after_update.major - after_read.major);
+        std::printf("      in place %zu / appended %zu, collapses %zu, materialized %.1f GB\n",
+                    hs.in_place_update_count(), hs.appended_update_count(), hs.collapse_count(),
+                    hs.materialized_bytes() / 1073741824.0);
+        std::printf("      on disk: %.1f GB (log %.1f + data %.1f + index %.1f)\n",
+                    (dir_bytes("big_hyb.log") + dir_bytes("big_hyb.dat") + dir_bytes("big_hyb.idx")) / 1073741824.0,
+                    dir_bytes("big_hyb.log") / 1073741824.0, dir_bytes("big_hyb.dat") / 1073741824.0,
+                    dir_bytes("big_hyb.idx") / 1073741824.0);
+        hs_holder.reset();
+        std::remove("big_hyb.log"); std::remove("big_hyb.dat"); std::remove("big_hyb.idx");
+    }
+
+    // =================================================================
+    // ours-cached - field_storage with a bounded read-through cache of
+    // materialized aggregates. See storage/cached_storage.hpp.
+    // =================================================================
+    template <std::size_t cache_bytes, bool admit_on_create, bool admit_on_second = false,
+              bool release_during_fill = false>
+    void run_ours_cached(const char* name) {
+        std::remove("big_cch.log"); std::remove("big_cch.idx"); std::remove("big_cch.cache");
+        auto holder = std::make_unique<storage::cached_storage<cached_bench_spec<cache_bytes, admit_on_create, admit_on_second>>>();
+        auto& cs = *holder;
+        if (!cs.ok()) { std::printf("%s: could not map the regions\n", name); return; }
+
+        blob b{};
+        std::memset(b.payload, 0xAB, sizeof(b.payload));
+        blob out{};
+
+        auto t0 = std::chrono::steady_clock::now();
+        std::vector<storage::record_id> ids;
+        ids.reserve(n_records);
+        for (std::size_t i = 0; i < n_records; ++i) {
+            b.key = i + 1; b.counter = i;
+            ids.push_back(cs.create(b));
+            if ((i + 1) % (n_records / 10) == 0) {
+                // The pages behind the write cursor are exhaust: they have
+                // been written, nothing reads them yet, and they are evicting
+                // whatever a read would want.
+                if constexpr (release_during_fill) cs.release_log(cs.current_offset());
+                progress(i + 1, n_records, secs(t0, std::chrono::steady_clock::now()), cs.current_offset());
+            }
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        report(name, "fill", n_records, secs(t0, t1));
+
+        const pressure before = sample();
+        xorshift rng(9);
+        volatile uint64_t sink = 0;
+        t0 = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n_random; ++i) { (void)cs.get(ids[rng.range(n_records)], out); sink = out.counter; }
+        t1 = std::chrono::steady_clock::now();
+        report(name, "random read", n_random, secs(t0, t1));
+        const pressure after_read = sample();
+
+        t0 = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n_random; ++i) cs.template update<&blob::counter>(ids[rng.range(n_records)], (uint64_t)i);
+        t1 = std::chrono::steady_clock::now();
+        report(name, "random update", n_random, secs(t0, t1));
+        const pressure after_update = sample();
+
+        std::vector<storage::record_id> hot;
+        hot.reserve(n_hot);
+        for (std::size_t i = 0; i < n_hot; ++i) hot.push_back(ids[rng.range(n_records)]);
+
+        t0 = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n_hot; ++i) { (void)cs.get(hot[i], out); sink = out.f1; }
+        t1 = std::chrono::steady_clock::now();
+        report(name, "read hot, before", n_hot, secs(t0, t1));
+
+        t0 = std::chrono::steady_clock::now();
+        for (std::size_t r = 0; r < hot_rounds; ++r)
+            for (std::size_t i = 0; i < n_hot; ++i)
+                switch (r) {
+                    case 0: cs.template update<&blob::counter>(hot[i], r); break;
+                    case 1: cs.template update<&blob::f1>(hot[i], r); break;
+                    case 2: cs.template update<&blob::f2>(hot[i], r); break;
+                    case 3: cs.template update<&blob::f3>(hot[i], r); break;
+                    default: cs.template update<&blob::f4>(hot[i], r); break;
+                }
+        t1 = std::chrono::steady_clock::now();
+        report(name, "hot update x5", n_hot * hot_rounds, secs(t0, t1));
+
+        t0 = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n_hot; ++i) { (void)cs.get(hot[i], out); sink = out.f1; }
+        t1 = std::chrono::steady_clock::now();
+        report(name, "read hot, after", n_hot, secs(t0, t1));
+
+        std::size_t hits = 0;
+        t0 = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n_hot; ++i) { const blob* p = cs.template peek<blob>(hot[i]); if (p) { sink = p->f1; ++hits; } }
+        t1 = std::chrono::steady_clock::now();
+        if (hits) report(name, "read hot, by pointer", hits, secs(t0, t1));
+        (void)sink;
+
+        std::printf("      RSS %zu MB, major faults: %zu during reads, %zu during updates\n",
+                    sample().rss_mb, after_read.major - before.major, after_update.major - after_read.major);
+        std::printf("      cache: %zu of %zu slots resident (%.1f GB budget), %.0f%% hit ratio, "
+                    "%zu hits / %zu misses / %zu evictions / %zu admissions, pointer reads for %zu of %zu hot\n",
+                    cs.cache_resident(), cs.cache_slot_count(), cache_bytes / 1073741824.0,
+                    cs.cache_hit_ratio() * 100, cs.cache_hits(), cs.cache_misses(), cs.cache_evictions(),
+                    admit_on_second ? cs.cache_admissions() : cs.cache_resident(), hits, n_hot);
+        std::printf("      on disk: %.1f GB (log %.1f + index %.1f + cache %.1f)\n",
+                    (dir_bytes("big_cch.log") + dir_bytes("big_cch.idx") + dir_bytes("big_cch.cache")) / 1073741824.0,
+                    dir_bytes("big_cch.log") / 1073741824.0, dir_bytes("big_cch.idx") / 1073741824.0,
+                    dir_bytes("big_cch.cache") / 1073741824.0);
+        holder.reset();
+        std::remove("big_cch.log"); std::remove("big_cch.idx"); std::remove("big_cch.cache");
+    }
+
+    // =================================================================
     // ours-deferred - storage.hpp's two regions and pointer-returning reads,
     // but an update only appends and marks the record dirty; the writes are
     // applied later, in address order. See bench/deferred_storage.hpp.
@@ -765,6 +980,16 @@ int main(int argc, char** argv) {
 
     if (engine == "ours") run_ours();
     else if (engine == "ours-fields") run_ours_fields();
+    else if (engine == "ours-hybrid") run_ours_hybrid();
+    else if (engine == "ours-cached") run_ours_cached<(2ull << 30), false>("ours-cch");
+    else if (engine == "ours-cached-full") run_ours_cached<(28ull << 30), true>("ours-cfl");
+    // the budget sweep: same engine, one number different
+    else if (engine == "cch-256") run_ours_cached<(256ull << 20), false>("cch-256");
+    else if (engine == "cch-256f") run_ours_cached<(256ull << 20), false, true>("cch-256f");
+    else if (engine == "cch-1g") run_ours_cached<(1ull << 30), false>("cch-1g");
+    else if (engine == "cch-1gf") run_ours_cached<(1ull << 30), false, true>("cch-1gf");
+    else if (engine == "cch-2gf") run_ours_cached<(2ull << 30), false, true>("cch-2gf");
+    else if (engine == "cch-1gfr") run_ours_cached<(1ull << 30), false, true, true>("cch-1gfr");
     else if (engine == "ours-deferred") run_ours_deferred();
     else if (engine == "lmdb") run_lmdb();
 #ifdef HAVE_ROCKSDB

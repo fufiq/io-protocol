@@ -463,7 +463,7 @@ namespace {
             store.open("schemacmp_ours.sidx", index_sizing());
             // The region is anonymous now, so it starts empty and the snapshot
             // has to be read into it. Order matters: allocate, load, adopt.
-            const std::size_t indexed_to = store.restore(restored.observer_state());
+            const std::size_t indexed_to = store.restore();
             restored.observer_state().attach(store.region(), store.region_bytes(), index_sizing());
             restored.restart(bench_spec::capacity);
             // Anything the log has past the snapshot is replayed through the

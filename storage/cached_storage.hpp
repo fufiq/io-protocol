@@ -311,6 +311,8 @@ namespace storage {
         std::size_t live_bytes() const noexcept { return inner->live_bytes(); }
         std::size_t overrides_used() const noexcept { return inner->overrides_used(); }
         double garbage_ratio() const noexcept { return inner->garbage_ratio(); }
+        bool compaction_due(double r = 0.5, std::size_t b = 64ull << 20) const noexcept { return inner->compaction_due(r, b); }
+        std::size_t compacted_size() const noexcept { return inner->compacted_size(); }
         std::size_t collapse_count() const noexcept { return inner->collapse_count(); }
         bool set_last_record_flags(uint8_t bits) noexcept { return inner->set_last_record_flags(bits); }
         std::size_t for_each_record(std::size_t from, auto&& fn) const { return inner->for_each_record(from, fn); }

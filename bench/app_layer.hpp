@@ -25,7 +25,9 @@
 #include "../storage/storage.hpp"
 #include "flat_index.hpp"
 
+#include <chrono>
 #include <cstring>
+#include <string>
 #include <fcntl.h>
 #include <span>
 #include <sys/mman.h>
@@ -519,13 +521,60 @@ namespace app {
             const bool ok = ::fsync(f) == 0;
             ::close(f);
             if (!ok) { ::remove(tmp.c_str()); return false; }
-            return ::rename(tmp.c_str(), file.c_str()) == 0;
+            if (::rename(tmp.c_str(), file.c_str()) != 0) { ::remove(tmp.c_str()); return false; }
+            // The rename itself has to be made durable, or a crash can leave
+            // the directory entry still pointing at the previous snapshot
+            // while the new file exists unnamed. Not a correctness hole - the
+            // old snapshot is a valid, merely older one, and the log covers
+            // the difference - but it silently costs the checkpoint that was
+            // just paid for.
+            sync_parent_directory(file.c_str());
+            last_checkpoint = std::chrono::steady_clock::now();
+            checkpointed_at = log_offset;
+            return true;
         }
+
+        // WHEN to take one. The engine cannot decide this for itself: a
+        // snapshot is only worth its cost against how much log a restart would
+        // otherwise have to replay, and only the caller knows what a restart is
+        // allowed to cost.
+        //
+        // Two bounds, either of which fires. The byte bound caps the replay
+        // window in bytes, which is what a restart actually pays. The time
+        // bound covers a database that goes quiet: without it, a system that
+        // stops writing sits forever one crash away from replaying everything
+        // since it started.
+        void set_checkpoint_policy(std::size_t log_bytes, std::chrono::seconds interval) noexcept {
+            policy_bytes = log_bytes;
+            policy_interval = interval;
+        }
+
+        bool checkpoint_due(std::size_t log_offset) const noexcept {
+            if (log_offset <= checkpointed_at) return false;   // nothing new to record
+            if (policy_bytes && log_offset - checkpointed_at >= policy_bytes) return true;
+            return policy_interval.count() > 0 &&
+                   std::chrono::steady_clock::now() - last_checkpoint >= policy_interval;
+        }
+
+        // The caller must already have made the log durable to log_offset.
+        bool checkpoint_if_due(std::size_t log_offset, schema_index& ix) noexcept {
+            return checkpoint_due(log_offset) && checkpoint(log_offset, ix);
+        }
+
+        std::size_t checkpointed_to() const noexcept { return checkpointed_at; }
 
         // Reads a snapshot back over the region. Returns the log offset it
         // describes, or 0 for "nothing usable here, replay the whole log".
-        std::size_t restore(schema_index& ix) noexcept {
+        //
+        // Reads valid_to out of the REGION rather than asking a schema_index,
+        // because this necessarily runs before attach(): the index has no
+        // header to consult until the bytes are in place. Asking it first
+        // returned 0 every time, which silently turned the caller's tail replay
+        // into dead code - harmless only while the snapshot happened to be the
+        // last thing written before shutdown.
+        std::size_t restore() noexcept {
             if (!base || fd < 0) return 0;
+            last_checkpoint = std::chrono::steady_clock::now();
             struct stat st{};
             if (::fstat(fd, &st) != 0 || (std::size_t)st.st_size < bytes) return 0;
             std::byte* p = (std::byte*)base;
@@ -535,7 +584,9 @@ namespace app {
                 if (n <= 0) return 0;
                 at += (std::size_t)n; left -= (std::size_t)n;
             }
-            return ix.stamped();
+            const auto* h = (const index_header*)base;
+            checkpointed_at = (h->magic == index_magic) ? (std::size_t)h->valid_to : 0;
+            return checkpointed_at;
         }
 
         void* region() const noexcept { return base; }
@@ -552,6 +603,20 @@ namespace app {
         std::size_t bytes = 0;
         int fd = -1;
         std::string file;
+        std::size_t checkpointed_at = 0;
+        std::size_t policy_bytes = 64ull << 20;                 // 64 MB of log
+        std::chrono::seconds policy_interval{60};
+        std::chrono::steady_clock::time_point last_checkpoint = std::chrono::steady_clock::now();
+
+        static void sync_parent_directory(const char* path) noexcept {
+            std::string dir(path);
+            const std::size_t slash = dir.find_last_of('/');
+            dir = (slash == std::string::npos) ? std::string(".") : dir.substr(0, slash ? slash : 1);
+            int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+            if (dfd < 0) return;
+            ::fsync(dfd);
+            ::close(dfd);
+        }
     };
 
 } // namespace app

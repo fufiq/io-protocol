@@ -522,6 +522,31 @@ namespace storage {
             return write_offset == 0 ? 0.0 : 1.0 - (double)head->live_byte_count / write_offset;
         }
 
+        // A PREDICATE, not a background task, and the difference is structural:
+        // compaction needs a fresh region, and the engine has no way to obtain
+        // one - the caller supplies it, along with its file. So the engine can
+        // only say whether compacting is worth doing; the caller decides when
+        // it can afford to.
+        //
+        // Two bounds, both of which must hold. The ratio is the point: below it
+        // the rewrite moves more live bytes than it reclaims. The floor keeps a
+        // young log from tripping it - a log holding one record and one update
+        // is 50% garbage by ratio and worth nothing to compact, and without a
+        // floor a caller polling this would compact continuously from startup.
+        bool compaction_due(double min_garbage = 0.5, std::size_t min_bytes = 64ull << 20) const noexcept {
+            return write_offset >= min_bytes && garbage_ratio() >= min_garbage;
+        }
+
+        // What a compaction would leave behind, so a caller can size the region
+        // it is about to hand over. Live bytes plus one header each, rounded up
+        // - the same arithmetic compact() performs as it writes.
+        std::size_t compacted_size() const noexcept {
+            std::size_t n = 0;
+            for (record_id id = 1; id < head->slot_count; ++id)
+                if (alive(id)) n += pad8(sizeof(record_header) + slots[id].len);
+            return n;
+        }
+
         // Replays the log. Identical in shape to storage.hpp's: verify, then
         // hand each record to the same apply() a live write goes through, so
         // an observer maintained above cannot drift from the data.

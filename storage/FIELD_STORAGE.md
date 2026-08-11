@@ -400,6 +400,44 @@ before any of them is issued. Under mmap that was a cost; issued to a ring those
 same places are read at once. `storage.hpp` has nothing to gain here - its
 record is contiguous, so a read is one request.
 
+## 11b. Replication
+
+```cpp
+std::size_t apply_wal_range(const std::byte* bytes, std::size_t len);
+std::vector<std::byte> export_snapshot() const;
+void reset() noexcept;
+```
+
+`replication/replication.hpp` ships this engine's log to a replica as-is: the
+on-disk record format *is* the wire format, so there is no second schema to keep
+in sync with the first.
+
+`apply_wal_range` appends the received bytes **verbatim** and then replays from
+the local copy. Verbatim matters twice: the bytes are already complete records
+with their own checksums, so copying them keeps the two logs byte-identical and
+therefore keeps the two ends agreeing on offsets - which is what lets a replica
+resume by naming one. And the replay must run off the local copy, never the
+caller's buffer, because a slot's `base` is an offset into *this* mapping;
+applying straight from a network payload would record an offset into memory
+about to be reused. It returns how many bytes were applied, which is less than
+`len` if a checksum fails - the same rule and the same conclusion as recovery.
+
+`export_snapshot` re-encodes every live record as one contiguous CREATE. That
+makes it a **state, not a history**: a record with a chain arrives collapsed, and
+the result is independent of how the log got that way, which is exactly what a
+replica that has fallen out of step needs. Unlike `compact()` it disturbs
+nothing - no append, no chain freed, no offset moved.
+
+`reset()` returns to empty, keeping the files. A snapshot is only meaningful
+applied on top of nothing, so the desync path is `reset()` then
+`apply_wal_range(snapshot)`. The node arena and `next_id` go too, because a
+snapshot names its own ids and a stale high-water mark would hand out nodes the
+incoming state is about to claim.
+
+Measured on 400 records with chains and deletions: the log was 79,280 bytes and
+its snapshot 51,984 - chains collapse away. Corrupting one byte in the middle of
+a snapshot applied 25,992 of 51,984 and discarded the rest.
+
 ## 12. Limits
 
 **Single writer, no concurrent readers, no MVCC, no snapshots.** There is no

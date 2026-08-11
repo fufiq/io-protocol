@@ -19,6 +19,7 @@
 
 #include "../storage/uring_gather.hpp"
 #include "../storage/direct_gather.hpp"
+#include "../storage/prefetch_gather.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -159,6 +160,28 @@ int main(int argc, char** argv) {
         auto t1 = std::chrono::steady_clock::now();
         sink = (uint64_t)out[0];
         row("mmap + slot prefetch", n_reads, secs(t0, t1), major_faults() - f0, "depth 1, slots pulled ahead");
+    }
+
+    // ---- mmap with the pages advised a window ahead ----------------------
+    //
+    // Same read path, same mapping, same assemble(). The only difference is
+    // that the kernel is told which pages the next window will want before the
+    // current one is assembled, so several reads are in flight instead of one.
+    for (std::size_t window : { 16u, 64u, 256u }) {
+        auto picks = fresh_picks(400 + window);
+        storage::prefetch_gather g(window);
+        cold();
+        const std::size_t f0 = major_faults();
+        auto t0 = std::chrono::steady_clock::now();
+        auto r = g.read_many(t, std::span<const storage::record_id>{ picks }, out.data(), value_bytes);
+        auto t1 = std::chrono::steady_clock::now();
+        sink = (uint64_t)out[0];
+        char note[112];
+        std::snprintf(note, sizeof(note), "%zu pieces -> %zu advises, %.1f MB advised",
+                      r.pieces, r.advises, r.advised_bytes / 1048576.0);
+        char label[48];
+        std::snprintf(label, sizeof(label), "mmap + WILLNEED w=%zu", window);
+        row(label, n_reads, secs(t0, t1), major_faults() - f0, note);
     }
 
     // ---- pread ---------------------------------------------------------

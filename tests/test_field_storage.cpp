@@ -1,4 +1,5 @@
 #include <doctest/doctest.h>
+#include <memory>
 #include <sys/mman.h>
 
 #include "../storage/field_storage.hpp"
@@ -298,6 +299,98 @@ TEST_CASE("a checkpoint is refused once anything was written after it") {
     CHECK_FALSE(restored.started_from_checkpoint());
     CHECK(restored.alive(a));
     CHECK(restored.alive(b)); // the write past the checkpoint survived the replay
+    wipe();
+}
+
+TEST_CASE("replication: a WAL range applies verbatim and keeps offsets aligned") {
+    // apply_wal_range must append the bytes and replay from the LOCAL copy: a
+    // slot's base is an offset into this mapping, so applying straight from the
+    // caller's buffer would record an offset into memory about to be reused.
+    fixture f;
+    std::vector<record_id> ids;
+    for (int i = 0; i < 300; ++i) ids.push_back(f.table->create(quad{(uint64_t)i, 0, 0, 0}));
+    for (int i = 0; i < 300; ++i) f.table->update<&quad::b>(ids[i], 400 + i);
+    for (int i = 0; i < 300; i += 5) f.table->destroy(ids[i]);
+
+    const std::size_t total = f.table->current_offset();
+
+    std::remove("fieldrep.log"); std::remove("fieldrep.idx");
+    using replica_spec = storage::field_spec<"fieldrep.log", 1u << 22, "fieldrep.idx", 4096, 8192, 8, 256>;
+    auto replica = std::make_unique<storage::field_storage<replica_spec>>();
+    REQUIRE(replica->ok());
+
+    // shipped in two chunks, each cut at a record boundary as a shipper would
+    const std::size_t half = f.table->for_each_record(0, total / 2, [](auto, auto) {});
+    CHECK(replica->apply_wal_range(f.table->raw_base(), half) == half);
+    CHECK(replica->apply_wal_range(f.table->raw_base() + half, total - half) == total - half);
+    CHECK(replica->current_offset() == total);          // byte-identical logs
+
+    for (int i = 0; i < 300; ++i) {
+        auto a = f.table->get<quad>(ids[i]);
+        auto b = replica->get<quad>(ids[i]);
+        CHECK(a.has_value() == b.has_value());
+        if (a) CHECK(a->b == b->b);
+    }
+
+    // a corrupted byte stops the replay there rather than applying past it
+    auto snap = f.table->export_snapshot();
+    REQUIRE(snap.size() > 64);
+    snap[snap.size() / 2] ^= std::byte{0xFF};
+    replica->reset();
+    const std::size_t applied = replica->apply_wal_range(snap.data(), snap.size());
+    CHECK(applied > 0);
+    CHECK(applied < snap.size());
+
+    replica.reset();
+    std::remove("fieldrep.log"); std::remove("fieldrep.idx");
+    wipe();
+}
+
+TEST_CASE("replication: a snapshot is state, not history, and does not disturb its source") {
+    fixture f;
+    std::vector<record_id> ids;
+    for (int i = 0; i < 200; ++i) ids.push_back(f.table->create(quad{(uint64_t)i, 0, 0, 0}));
+    for (int i = 0; i < 200; ++i) f.table->update<&quad::b>(ids[i], 900 + i);
+    for (int i = 0; i < 200; i += 2) f.table->update<&quad::c>(ids[i], 5);
+    REQUIRE(f.table->depth(ids[0]) == 2);
+
+    const std::size_t offset_before = f.table->current_offset();
+    const std::size_t live_before = f.table->live_bytes();
+    const auto snap = f.table->export_snapshot();
+
+    CHECK(f.table->current_offset() == offset_before);   // unlike compact(), nothing moved
+    CHECK(f.table->live_bytes() == live_before);
+    CHECK(f.table->depth(ids[0]) == 2);
+    CHECK(snap.size() < offset_before);                  // chains collapsed away
+
+    std::remove("fieldrep.log"); std::remove("fieldrep.idx");
+    using replica_spec = storage::field_spec<"fieldrep.log", 1u << 22, "fieldrep.idx", 4096, 8192, 8, 256>;
+    auto replica = std::make_unique<storage::field_storage<replica_spec>>();
+    REQUIRE(replica->ok());
+
+    // over a dirty replica, which is the desync path: reset then snapshot
+    for (int i = 0; i < 500; ++i) replica->create(quad{7, 7, 7, 7});
+    for (int i = 0; i < 500; ++i) replica->update<&quad::b>(i + 1, 7);
+    REQUIRE(replica->overrides_used() > 0);
+    replica->reset();
+    CHECK(replica->current_offset() == 0);
+    CHECK(replica->live_bytes() == 0);
+    CHECK(replica->overrides_used() == 0);
+    CHECK_FALSE(replica->alive(1));
+
+    CHECK(replica->apply_wal_range(snap.data(), snap.size()) == snap.size());
+    for (int i = 0; i < 200; ++i) {
+        auto a = f.table->get<quad>(ids[i]);
+        auto b = replica->get<quad>(ids[i]);
+        REQUIRE(b.has_value());
+        CHECK(a->b == b->b);
+        CHECK(a->c == b->c);
+        CHECK(replica->depth(ids[i]) == 0);   // arrived collapsed
+    }
+    CHECK_FALSE(replica->alive(400));         // the dirty replica's own ids are gone
+
+    replica.reset();
+    std::remove("fieldrep.log"); std::remove("fieldrep.idx");
     wipe();
 }
 

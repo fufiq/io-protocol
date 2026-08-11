@@ -563,6 +563,93 @@ namespace storage {
             return pos;
         }
 
+        // ---- replication --------------------------------------------------
+
+        // Back to empty, keeping the files. A snapshot is only meaningful
+        // applied on top of nothing, so a replica adopting one discards what it
+        // had first; this is that discard.
+        //
+        // Everything goes, including the node arena and next_id, because a
+        // snapshot names its own ids and a stale high-water mark would hand out
+        // nodes that the incoming state is about to claim. The log's bytes are
+        // left where they are - write_offset returning to zero is what makes
+        // them unreachable, and the next append overwrites them.
+        void reset() noexcept {
+            write_offset = 0;
+            last_synced = 0;
+            last_record_offset = no_record_yet;
+            from_checkpoint = false;
+            reset_header();
+        }
+
+
+
+        // Applies a run of raw WAL bytes - records exactly as they sit in
+        // another storage's log - by APPENDING THEM VERBATIM to this one and
+        // then replaying from the local copy.
+        //
+        // Verbatim matters twice over. The bytes are already complete records
+        // with their own checksums, so copying them keeps this log
+        // byte-identical to the one it is following, and therefore keeps the
+        // two agreeing on offsets - which is what lets a replica resume by
+        // naming one.
+        //
+        // And the replay must run off the LOCAL copy, never off the caller's
+        // buffer. A slot's base is an offset into this mapping; applying
+        // straight from a network payload would record an offset into memory
+        // that is about to be reused, and the record would read as garbage the
+        // moment the buffer went away. The caller's buffer also carries no
+        // alignment guarantee, unlike everything else that reaches
+        // checksum_of() here.
+        //
+        // Returns the number of bytes actually applied, which is less than len
+        // if the run is truncated or a checksum fails - the same rule recovery
+        // uses, and the same conclusion: stop at the first record that cannot
+        // be trusted.
+        std::size_t apply_wal_range(const std::byte* bytes, std::size_t len) {
+            if (!base || !len) return 0;
+            if (write_offset + len > spec::capacity) { ++refused_appends; return 0; }
+            std::memcpy(base + write_offset, bytes, len);
+            const std::size_t from = write_offset;
+            const std::size_t end = scan(base, from, from + len, [this](record_header hdr, const std::byte* payload) {
+                apply(hdr, payload);
+                return true;
+            });
+            write_offset = end;
+            head->write_offset = end;
+            if (end > from) last_record_offset = from;   // approximate, and only used for flags
+            return end - from;
+        }
+
+        // Every live record re-encoded as one contiguous CREATE, for seeding a
+        // replica from scratch or after a desync.
+        //
+        // Assembling is what makes this a snapshot rather than a copy: a record
+        // with a chain is written as the single CREATE it currently amounts to,
+        // so the receiver gets a state, not a history. It also means the result
+        // is independent of how the log got that way, which is exactly what a
+        // replica that has fallen out of step needs.
+        //
+        // Does NOT disturb this storage: nothing is appended, no chain is
+        // freed, no offset moves. Unlike compact(), which does all three.
+        std::vector<std::byte> export_snapshot() const {
+            std::size_t needed = 0;
+            for (record_id id = 1; id < head->slot_count; ++id)
+                if (alive(id)) needed += pad8(sizeof(record_header) + slots[id].len);
+
+            std::vector<std::byte> out(needed);
+            alignas(8) std::byte scratch[spec::max_record_bytes];
+            std::size_t at = 0;
+            for (record_id id = 1; id < head->slot_count; ++id) {
+                if (!alive(id)) continue;
+                const uint32_t len = slots[id].len;
+                assemble(id, scratch, len);
+                write_record_at<record_op::create>(out.data(), at, id, 0, slots[id].tag,
+                                                   std::span<const std::byte>{ scratch, len });
+            }
+            return out;
+        }
+
         std::size_t for_each_record(std::size_t from, std::size_t to, auto&& fn) const {
             return scan(base, from, to, [&](record_header hdr, const std::byte* payload) {
                 if constexpr (std::is_void_v<decltype(fn(hdr, std::span<const std::byte>{payload, hdr.len}))>) {

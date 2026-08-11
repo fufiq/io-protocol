@@ -71,8 +71,10 @@
 
 #include "storage.hpp"
 
+#include <algorithm>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace storage {
 
@@ -91,13 +93,54 @@ namespace storage {
     static_assert(sizeof(override_node) == 24);
 
     struct field_slot {
-        uint64_t base;      // 8 - log offset of the CREATE's payload; 0 = no record
-        uint32_t head;      // 4 - first override, or no_override
-        uint32_t depth;     // 4
+        uint64_t base;          // 8 - log offset of the CREATE's payload; 0 = no record
+
+        // head AND depth in one word: 24 bits of node index, 8 bits of depth.
+        // A node index is bounded by max_overrides and a depth by max_depth,
+        // and neither is anywhere near its field - so spending a full uint32 on
+        // each was spending 4 bytes to store a number below 16 million and 4
+        // more to store one below 256.
+        //
+        // Worth the shifts because the index is the ONE structure that has to
+        // stay resident: at 24 bytes a 27M-record index is 648 MB, at 16 it is
+        // 432 MB, and the difference decides whether it survives memory
+        // pressure. When it did not survive - measured under a 320 MB cap - all
+        // six read paths collapsed to ~1000 ops/sec and became
+        // indistinguishable, because every one of them needs the slot before it
+        // can do anything at all.
+        uint32_t chain;         // 4
+
+        static constexpr uint32_t head_bits = 0x00FFFFFFu;
+        uint32_t head() const noexcept { return chain & head_bits; }
+        uint32_t depth() const noexcept { return chain >> 24; }
+        void set_head(uint32_t h) noexcept { chain = (chain & ~head_bits) | (h & head_bits); }
+        void set_depth(uint32_t d) noexcept { chain = (chain & head_bits) | (d << 24); }
+        // Saturating, so a record that somehow outruns max_depth records 255
+        // rather than wrapping to 0 and never collapsing again.
+        void bump_depth() noexcept { if (depth() < 255) set_depth(depth() + 1); }
+
+        // The record's LENGTH AND TAG, kept here rather than read back from the
+        // header that precedes the payload in the log.
+        //
+        // This is not a cache, it is the difference between a read path that
+        // can avoid the log and one that cannot. record_len() used to be
+        // header_of(base + slots[id].base)->len - a dereference into the log
+        // MAPPING, so merely learning how many bytes to read cost a page touch
+        // per record. Measured on 512 MB under a 320 MB cap, that made every
+        // read path identical to within 30% and left O_DIRECT taking 7272 major
+        // faults per 10000 reads while reading its data into an aligned pool it
+        // had specifically to avoid the page cache. It bypassed the cache for
+        // the data and walked straight into it for the metadata.
+        //
+        // The 16 bytes come from the old inline_* fields, which were measured
+        // and did not pay (variant H: 9.2M upd/s against the baseline's 12.5M
+        // for the same 4.08M reads). The slot gets SMALLER, 24 bytes not 32.
+        uint16_t len;           // 2
+        tag_t    tag;           // 2
     };
     static_assert(sizeof(field_slot) == 16);
 
-    inline constexpr uint32_t no_override = 0xFFFFFFFFu;
+    inline constexpr uint32_t no_override = 0x00FFFFFFu; // fits field_slot::chain's 24 bits
 
     // The index file's header. Everything a restart needs that is not in the
     // arrays themselves.
@@ -113,7 +156,7 @@ namespace storage {
         uint64_t write_offset;    // the log position these arrays describe
     };
     inline constexpr uint64_t field_index_magic = 0x584449444c454946ull; // "FIELDIDX"
-    inline constexpr uint32_t field_index_version = 1;
+    inline constexpr uint32_t field_index_version = 3; // 3: 16-byte slot, head+depth packed
 
     // =====================================================================
     // level is always local_sync here: a field storage owns its files by
@@ -123,7 +166,8 @@ namespace storage {
     template <fixed_string path_v, std::size_t capacity_v,
               fixed_string index_path_v, std::size_t max_ids_v, std::size_t max_overrides_v,
               std::size_t max_depth_v = 8, std::size_t max_record_bytes_v = 4096,
-              fixed_string checkpoint_path_v = fixed_string("")>
+              fixed_string checkpoint_path_v = fixed_string(""),
+              std::size_t max_span_v = 0>
     struct field_spec {
         static constexpr auto path = path_v;
         static constexpr std::size_t capacity = capacity_v;
@@ -141,11 +185,21 @@ namespace storage {
         // scratch buffer a collapse assembles into.
         static constexpr std::size_t max_record_bytes = max_record_bytes_v;
 
+        // Collapse when the chain's overrides are spread further apart in the
+        // log than this, rather than when there are more than max_depth of
+        // them. Depth is only a proxy for what a gather costs; the spread is
+        // the thing itself - two overrides in one page cost one fault, two
+        // 20 GB apart cost two. 0 disables it.
+        static constexpr std::size_t max_span = max_span_v;
+
         static constexpr const char* checkpoint_path = checkpoint_path_v.value;
         static constexpr bool fast_restart = checkpoint_path_v.value[0] != '\0';
 
         static_assert(index_path_v.value[0] != '\0', "a field storage keeps its index in a file - give the spec an index_path");
         static_assert(max_depth_v >= 1, "max_depth 0 would collapse on every update, which is just storage.hpp with extra steps");
+        static_assert(max_depth_v < 255, "depth is 8 bits in field_slot::chain");
+        static_assert(max_overrides_v < 0x00FFFFFFu, "a node index is 24 bits in field_slot::chain");
+        static_assert(max_record_bytes_v <= 0xFFFFu, "field_slot::len is 16 bits");
         static constexpr std::size_t index_bytes =
             sizeof(field_index_header) + max_ids_v * sizeof(field_slot) + max_overrides_v * sizeof(override_node);
     };
@@ -180,6 +234,7 @@ namespace storage {
         }
 
         ~field_storage() {
+            if (head && index_pinned) ::munlock(head, spec::index_bytes);
             if (head) ::munmap(head, spec::index_bytes);
             if (base) ::munmap(base, spec::capacity);
             if (index_fd >= 0) ::close(index_fd);
@@ -202,6 +257,7 @@ namespace storage {
             const record_id id = head->next_id++;
             if (id >= spec::max_ids) return 0;
             std::byte* logged = append<record_op::create>(id, 0, T::tag, std::as_bytes(std::span{&value, 1}));
+            if (!logged) return 0;
             apply_local<record_op::create>(*header_of(logged), logged);
             return id;
         }
@@ -216,6 +272,7 @@ namespace storage {
         record_id create_raw(record_id id, tag_t tag, std::span<const std::byte> bytes) {
             if (id >= spec::max_ids || bytes.size() > spec::max_record_bytes) return 0;
             std::byte* logged = append<record_op::create>(id, 0, tag, bytes);
+            if (!logged) return 0;
             apply_local<record_op::create>(*header_of(logged), logged);
             return id;
         }
@@ -239,6 +296,7 @@ namespace storage {
             static_assert(sizeof(T) <= spec::max_record_bytes, "raise field_spec::max_record_bytes for this type");
             if (id >= spec::max_ids) return 0;
             std::byte* logged = append<record_op::create>(id, 0, T::tag, std::as_bytes(std::span{&value, 1}));
+            if (!logged) return 0;
             apply_local<record_op::create>(*header_of(logged), logged);
             return id;
         }
@@ -249,6 +307,7 @@ namespace storage {
             if (!alive(id)) return;
             const std::size_t off = (std::size_t)&(((member_class_t<member> const volatile*)0)->*member);
             std::byte* logged = append<record_op::update>(id, (uint32_t)off, tag_t{0}, std::as_bytes(std::span{&value, 1}));
+            if (!logged) return;
             apply_local<record_op::update>(*header_of(logged), logged);
         }
 
@@ -258,12 +317,14 @@ namespace storage {
             if (!alive(id)) return;
             if ((std::size_t)offset + bytes.size() > record_len(id)) return;
             std::byte* logged = append<record_op::update>(id, offset, tag_t{0}, bytes);
+            if (!logged) return;
             apply_local<record_op::update>(*header_of(logged), logged);
         }
 
         void destroy(record_id id) {
             if (!alive(id)) return;
             std::byte* logged = append<record_op::destroy>(id, 0, tag_t{0}, {});
+            if (!logged) return;
             apply_local<record_op::destroy>(*header_of(logged), logged);
         }
 
@@ -302,11 +363,11 @@ namespace storage {
         }
 
         [[nodiscard]] tag_t tag_of(record_id id) const noexcept {
-            return alive(id) ? header_of(base + slots[id].base)->tag : tag_t{0};
+            return alive(id) ? slots[id].tag : tag_t{0};
         }
 
         bool alive(record_id id) const noexcept { return id < head->slot_count && slots[id].base != 0; }
-        uint32_t depth(record_id id) const noexcept { return alive(id) ? slots[id].depth : 0; }
+        uint32_t depth(record_id id) const noexcept { return alive(id) ? slots[id].depth() : 0; }
 
         template <tagged_aggregate T>
         void for_each(auto&& fn) const requires std::invocable<decltype(fn), record_id, const T&> {
@@ -322,9 +383,9 @@ namespace storage {
             alignas(8) std::byte scratch[spec::max_record_bytes];
             for (record_id id = 1; id < head->slot_count; ++id) {
                 if (!alive(id)) continue;
-                const record_header* h = header_of(base + slots[id].base);
-                assemble(id, scratch, h->len);
-                fn(raw_view{ id, h->tag, std::span<const std::byte>{ scratch, h->len } });
+                const field_slot& s = slots[id];
+                assemble(id, scratch, s.len);
+                fn(raw_view{ id, s.tag, std::span<const std::byte>{ scratch, s.len } });
             }
         }
 
@@ -362,18 +423,67 @@ namespace storage {
         // record passes spec::max_depth; exposed because a caller may know
         // better than the threshold does.
         void collapse(record_id id) {
-            if (!alive(id) || slots[id].head == no_override) return;
-            const record_header* h = header_of(base + slots[id].base);
-            const uint32_t len = h->len;
-            const tag_t tag = h->tag;
+            if (!alive(id) || slots[id].head() == no_override) return;
+            const uint32_t len = slots[id].len;
+            const tag_t tag = slots[id].tag;
             alignas(8) std::byte scratch[spec::max_record_bytes];
             assemble(id, scratch, len);
             std::byte* logged = append<record_op::create>(id, 0, tag, std::span<const std::byte>{ scratch, len });
+            if (!logged) return;   // the log is full; the chain stays, which is correct, only slower
             free_chain(id);
             slots[id].base = (std::size_t)(logged - base);
             ++collapses;
         }
 
+        // Collapse driven by READS rather than by writes. The threshold on
+        // update bounds the gather for everyone; this bounds it only for
+        // records somebody actually looks at, which is a different trade: a
+        // write-only record never pays to become contiguous, and a hot one
+        // pays once. Call it after a get() when the caller knows the record
+        // is worth flattening.
+        void collapse_if_deeper_than(record_id id, uint32_t depth_limit) {
+            if (alive(id) && slots[id].depth() > depth_limit) collapse(id);
+        }
+
+        // VARIANT B: re-append the record's overrides back to back at the log
+        // tail and repoint the chain at the copies. Depth is unchanged, so the
+        // gather still does the same number of memcpys - but they now come
+        // from ONE place instead of k scattered ones, which is what a gather
+        // actually pays for once the log stops fitting in memory.
+        //
+        // Costs the changed bytes, not the record: three uint64 fields of a
+        // kilobyte record is 24 bytes against 1024. And it needs no format
+        // change, because what it writes is ordinary update records that
+        // recovery already knows how to replay.
+        void compact_chain(record_id id) {
+            if (!alive(id) || slots[id].head() == no_override) return;
+            field_slot& s = slots[id];
+            for (uint32_t n = s.head(); n != no_override; n = nodes[n].next) {
+                override_node& o = nodes[n];
+                std::byte* moved = append<record_op::update>(id, o.field_offset, tag_t{0},
+                    std::span<const std::byte>{ base + o.log_offset, o.len });
+                if (!moved) return;
+                o.log_offset = (std::size_t)(moved - base);
+            }
+            ++chain_compactions;
+        }
+
+        // VARIANT A: collapse everything deeper than a threshold in ONE pass,
+        // SORTED BY ADDRESS, so the reads feeding the gathers walk the log in
+        // order instead of jumping. Meant to be driven by a background thread
+        // or a maintenance tick - the point is that neither a read nor a write
+        // pays for it on the critical path.
+        std::size_t collapse_deep(uint32_t depth_limit) {
+            sweep.clear();
+            for (record_id id = 1; id < head->slot_count; ++id)
+                if (alive(id) && slots[id].depth() > depth_limit) sweep.push_back({ slots[id].base, id });
+            std::sort(sweep.begin(), sweep.end(), [](auto& a, auto& b) { return a.first < b.first; });
+            for (auto& [addr, id] : sweep) collapse(id);
+            return sweep.size();
+        }
+
+        std::size_t chain_compaction_count() const noexcept { return chain_compactions; }
+        std::size_t refused_append_count() const noexcept { return refused_appends; }
         std::size_t collapse_count() const noexcept { return collapses; }
 
         // ---- durability --------------------------------------------------
@@ -383,6 +493,26 @@ namespace storage {
             const std::size_t start = last_synced & ~(page_size - 1);
             ::msync(base + start, write_offset - start, MS_SYNC);
             last_synced = write_offset;
+        }
+
+        // Tells the kernel we are done with the log below `upto`: first drop
+        // our page-table entries for it, then ask for the page-cache pages
+        // themselves. The data is not lost - this mapping is MAP_SHARED over a
+        // file, so the next access re-faults it in.
+        //
+        // Only CLEAN pages actually go. A page still dirty is skipped and left
+        // to writeback, which is why this deliberately does NOT force an msync
+        // first: paying a filesystem commit to free memory would trade the
+        // exact thing the log/data split was built to avoid.
+        //
+        // Meant for a bulk load, where the pages behind the write cursor are
+        // pure exhaust and are evicting the pages that reads actually want.
+        void release_log(std::size_t upto) noexcept {
+            if (!base || upto < page_size) return;
+            const std::size_t end = (upto < write_offset ? upto : write_offset) & ~(page_size - 1);
+            if (end == 0) return;
+            ::madvise(base, end, MADV_DONTNEED);
+            ::posix_fadvise(fd, 0, (off_t)end, POSIX_FADV_DONTNEED);
         }
 
         std::size_t current_offset() const noexcept { return write_offset; }
@@ -482,9 +612,8 @@ namespace storage {
             std::size_t live = 0;
             for (record_id id = 1; id < head->slot_count; ++id) {
                 if (!alive(id)) continue;
-                const record_header* h = header_of(base + slots[id].base);
-                const uint32_t len = h->len;
-                const tag_t tag = h->tag;
+                const uint32_t len = slots[id].len;
+                const tag_t tag = slots[id].tag;
                 assemble(id, scratch, len);
                 std::byte* placed = write_record_at<record_op::create>(scratch_base, scratch_offset, id, 0, tag,
                                                                        std::span<const std::byte>{ scratch, len });
@@ -510,6 +639,114 @@ namespace storage {
 
         std::byte* raw_base() const noexcept { return base; }
 
+        // The log's file descriptor, and the record's bytes described as FILE
+        // OFFSETS rather than as addresses in the mapping. A pointer-returning
+        // API hides where the data is; an io_uring read needs to be told.
+        int log_fd() const noexcept { return fd; }
+
+        // Pulls the slot toward the core before anything asks for it. Every
+        // read begins by loading slots[id], and at 16 bytes with random ids
+        // that is one cache line per lookup that nothing can predict - the
+        // access is id -> slot, and an id says nothing about the previous one.
+        // Issued a batch ahead, the miss overlaps with work instead of stalling
+        // in front of it.
+        void prefetch(record_id id) const noexcept {
+            if (id < spec::max_ids) __builtin_prefetch(&slots[id], 0, 3);
+        }
+
+        // Makes the index's residency a decision instead of an outcome.
+        //
+        // Not a tuning knob. Under a 320 MB cap the index was evicted along
+        // with everything else, and because every read path needs the slot
+        // before it can issue anything, all six of them - mmap, pread, two ring
+        // depths, two O_DIRECT depths - landed within 30% of each other at
+        // ~1000 ops/sec. The bottleneck was not the path, it was that the 2.3%
+        // of bytes that gate every access were competing with the 97.7% that do
+        // not.
+        //
+        // mlock is the real thing and needs RLIMIT_MEMLOCK; MADV_WILLNEED only
+        // asks. Returns true only for the former, so a caller can tell which it
+        // got rather than assume.
+        bool pin_index() noexcept {
+            if (!head) return false;
+            if (::mlock(head, spec::index_bytes) == 0) { index_pinned = true; return true; }
+            ::madvise(head, spec::index_bytes, MADV_WILLNEED);
+            return false;
+        }
+        bool index_is_pinned() const noexcept { return index_pinned; }
+
+        // Emits the record as DISJOINT pieces that together cover [0, len)
+        // exactly once: fn(file_offset, offset_within_record, length).
+        //
+        // Disjoint is the whole point and it is not an optimisation. assemble()
+        // gets away with reading the whole base and then overwriting fields on
+        // top because it runs in order. Reads issued to a ring complete in
+        // whatever order the device likes, so a base read landing after an
+        // override read would silently restore the stale bytes. Splitting the
+        // base into the gaps BETWEEN the overridden fields removes the overlap,
+        // and with it the ordering requirement - every piece can then be in
+        // flight at once.
+        //
+        // Returns false when two overrides overlap, which only run-time patch()
+        // calls can produce (update<member> cannot): there the result depends
+        // on chain order, so the caller must use the ordered path instead.
+        bool for_each_piece(record_id id, auto&& fn) const {
+            if (!alive(id)) return false;
+            const field_slot& s = slots[id];
+            const uint32_t len = record_len(id);
+
+            struct piece { uint32_t at; uint32_t len; std::size_t from; };
+            piece parts[spec::max_depth + 2];
+            std::size_t n = 0;
+            for (uint32_t k = s.head(); k != no_override; k = nodes[k].next) {
+                if ((std::size_t)nodes[k].field_offset + nodes[k].len > len) continue;
+                if (n >= spec::max_depth + 2) return false;
+                parts[n++] = { nodes[k].field_offset, nodes[k].len, nodes[k].log_offset };
+            }
+            std::sort(parts, parts + n, [](const piece& a, const piece& b) { return a.at < b.at; });
+
+            // Validated BEFORE anything is emitted. Returning false halfway
+            // would leave the caller having queued reads for a record it is
+            // then told to redo, and those reads would land in the buffer
+            // after the redo finished.
+            uint32_t cursor = 0;
+            for (std::size_t i = 0; i < n; ++i) {
+                if (parts[i].at < cursor) return false;          // overlapping overrides
+                cursor = parts[i].at + parts[i].len;
+            }
+
+            cursor = 0;
+            for (std::size_t i = 0; i < n; ++i) {
+                if (parts[i].at > cursor) fn(s.base + cursor, cursor, parts[i].at - cursor);
+                fn(parts[i].from, parts[i].at, parts[i].len);
+                cursor = parts[i].at + parts[i].len;
+            }
+            if (cursor < len) fn(s.base + cursor, cursor, len - cursor);
+            return true;
+        }
+
+        // The pieces in ASSEMBLE ORDER instead: the whole base first, then each
+        // override on top. They overlap, so a caller using this must apply them
+        // in the order given - which a reader that copies out of its own pool
+        // controls, and a reader writing straight into the caller's buffer does
+        // not.
+        //
+        // Worth having because the disjoint form splits the base into up to d+1
+        // fragments, and under O_DIRECT a fragment costs a whole block however
+        // few bytes it is: measured 18.5x read amplification against 1 KB
+        // records. This form is d+1 pieces with the base contiguous.
+        void for_each_piece_ordered(record_id id, auto&& fn) const {
+            if (!alive(id)) return;
+            const field_slot& s = slots[id];
+            const uint32_t len = record_len(id);
+            fn(s.base, (uint32_t)0, len);
+            for (uint32_t n = s.head(); n != no_override; n = nodes[n].next)
+                if ((std::size_t)nodes[n].field_offset + nodes[n].len <= len)
+                    fn(nodes[n].log_offset, nodes[n].field_offset, nodes[n].len);
+        }
+
+        uint32_t length_of(record_id id) const noexcept { return alive(id) ? record_len(id) : 0; }
+
     private:
         // The three op bodies. Every path into the storage - a live write, a
         // replayed record, a replicated one - ends in exactly one of these.
@@ -518,10 +755,12 @@ namespace storage {
             if (hdr.id >= head->slot_count) head->slot_count = hdr.id + 1;
             if (head->next_id <= hdr.id) head->next_id = hdr.id + 1;
             field_slot& s = slots[hdr.id];
-            if (s.base) head->live_byte_count -= header_of(base + s.base)->len;
+            if (s.base) head->live_byte_count -= s.len;
             obs.on_record(*this, hdr, data);
             free_chain(hdr.id);
             s.base = (std::size_t)(data - base);
+            s.len = (uint16_t)hdr.len;
+            s.tag = hdr.tag;
             head->live_byte_count += hdr.len;
         }
 
@@ -552,14 +791,15 @@ namespace storage {
             return (const record_header*)(data - sizeof(record_header));
         }
 
-        uint32_t record_len(record_id id) const noexcept { return header_of(base + slots[id].base)->len; }
+        uint32_t record_len(record_id id) const noexcept { return slots[id].len; }
 
         // The gather. Base record first, then every overridden field on top -
         // newest chain node first, and since an update to an already-overridden
         // field replaces its node, every node here is the current value.
         void assemble(record_id id, std::byte* out, uint32_t len) const noexcept {
-            std::memcpy(out, base + slots[id].base, len);
-            for (uint32_t n = slots[id].head; n != no_override; n = nodes[n].next) {
+            const field_slot& s = slots[id];
+            std::memcpy(out, base + s.base, len);
+            for (uint32_t n = s.head(); n != no_override; n = nodes[n].next) {
                 const override_node& o = nodes[n];
                 if ((std::size_t)o.field_offset + o.len <= len)
                     std::memcpy(out + o.field_offset, base + o.log_offset, o.len);
@@ -567,21 +807,31 @@ namespace storage {
         }
 
         void set_override(record_id id, uint32_t offset, uint32_t len, std::size_t at) noexcept {
-            for (uint32_t n = slots[id].head; n != no_override; n = nodes[n].next) {
+            field_slot& s = slots[id];
+            // The walk that finds an existing override for this field also
+            // measures how far apart the chain is, which costs nothing extra
+            // because the nodes are being touched anyway.
+            std::size_t lo = at, hi = at;
+            for (uint32_t n = s.head(); n != no_override; n = nodes[n].next) {
                 if (nodes[n].field_offset == offset && nodes[n].len == len) { nodes[n].log_offset = at; return; }
+                lo = nodes[n].log_offset < lo ? nodes[n].log_offset : lo;
+                hi = nodes[n].log_offset > hi ? nodes[n].log_offset : hi;
             }
             const uint32_t n = alloc_node();
             if (n == no_override) return; // out of nodes: the record keeps its previous value rather than a wrong one
-            nodes[n] = { at, offset, len, slots[id].head, 0 };
-            slots[id].head = n;
-            ++slots[id].depth;
+            nodes[n] = { at, offset, len, s.head(), 0 };
+            s.set_head(n);
+            s.bump_depth();
+            if constexpr (spec::max_span != 0) {
+                if (hi - lo > spec::max_span) collapse(id);
+            }
         }
 
         // The bound on how far a read can degrade. Without it a chain grows
         // with the number of DISTINCT fields a record has ever had touched,
         // and a gather grows with it.
         void maybe_collapse(record_id id) {
-            if (slots[id].depth > spec::max_depth) collapse(id);
+            if (slots[id].depth() > spec::max_depth) collapse(id);
         }
 
         uint32_t alloc_node() noexcept {
@@ -594,20 +844,31 @@ namespace storage {
             return (uint32_t)head->node_high_water++;
         }
 
-        void free_chain(record_id id) noexcept {
-            uint32_t n = slots[id].head;
+        void free_chain_only(record_id id) noexcept {
+            uint32_t n = slots[id].head();
             while (n != no_override) {
                 const uint32_t next = nodes[n].next;
                 nodes[n].next = (uint32_t)head->node_free_head;
                 head->node_free_head = n;
                 n = next;
             }
-            slots[id].head = no_override;
-            slots[id].depth = 0;
+            slots[id].set_head(no_override);
         }
 
+        void free_chain(record_id id) noexcept {
+            free_chain_only(id);
+            slots[id].set_depth(0);
+        }
+
+        // The capacity check the log did not have. Without it a workload that
+        // collapses often - a low max_depth over wide records rewrites the
+        // whole record on nearly every update - walks straight off the end of
+        // the mapping and segfaults. Found by exactly that: max_depth 1 over
+        // 32 fields wrote 8.8 GB into a 4 GB log.
         template <record_op op>
         std::byte* append(record_id id, uint32_t offset, tag_t tag, std::span<const std::byte> bytes) {
+            const std::size_t need = pad8(sizeof(record_header) + bytes.size());
+            if (write_offset + need > spec::capacity) { ++refused_appends; return nullptr; }
             last_record_offset = write_offset;
             return write_record_at<op>(base, write_offset, id, offset, tag, bytes);
         }
@@ -672,7 +933,7 @@ namespace storage {
             head->slot_count = 1;      // id 0 is never a record
             head->node_free_head = no_override;
             std::memset(slots, 0, spec::max_ids * sizeof(field_slot));
-            for (std::size_t i = 0; i < spec::max_ids; ++i) slots[i].head = no_override;
+            for (std::size_t i = 0; i < spec::max_ids; ++i) slots[i].chain = no_override; // head = none, depth = 0
         }
 
         static constexpr std::size_t page_size = 4096;
@@ -682,8 +943,10 @@ namespace storage {
         std::size_t last_synced = 0;
         static constexpr std::size_t no_record_yet = (std::size_t)-1;
         std::size_t last_record_offset = no_record_yet;
-        std::size_t collapses = 0;
+        std::size_t collapses = 0, chain_compactions = 0, refused_appends = 0;
+        std::vector<std::pair<std::size_t, record_id>> sweep;
         bool from_checkpoint = false;
+        bool index_pinned = false;
         int fd = -1, index_fd = -1;
 
         field_index_header* head = nullptr;

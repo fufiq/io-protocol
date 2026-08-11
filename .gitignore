@@ -6,3 +6,6 @@ compile_commands.json
 *.storage
 *.compact_tmp
 *.o
+
+# Telegram export used for research, 147 MB of chat logs
+chats/

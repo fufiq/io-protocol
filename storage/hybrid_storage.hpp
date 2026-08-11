@@ -523,7 +523,7 @@ namespace storage {
         // `rehome` false is the migration the whole design exists to make
         // cheap: every base ends up in the log, no record is patchable any
         // more, and the data file can be deleted.
-        void compact(std::byte* scratch_base, bool rehome = true) {
+        void compact(std::byte* scratch_base, bool rehome = true, int scratch_fd = -1) {
             std::size_t scratch_offset = 0;
             alignas(8) std::byte scratch[spec::max_record_bytes];
             std::size_t live = 0;
@@ -541,8 +541,9 @@ namespace storage {
                 live += len;
             }
 
-            if (base) ::munmap(base, spec::capacity);
-            if (fd >= 0) { ::close(fd); fd = -1; }
+            if (base && base != scratch_base) ::munmap(base, spec::capacity);
+            if (fd >= 0 && fd != scratch_fd) ::close(fd);
+            fd = scratch_fd;
             base = scratch_base;
             write_offset = scratch_offset;
             last_synced = 0;

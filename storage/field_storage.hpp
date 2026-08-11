@@ -606,7 +606,17 @@ namespace storage {
         // Rewrites every live record as one contiguous CREATE into a fresh
         // region, which drops every chain at once. Compaction here reclaims
         // more than dead records: the whole update history goes with it.
-        void compact(std::byte* scratch_base) {
+        // scratch_fd is the file behind scratch_base, and passing it is what
+        // keeps this storage owning a file after a compaction. It used to close
+        // its fd and leave it at -1: the mapping was adopted, the file was
+        // dropped, and every path that needs a descriptor degraded silently -
+        // log_fd() handed a closed one to uring_gather and direct_gather,
+        // release_log()'s posix_fadvise did nothing, and checkpoint() named an
+        // offset in a file it could no longer fsync.
+        //
+        // -1 keeps the old behaviour, which is right for scratch that is not a
+        // file: a vector, or an anonymous mapping, as the tests use.
+        void compact(std::byte* scratch_base, int scratch_fd = -1) {
             std::size_t scratch_offset = 0;
             alignas(8) std::byte scratch[spec::max_record_bytes];
             std::size_t live = 0;
@@ -621,8 +631,9 @@ namespace storage {
                 slots[id].base = (std::size_t)(placed - scratch_base);
                 live += len;
             }
-            if (base) ::munmap(base, spec::capacity);
-            if (fd >= 0) { ::close(fd); fd = -1; }
+            if (base && base != scratch_base) ::munmap(base, spec::capacity);
+            if (fd >= 0 && fd != scratch_fd) ::close(fd);
+            fd = scratch_fd;
             base = scratch_base;
             write_offset = scratch_offset;
             last_synced = 0;

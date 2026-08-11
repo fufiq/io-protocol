@@ -328,9 +328,9 @@ namespace storage {
         bool started_from_checkpoint() const noexcept { return inner->started_from_checkpoint(); }
         void discard_checkpoint() noexcept { inner->discard_checkpoint(); }
 
-        void compact(std::byte* scratch_base) {
+        void compact(std::byte* scratch_base, int scratch_fd = -1) {
             if constexpr (spec::has_cache) drop_cache();
-            inner->compact(scratch_base);
+            inner->compact(scratch_base, scratch_fd);
         }
 
         // ---- cache accounting ---------------------------------------------

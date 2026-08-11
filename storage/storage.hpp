@@ -1008,16 +1008,17 @@ namespace storage {
         // split storage that compacted into a single region would silently
         // point its index back into the log and quietly undo the split. A
         // `requires` makes that a compile error at the call site instead.
-        void compact(std::byte* scratch_base) requires (!split_regions) {
-            compact_into(scratch_base, nullptr);
+        void compact(std::byte* scratch_base, int scratch_fd = -1) requires (!split_regions) {
+            compact_into(scratch_base, nullptr, scratch_fd, -1);
         }
 
         // scratch_data_base must be a DIFFERENT region from the current data
         // region: records are read from the old one while being written to
         // the new one, and their relative order is not guaranteed to make an
         // in-place shuffle safe.
-        void compact(std::byte* scratch_base, std::byte* scratch_data_base) requires (split_regions) {
-            compact_into(scratch_base, scratch_data_base);
+        void compact(std::byte* scratch_base, std::byte* scratch_data_base,
+                     int scratch_fd = -1, int scratch_data_fd = -1) requires (split_regions) {
+            compact_into(scratch_base, scratch_data_base, scratch_fd, scratch_data_fd);
         }
 
         // --- Below: methods for background_compact (Variant 2) only, not
@@ -1176,11 +1177,12 @@ namespace storage {
         // CREATEs, then switches index/base/write_offset/last_synced
         // to the new region. Call only while holding the lock (see
         // background_compact).
-        void finish_compaction(std::byte* scratch, snapshot& snap) requires (!split_regions) {
-            finish_compaction_into(scratch, nullptr, snap);
+        void finish_compaction(std::byte* scratch, snapshot& snap, int scratch_fd = -1) requires (!split_regions) {
+            finish_compaction_into(scratch, nullptr, snap, scratch_fd, -1);
         }
-        void finish_compaction(std::byte* scratch, std::byte* scratch_data, snapshot& snap) requires (split_regions) {
-            finish_compaction_into(scratch, scratch_data, snap);
+        void finish_compaction(std::byte* scratch, std::byte* scratch_data, snapshot& snap,
+                               int scratch_fd = -1, int scratch_data_fd = -1) requires (split_regions) {
+            finish_compaction_into(scratch, scratch_data, snap, scratch_fd, scratch_data_fd);
         }
 
     private:
@@ -1293,7 +1295,8 @@ namespace storage {
 
         // Shared body of both compact() overloads. scratch_data_base is
         // nullptr exactly when the storage is unsplit.
-        void compact_into(std::byte* scratch_base, std::byte* scratch_data_base) {
+        void compact_into(std::byte* scratch_base, std::byte* scratch_data_base,
+                          int scratch_fd = -1, int scratch_data_fd = -1) {
             // Slots are rewritten as the loop goes, so the new offsets must be
             // measured against the region they will end up in, not against
             // data_base - which is still the OLD region every record is being
@@ -1313,7 +1316,7 @@ namespace storage {
                 index[id].offset = (std::size_t)(placed - target_data);
                 live_byte_count += old_hdr->len;
             }
-            adopt_region(base, fd, scratch_base);
+            adopt_region(base, fd, scratch_base, scratch_fd);
             write_offset = scratch_offset;
             last_record_offset = no_record; // the record it pointed at is gone
             // last_synced MUST be reset: scratch has never been synced, and
@@ -1321,11 +1324,12 @@ namespace storage {
             // the new write_offset - sync() would then conclude there's
             // nothing to flush and silently skip the whole compacted region.
             last_synced = 0;
-            if constexpr (split_regions) { adopt_region(data_base, data_fd, scratch_data_base); data_offset = scratch_data_offset; }
+            if constexpr (split_regions) { adopt_region(data_base, data_fd, scratch_data_base, scratch_data_fd); data_offset = scratch_data_offset; }
             else data_base = scratch_base;
         }
 
-        void finish_compaction_into(std::byte* scratch, std::byte* scratch_data, snapshot& snap) {
+        void finish_compaction_into(std::byte* scratch, std::byte* scratch_data, snapshot& snap,
+                                    int scratch_fd = -1, int scratch_data_fd = -1) {
             std::byte* const target_data = split_regions ? scratch_data : scratch;
             std::size_t scratch_offset = 0, scratch_data_offset = 0;
             live_byte_count = 0;
@@ -1341,11 +1345,11 @@ namespace storage {
                 index[id].offset = (std::size_t)(placed - target_data);
                 live_byte_count += ref.len;
             }
-            adopt_region(base, fd, scratch);
+            adopt_region(base, fd, scratch, scratch_fd);
             write_offset = scratch_offset;
             last_record_offset = no_record;
             last_synced = 0;
-            if constexpr (split_regions) { adopt_region(data_base, data_fd, scratch_data); data_offset = scratch_data_offset; }
+            if constexpr (split_regions) { adopt_region(data_base, data_fd, scratch_data, scratch_data_fd); data_offset = scratch_data_offset; }
             else data_base = scratch;
         }
 
@@ -1412,12 +1416,23 @@ namespace storage {
         // The incoming region is adopted, not borrowed - ~storage() will
         // unmap it. The caller may close its file descriptor afterwards (the
         // mapping keeps the inode alive), but must not unmap it itself.
-        void adopt_region(std::byte*& region, int& region_fd, std::byte* fresh) noexcept {
+        // Takes over BOTH the mapping and the file behind it. The fd used to
+        // be closed and left at -1, which lost the storage its own file: after
+        // a compaction log_fd() returned -1, so uring_gather and direct_gather
+        // read from a closed descriptor, release_log()'s posix_fadvise silently
+        // did nothing, and checkpoint() named an offset in a file it could no
+        // longer fsync. The mapping was adopted; the file was dropped.
+        //
+        // fresh_fd < 0 keeps the old behaviour and is correct for a caller
+        // whose scratch is not a file at all - a vector, or an anonymous
+        // mapping, as several tests use.
+        void adopt_region(std::byte*& region, int& region_fd, std::byte* fresh, int fresh_fd) noexcept {
             if constexpr (split_regions) {
                 if (region && region != fresh) ::munmap(region, spec::capacity);
-                if (region_fd >= 0) { ::close(region_fd); region_fd = -1; }
+                if (region_fd >= 0 && region_fd != fresh_fd) ::close(region_fd);
             }
             region = fresh;
+            region_fd = fresh_fd;
         }
 
         // Grows with the total number of ids ever issued (next_id only

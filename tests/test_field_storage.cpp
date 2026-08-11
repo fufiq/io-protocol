@@ -1,4 +1,5 @@
 #include <doctest/doctest.h>
+#include <sys/mman.h>
 
 #include "../storage/field_storage.hpp"
 
@@ -297,6 +298,67 @@ TEST_CASE("a checkpoint is refused once anything was written after it") {
     CHECK_FALSE(restored.started_from_checkpoint());
     CHECK(restored.alive(a));
     CHECK(restored.alive(b)); // the write past the checkpoint survived the replay
+    wipe();
+}
+
+TEST_CASE("compaction hands over the FILE, not just the mapping") {
+    // The fd used to be closed and left at -1, so a compacted storage no longer
+    // owned a file: log_fd() gave a closed descriptor to uring_gather and
+    // direct_gather, release_log()'s posix_fadvise silently did nothing, and
+    // checkpoint() named an offset in a file it could no longer fsync. The
+    // mapping was adopted and the file was dropped.
+    fixture f;
+    for (int i = 0; i < 200; ++i) f.table->create(quad{(uint64_t)i, 0, 0, 0});
+    for (int i = 0; i < 200; ++i) f.table->update<&quad::b>(i + 1, 500 + i);
+    const int before = f.table->log_fd();
+    REQUIRE(before >= 0);
+
+    const std::string path = "fieldcmp_new.log";
+    int nfd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    REQUIRE(nfd >= 0);
+    REQUIRE(::posix_fallocate(nfd, 0, 1u << 22) == 0);
+    void* fresh = ::mmap(nullptr, 1u << 22, PROT_READ | PROT_WRITE, MAP_SHARED, nfd, 0);
+    REQUIRE(fresh != MAP_FAILED);
+
+    f.table->compact((std::byte*)fresh, nfd);
+
+    CHECK(f.table->log_fd() == nfd);
+    CHECK(::fcntl(f.table->log_fd(), F_GETFD) != -1);   // still open
+
+    for (int i = 0; i < 200; ++i) {
+        auto v = f.table->get<quad>(i + 1);
+        REQUIRE(v.has_value());
+        CHECK(v->a == (uint64_t)i);
+        CHECK(v->b == (uint64_t)(500 + i));
+        CHECK(f.table->depth(i + 1) == 0);
+    }
+
+    // The paths that used to degrade in silence
+    f.table->sync();
+    f.table->release_log(f.table->current_offset());
+    CHECK(f.table->checkpoint());
+
+    std::size_t creates = 0;
+    f.table->for_each_record(0, f.table->current_offset(),
+        [&](storage::record_header h, std::span<const std::byte>) {
+            if (h.op == storage::record_op::create) ++creates;
+        });
+    CHECK(creates == 200);
+
+    ::munmap(fresh, 1u << 22);
+    std::remove(path.c_str());
+    wipe();
+}
+
+TEST_CASE("compaction with a scratch that is not a file keeps the old behaviour") {
+    // -1 is the default and must still be accepted: several callers compact
+    // into a vector or an anonymous mapping, where there is no fd to adopt.
+    fixture f;
+    for (int i = 0; i < 50; ++i) f.table->create(quad{(uint64_t)i, 0, 0, 0});
+    std::vector<std::byte> scratch(1u << 20);
+    f.table->compact(scratch.data());
+    CHECK(f.table->log_fd() == -1);
+    for (int i = 0; i < 50; ++i) CHECK(f.table->get<quad>(i + 1)->a == (uint64_t)i);
     wipe();
 }
 

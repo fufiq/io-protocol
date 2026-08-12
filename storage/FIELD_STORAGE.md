@@ -423,6 +423,26 @@ before any of them is issued. Under mmap that was a cost; issued to a ring those
 same places are read at once. `storage.hpp` has nothing to gain here - its
 record is contiguous, so a read is one request.
 
+### The prefetch window is a memory budget, not a tuning knob
+
+`prefetch_gather` works by putting pages in the cache *before* they are touched,
+so every window in flight is memory committed until its records are assembled.
+Run one per thread and the requirement is
+
+    threads x window x record_size  <  available memory
+
+Cross it and prefetch degrades below plain faulting, because the earliest pages
+of each window are evicted before they are read. Measured on 512 MB under a
+320 MB cap: 1 thread 203 744 records/sec, 2 threads 277 592, **4 threads 5 499**
+- a 37x collapse against a single thread, reproduced twice, and not fixed by
+quartering the per-thread window (5 275).
+
+The same configuration in RAM scales the other way - 231 147 / 332 499 / 560 802
+- because reads there are `memcpy`-bound, not device-bound. So: threads help
+when the working set is resident and hurt when it is not, and one thread with a
+prefetch window already draws ~1.25 GB/s against this device's ~1.36 GB/s.
+
+
 ## 11b. Replication
 
 ```cpp
@@ -461,10 +481,85 @@ Measured on 400 records with chains and deletions: the log was 79,280 bytes and
 its snapshot 51,984 - chains collapse away. Corrupting one byte in the middle of
 a snapshot applied 25,992 of 51,984 and discarded the rest.
 
+## 11c. Reading during a commit (the sync window)
+
+```cpp
+bool     read_window_open()  const noexcept;
+std::size_t read_window_count() const noexcept;
+
+template <tagged_aggregate T>
+bool     try_get(record_id id, T& out) const noexcept;   // false = "not now"
+uint32_t try_read_raw(record_id id, std::span<std::byte> out) const noexcept;
+```
+
+A durable commit is time in which the writer holds a thread and mutates
+**nothing**: it is stopped inside `msync` waiting on the device. `sync()`
+publishes that fact so other threads can read the index while it lasts, and
+withdraws it the moment `msync` returns.
+
+The mechanism is a seqlock. `sync()` bumps a generation to an **odd** value
+before `msync` and to an even one after. `try_get` refuses unless the generation
+is odd, and after assembling checks it is *still the same odd value* - proving
+the whole gather happened inside one commit, during which no slot or node
+changed. The writer never waits for a reader: a reader that overruns simply
+loses its read and returns false. That asymmetry is deliberate. A gate the
+writer had to drain would let a reader taking a 275 µs major fault stall the
+commit path.
+
+Three consequences worth stating plainly.
+
+**`false` is not an error.** It means the window was shut, shut mid-gather, or
+the record failed the bounds checks the optimistic path applies. It says nothing
+about whether the record exists. The exclusive `get()` remains the way to find
+that out.
+
+**The optimistic path is bounds-checked and the exclusive one is not.** A slot
+read concurrently with `set_override` can be torn - head and depth share one
+32-bit word - so `assemble<true>` validates every node index against
+`max_overrides`, every log offset against the window's extent, and caps chain
+length to stop a torn `next` that closed a loop. `if constexpr` keeps all of it
+out of the exclusive path.
+
+**Every index word involved is read and written with relaxed atomics**
+(`load_relaxed`/`store_relaxed`). Not for ordering - for indivisibility. A plain
+read of a word a writer may be changing lets the compiler *reload* it between
+the bounds check and its use, so the check would validate one value and the
+`memcpy` would use another. On x86-64 these compile to the same instruction as
+the plain access; the exclusive write path measured 46.5M updates/sec against
+46.6M before the conversion.
+
+### What it is worth, measured
+
+The window is only as large as the commit actually waits, and that is a property
+of the **device**, not of this engine:
+
+| | commit share of wall time |
+|---|---|
+| VPS, `local_sync`, 204 800 inserts / 5 451 barriers | **45 %** (0.61 s iowait of 1.35 s) |
+| local NVMe, 26 barriers over 20 M updates | **0.0 %** (`msync` totalled under 1 ms) |
+
+On the NVMe there is nothing to give away: background writeback keeps up, so by
+the time `msync` is called the pages are already clean and it returns
+immediately. 61 million read attempts against that run were served 53 times.
+
+Correctness held throughout - **zero torn reads across ~1 billion attempts**,
+and ThreadSanitizer reports no race.
+
+The gate is free to a writer that has no readers, and free to one that does: a
+control run whose threads spun on a private atomic and never touched the engine
+slowed the writer by exactly as much as the real readers did. That cost is real
+but it belongs to busy-waiting, not to this mechanism.
+
+**So: do not poll for the window.** A thread spinning on `read_window_open()`
+costs the writer 3-5x by occupying cores, to catch a window that on fast storage
+is never open. This is for a reader that has other work and checks
+opportunistically - and it earns its keep only where commits genuinely wait on
+the device.
+
 ## 12. Limits
 
-**One writer, and readers only while it is idle.** There is no locking anywhere
-in this file. The boundary is narrower than "single-threaded", and it was
+**One writer, and readers only while it is idle** - or inside a commit, see
+§11c. There is no locking anywhere in this file. The boundary is narrower than "single-threaded", and it was
 checked rather than assumed:
 
 | | |

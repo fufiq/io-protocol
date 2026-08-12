@@ -72,6 +72,7 @@
 #include "storage.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <optional>
 #include <string>
 #include <vector>
@@ -92,6 +93,28 @@ namespace storage {
     };
     static_assert(sizeof(override_node) == 24);
 
+    // The index words a reader may see while a writer is changing them, read
+    // and written as single indivisible loads and stores.
+    //
+    // This is the price of admitting readers during a commit, and it is paid in
+    // notation rather than in instructions: a relaxed atomic load or store of an
+    // aligned word compiles to the same mov as the plain access on every
+    // architecture this targets. What it buys is that the compiler may not
+    // split, fuse or re-read the access - which is what makes a bounds check on
+    // a possibly-torn value mean anything at all - and that ThreadSanitizer can
+    // tell an intended optimistic read from a genuine bug.
+    //
+    // Both sides must use them. A relaxed load racing a plain store is still a
+    // data race by the standard, so the writer's stores below are converted too.
+    template <typename word>
+    inline word load_relaxed(const word& w) noexcept {
+        return std::atomic_ref<word>(const_cast<word&>(w)).load(std::memory_order_relaxed);
+    }
+    template <typename word>
+    inline void store_relaxed(word& w, word v) noexcept {
+        std::atomic_ref<word>(w).store(v, std::memory_order_relaxed);
+    }
+
     struct field_slot {
         uint64_t base;          // 8 - log offset of the CREATE's payload; 0 = no record
 
@@ -111,10 +134,10 @@ namespace storage {
         uint32_t chain;         // 4
 
         static constexpr uint32_t head_bits = 0x00FFFFFFu;
-        uint32_t head() const noexcept { return chain & head_bits; }
-        uint32_t depth() const noexcept { return chain >> 24; }
-        void set_head(uint32_t h) noexcept { chain = (chain & ~head_bits) | (h & head_bits); }
-        void set_depth(uint32_t d) noexcept { chain = (chain & head_bits) | (d << 24); }
+        uint32_t head() const noexcept { return load_relaxed(chain) & head_bits; }
+        uint32_t depth() const noexcept { return load_relaxed(chain) >> 24; }
+        void set_head(uint32_t h) noexcept { store_relaxed(chain, (load_relaxed(chain) & ~head_bits) | (h & head_bits)); }
+        void set_depth(uint32_t d) noexcept { store_relaxed(chain, (load_relaxed(chain) & head_bits) | (d << 24)); }
         // Saturating, so a record that somehow outruns max_depth records 255
         // rather than wrapping to 0 and never collapsing again.
         void bump_depth() noexcept { if (depth() < 255) set_depth(depth() + 1); }
@@ -431,7 +454,7 @@ namespace storage {
             std::byte* logged = append<record_op::create>(id, 0, tag, std::span<const std::byte>{ scratch, len });
             if (!logged) return;   // the log is full; the chain stays, which is correct, only slower
             free_chain(id);
-            slots[id].base = (std::size_t)(logged - base);
+            store_relaxed(slots[id].base, (uint64_t)(logged - base));
             ++collapses;
         }
 
@@ -491,8 +514,78 @@ namespace storage {
         void sync() noexcept {
             if (write_offset <= last_synced) return;
             const std::size_t start = last_synced & ~(page_size - 1);
+            open_read_window();
             ::msync(base + start, write_offset - start, MS_SYNC);
+            close_read_window();
             last_synced = write_offset;
+        }
+
+        // ---- the sync window ---------------------------------------------
+        //
+        // A durable commit is time in which the writer holds the CPU and mutates
+        // NOTHING: it is stopped inside msync waiting on the device. Measured on
+        // the VPS matrix, that is 0.61 s of iowait out of 1.35 s wall for
+        // 204800 inserts across 5451 barriers - 45% of the run in which the
+        // index is provably still.
+        //
+        // Readers can have that time. Not by locking, which would put a
+        // contended atomic on the append path where there is none today, but by
+        // publishing a GENERATION that is odd exactly while a commit is in
+        // flight. A reader that sees the same odd value before and after its
+        // gather knows the whole gather happened inside one still window.
+        //
+        // The writer never waits for a reader. That is the point, and it is the
+        // difference from the obvious design: a gate the writer has to drain
+        // hands a reader that takes a 275 us major fault the power to stall the
+        // commit path. Here a reader that overruns simply loses its read and
+        // says so - try_get returns false and the caller retries or defers.
+        //
+        // WHERE THIS PAYS, precisely: readers that are CPU-bound while the
+        // writer is device-bound. In RAM that is the whole workload, and threads
+        // measured 231147 -> 560802 ops/sec at 4 of them. Out of RAM readers
+        // want the same device the commit is waiting on and there is nothing to
+        // win; see the prefetch note in FIELD_STORAGE.md.
+        bool read_window_open() const noexcept { return (gate_generation.load(std::memory_order_acquire) & 1) != 0; }
+        std::size_t read_window_count() const noexcept { return gate_generation.load(std::memory_order_relaxed) / 2; }
+
+        // The reader's entry point, and the only const method on this class that
+        // is safe to call from another thread while this one is writing.
+        //
+        // Returns false - having written nothing to `out` it promises - when the
+        // window was shut, shut mid-gather, or the record does not survive the
+        // bounds checks the optimistic path applies. False is not an error and
+        // carries no information about the record; it means "not now".
+        template <tagged_aggregate T>
+        [[nodiscard]] bool try_get(record_id id, T& out) const noexcept {
+            return try_read_raw(id, std::span<std::byte>{ (std::byte*)&out, sizeof(T) }) == sizeof(T);
+        }
+
+        // Returns the number of bytes assembled, or 0.
+        [[nodiscard]] uint32_t try_read_raw(record_id id, std::span<std::byte> out) const noexcept {
+            for (int attempt = 0; attempt < window_read_attempts; ++attempt) {
+                const uint64_t before = gate_generation.load(std::memory_order_acquire);
+                if ((before & 1) == 0) return 0;                    // no commit in flight
+
+                // Snapshots taken while the window was shut, published by the
+                // release on gate_generation above. The writer's own
+                // write_offset and slot_count are plain members it stores to on
+                // every append; reading them from here would be a data race in
+                // the language whatever the hardware does.
+                const std::size_t extent = gate_extent.load(std::memory_order_relaxed);
+                const uint64_t slot_limit = gate_slots.load(std::memory_order_relaxed);
+
+                if (id == 0 || id >= slot_limit) return 0;
+                const uint16_t len = load_relaxed(slots[id].len);
+                if (len == 0 || len > out.size()) return 0;
+                if (!assemble<true>(id, out.data(), len, extent)) return 0;
+
+                // The gather is done. If the generation is still the odd value
+                // it started at, the writer was inside the same msync the whole
+                // time and touched neither slot nor node.
+                std::atomic_thread_fence(std::memory_order_acquire);
+                if (gate_generation.load(std::memory_order_relaxed) == before) return len;
+            }
+            return 0;
         }
 
         // Tells the kernel we are done with the log below `upto`: first drop
@@ -668,7 +761,11 @@ namespace storage {
         bool checkpoint() noexcept requires (spec::fast_restart) {
             sync();
             head->write_offset = write_offset;
+            // The index flush is the LONGER of the two windows - it is the whole
+            // arena, not the log's tail - and the writer is just as idle in it.
+            open_read_window();
             ::msync(head, spec::index_bytes, MS_SYNC);
+            close_read_window();
 
             checkpoint_record rec{};
             rec.magic = checkpoint_magic;
@@ -881,9 +978,9 @@ namespace storage {
             if (s.base) head->live_byte_count -= s.len;
             obs.on_record(*this, hdr, data);
             free_chain(hdr.id);
-            s.base = (std::size_t)(data - base);
-            s.len = (uint16_t)hdr.len;
+            store_relaxed(s.len, (uint16_t)hdr.len);
             s.tag = hdr.tag;
+            store_relaxed(s.base, (uint64_t)(data - base));   // published last: base != 0 is what alive() tests
             head->live_byte_count += hdr.len;
         }
 
@@ -906,7 +1003,7 @@ namespace storage {
             obs.on_record(*this, hdr, nullptr);
             head->live_byte_count -= record_len(hdr.id);
             free_chain(hdr.id);
-            slots[hdr.id].base = 0;
+            store_relaxed(slots[hdr.id].base, (uint64_t)0);
         }
 
         static record_header* header_of(std::byte* data) noexcept { return (record_header*)(data - sizeof(record_header)); }
@@ -919,14 +1016,84 @@ namespace storage {
         // The gather. Base record first, then every overridden field on top -
         // newest chain node first, and since an update to an already-overridden
         // field replaces its node, every node here is the current value.
-        void assemble(record_id id, std::byte* out, uint32_t len) const noexcept {
+        //
+        // `guarded` is the optimistic-read variant and it exists because a slot
+        // read concurrently with set_override can be TORN - head and depth share
+        // one 32-bit word, and a chain rewritten under a reader can hand it a
+        // node index that was never valid. Unguarded, `nodes[n]` with a stray n
+        // is a read off the end of the index arena, and a stray `next` is a
+        // cycle. Neither is theoretical: it is exactly the race ThreadSanitizer
+        // pointed at on field_slot::head().
+        //
+        // The checks cost one compare per chain node on a path whose body is a
+        // memcpy, so they are free where they are needed. `if constexpr` keeps
+        // them out of the exclusive path entirely rather than trusting the
+        // branch predictor with them.
+        // Every index word the optimistic path reads goes through this, and it
+        // is not decoration. A plain read of a word a writer may be changing is
+        // a data race, which C++ calls undefined and ThreadSanitizer calls a
+        // race - but the concrete hazard is worse than either label. The
+        // compiler is entitled to RELOAD a non-atomic value between the bounds
+        // check and its use, so
+        //
+        //     if (o.log_offset + o.len > extent) return false;
+        //     memcpy(dst, base + o.log_offset, o.len);
+        //
+        // may check one value and copy with another, and the check that exists
+        // to keep the reader inside the mapping stops meaning anything. A
+        // relaxed atomic load is one load that cannot be split or repeated. On
+        // x86-64 it emits the same instruction as the plain read.
+        template <bool guarded = false>
+        bool assemble(record_id id, std::byte* out, uint32_t len,
+                      std::size_t extent = 0) const noexcept {
             const field_slot& s = slots[id];
-            std::memcpy(out, base + s.base, len);
-            for (uint32_t n = s.head(); n != no_override; n = nodes[n].next) {
-                const override_node& o = nodes[n];
-                if ((std::size_t)o.field_offset + o.len <= len)
-                    std::memcpy(out + o.field_offset, base + o.log_offset, o.len);
+            if constexpr (guarded) {
+                const uint64_t at = load_relaxed(s.base);
+                if (at == 0 || at + len > extent) return false;
+                std::memcpy(out, base + at, len);
+            } else {
+                std::memcpy(out, base + s.base, len);
             }
+            uint32_t steps = 0;
+            uint32_t n = guarded ? (load_relaxed(s.chain) & field_slot::head_bits) : s.head();
+            for (; n != no_override; ) {
+                if constexpr (guarded) {
+                    // The index bound stops the out-of-arena read; the step
+                    // bound stops a torn `next` that closed a loop. A real chain
+                    // never exceeds max_depth, which is 8 bits wide.
+                    if (n >= spec::max_overrides || ++steps > 256) return false;
+                    const override_node& o = nodes[n];
+                    const uint64_t at = load_relaxed(o.log_offset);
+                    const uint32_t off = load_relaxed(o.field_offset), plen = load_relaxed(o.len);
+                    if (at + plen > extent) return false;
+                    if ((std::size_t)off + plen <= len)
+                        std::memcpy(out + off, base + at, plen);
+                    n = load_relaxed(o.next);
+                } else {
+                    const override_node& o = nodes[n];
+                    if ((std::size_t)o.field_offset + o.len <= len)
+                        std::memcpy(out + o.field_offset, base + o.log_offset, o.len);
+                    n = o.next;
+                }
+            }
+            return true;
+        }
+
+        // Publishing order matters and is the whole correctness argument: the
+        // snapshots are stored first and the generation last, with release, so a
+        // reader that acquires an odd generation is guaranteed to see the extent
+        // and slot count that went with it.
+        void open_read_window() noexcept {
+            gate_extent.store(write_offset, std::memory_order_relaxed);
+            gate_slots.store(head->slot_count, std::memory_order_relaxed);
+            gate_generation.fetch_add(1, std::memory_order_release);
+        }
+
+        // Closing needs release too, so that a reader which is about to compare
+        // generations cannot see the even value while still reading index words
+        // the writer is now free to change.
+        void close_read_window() noexcept {
+            gate_generation.fetch_add(1, std::memory_order_release);
         }
 
         void set_override(record_id id, uint32_t offset, uint32_t len, std::size_t at) noexcept {
@@ -936,13 +1103,20 @@ namespace storage {
             // because the nodes are being touched anyway.
             std::size_t lo = at, hi = at;
             for (uint32_t n = s.head(); n != no_override; n = nodes[n].next) {
-                if (nodes[n].field_offset == offset && nodes[n].len == len) { nodes[n].log_offset = at; return; }
+                if (nodes[n].field_offset == offset && nodes[n].len == len) { store_relaxed(nodes[n].log_offset, (uint64_t)at); return; }
                 lo = nodes[n].log_offset < lo ? nodes[n].log_offset : lo;
                 hi = nodes[n].log_offset > hi ? nodes[n].log_offset : hi;
             }
             const uint32_t n = alloc_node();
             if (n == no_override) return; // out of nodes: the record keeps its previous value rather than a wrong one
-            nodes[n] = { at, offset, len, s.head(), 0 };
+            // The node is filled in BEFORE the slot points at it, so a reader
+            // that follows the new head never sees an uninitialised node.
+            override_node& o = nodes[n];
+            store_relaxed(o.log_offset, (uint64_t)at);
+            store_relaxed(o.field_offset, offset);
+            store_relaxed(o.len, len);
+            store_relaxed(o.next, s.head());
+            o.reserved = 0;
             s.set_head(n);
             s.bump_depth();
             if constexpr (spec::max_span != 0) {
@@ -970,8 +1144,8 @@ namespace storage {
         void free_chain_only(record_id id) noexcept {
             uint32_t n = slots[id].head();
             while (n != no_override) {
-                const uint32_t next = nodes[n].next;
-                nodes[n].next = (uint32_t)head->node_free_head;
+                const uint32_t next = load_relaxed(nodes[n].next);
+                store_relaxed(nodes[n].next, (uint32_t)head->node_free_head);
                 head->node_free_head = n;
                 n = next;
             }
@@ -1071,6 +1245,17 @@ namespace storage {
         bool from_checkpoint = false;
         bool index_pinned = false;
         int fd = -1, index_fd = -1;
+
+        // Odd while a commit is in flight. Even - the steady state - means the
+        // writer owns the index and try_read_raw refuses. Bumped twice per
+        // sync() and never on the append path, so the cost to a writer that
+        // never has a concurrent reader is two uncontended atomic increments per
+        // BARRIER, against an msync measured at 87 us.
+        static constexpr int window_read_attempts = 4;
+        alignas(64) std::atomic<uint64_t> gate_generation{0};
+        std::atomic<std::size_t> gate_extent{0};
+        std::atomic<uint64_t> gate_slots{0};
+        char gate_padding[64 - 3 * sizeof(uint64_t)] = {};
 
         field_index_header* head = nullptr;
         field_slot* slots = nullptr;

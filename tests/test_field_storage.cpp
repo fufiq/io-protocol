@@ -586,3 +586,88 @@ TEST_CASE("running out of override nodes keeps the old value rather than a wrong
     }
     std::remove(tiny::path.value); std::remove(tiny::index_path);
 }
+
+TEST_CASE("readers run inside the sync window while a writer is committing") {
+    // The invariant is chosen so that a TORN read cannot pass it. Every update
+    // burst sets b, c and d to the same value derived from a, and only then
+    // calls sync(). So a record is self-consistent exactly at the moments the
+    // window is open, and a reader that mixed a base from one burst with an
+    // override from the next would come back with mismatched fields.
+    //
+    // That is the whole correctness claim: not "the read did not crash" but
+    // "the read saw one instant".
+    //
+    // Its own spec, with room. Under the shared 4 MB fixture the log filled at
+    // round 16, appends started being refused, and an update burst then landed
+    // PARTIALLY - a=v with b still at the old value. That reports as a torn
+    // read and is nothing of the kind, so the capacity is sized here and
+    // refused_append_count() is asserted below to keep the two apart.
+    using wspec = storage::field_spec<"t_win.log", 1u << 26, "t_win.idx", 4096, 8192, 3, 256>;
+    std::remove(wspec::path.value);
+    std::remove(wspec::index_path);
+    auto held = std::make_unique<storage::field_storage<wspec>>();
+    auto& table = *held;
+    REQUIRE(table.ok());
+
+    constexpr int n = 1500;
+    for (int i = 0; i < n; ++i) table.create(quad{(uint64_t)i, 0, 0, 0});
+    table.sync();
+
+    std::atomic<bool> stop{false};
+    std::atomic<long> torn{0}, served{0}, refused{0};
+
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 4; ++t) {
+        readers.emplace_back([&, t] {
+            uint64_t x = 0x9E3779B97F4A7C15ull * (uint64_t)(t + 1);
+            while (!stop.load(std::memory_order_relaxed)) {
+                x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+                const record_id id = (record_id)(x % n + 1);
+                quad q{};
+                if (!table.try_get(id, q)) { ++refused; continue; }
+                ++served;
+                if (q.b != q.a || q.c != q.a || q.d != q.a) ++torn;
+            }
+        });
+    }
+
+    for (int round = 0; round < 40; ++round) {
+        for (int i = 0; i < n; ++i) {
+            const uint64_t v = (uint64_t)(round * n + i);
+            const record_id id = (record_id)(i + 1);
+            table.update<&quad::a>(id, v);
+            table.update<&quad::b>(id, v);
+            table.update<&quad::c>(id, v);
+            table.update<&quad::d>(id, v);
+        }
+        table.sync();          // the only moment readers are allowed in
+    }
+    stop.store(true);
+    for (auto& t : readers) t.join();
+
+    CHECK(torn.load() == 0);
+    CHECK(table.read_window_count() >= 40);
+    CHECK(table.read_window_open() == false);   // shut again once sync returned
+    // Not asserted: that `served` is large. On a machine where msync returns
+    // immediately - everything already clean, or a tmpfs - the window is too
+    // short to catch and every attempt legitimately refuses. The test is about
+    // what a served read contains, not how many there are.
+    CHECK(served.load() + refused.load() > 0);
+    // If this trips, the log ran out and the "torn" count above is measuring a
+    // refused append, not a race.
+    CHECK(table.refused_append_count() == 0);
+    held.reset();
+    std::remove(wspec::path.value);
+    std::remove(wspec::index_path);
+}
+
+TEST_CASE("a shut window refuses every read") {
+    fixture f;
+    const record_id id = f.table->create(quad{1, 2, 3, 4});
+    f.table->sync();
+    CHECK_FALSE(f.table->read_window_open());
+    quad q{};
+    CHECK_FALSE(f.table->try_get(id, q));   // no commit in flight
+    CHECK(f.table->get<quad>(id).has_value()); // the exclusive path is unaffected
+    wipe();
+}

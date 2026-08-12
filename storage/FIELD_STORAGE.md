@@ -404,6 +404,35 @@ The catch is that it only helps when you read in **batches**: a lone `get(id)`
 still runs at ~1,100/sec out of RAM, because there is nothing to tell the kernel
 in advance when the next id is not yet known.
 
+### The 141x is hardware, not the technique
+
+That table was measured on an NVMe capable of 239,000 IOPS at queue depth 512 -
+a device with enormous depth to sell. Re-run on the VPS (1 vCPU, QEMU virtio
+disk, 1 GB of data on 960 MB of RAM), the same code on the same pair of passes
+within one process:
+
+| 1000 MB, out of RAM | ops/sec | major faults | RSS | iowait |
+|---|---|---|---|---|
+| cold read | 4,064 / 4,084 / 4,240 | ~10,300 | 544 MB | 3.0 s |
+| cold read + prefetch | 7,726 / 7,716 / 7,706 | **~1,180** | **123 MB** | 2.0 s |
+
+**1.9x**, three runs, spread under 5%. The mechanism is intact - major faults
+drop ~9x and resident set drops 4.4x - but the payoff scales with how much
+queue depth the device actually has, and this one has almost none. Expect 1.9x
+on a shared virtual disk and two orders of magnitude on a real NVMe.
+
+And it is a **cost** when the data is resident. The same pair at 200 MB, which
+fits:
+
+| 200 MB, fits | ops/sec |
+|---|---|
+| cold read | **20,928** |
+| cold read + prefetch | 9,006 |
+
+2.3x slower, because advising pages that are already there is syscalls with
+nothing to overlap. Same shape as the local result (3.19M → 1.95M in RAM). Use
+it when you know the working set does not fit; do not leave it on by default.
+
 `for_each_piece` emits the record as **disjoint** pieces in file offsets. Disjoint
 is a correctness requirement, not tidiness: `assemble()` gets away with reading
 the whole base and overwriting fields on top because it runs in order, and a
@@ -658,6 +687,7 @@ operations or 200 µs. One process per cell, page cache dropped between them.
 | CPU / iowait on update | **93.8% / 0.00 s** | 3.7% / 13.52 s | 7.3% / 16.58 s |
 | random read, in RAM | 1,541,045 | **6,550,781** | 827,178 |
 | random read, out of RAM | **5,731** | 4,747 | 3,812 |
+| random read, out of RAM, batched with `prefetch_gather` | **7,726** | - | - |
 | fill | 303,751 | 146,760 | **331,151** |
 | durable fill | 151,741 | 92,037 | **315,116** |
 | on disk per 1 GB of data | **1.05 GB** | 2.1 GB | 1.34 GB |
@@ -669,6 +699,11 @@ ours and a mature B+tree - *stall on the device*. Appending touches no page of
 the record, so there is nothing to wait for.
 
 The read row is the cost, and it is real only while the data fits.
+
+The batched row is not comparable to the two beside it - no other engine here
+exposes a batch read - and it is measured against its own cold pass in the same
+process, not against the row above it. See §11 for the pair and the caveat that
+it is a cost when the data is resident.
 
 ## 15. Out of scope
 

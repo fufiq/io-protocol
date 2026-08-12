@@ -52,6 +52,7 @@
 
 #include "../storage/storage.hpp"
 #include "../storage/field_storage.hpp"
+#include "../storage/prefetch_gather.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -239,6 +240,48 @@ namespace {
         }
         if (do_sync) { t.sync(); ++bc.fired; }
         row("random update", n_ops, m, bc.fired);
+
+        // ---- the cold-read pair -----------------------------------------
+        //
+        // The "random read" row above runs straight after fill, so the tail of
+        // the log is still warm from writing it. That is fine for comparing
+        // engines - every engine gets it - but it is useless for measuring what
+        // prefetch is worth, because prefetch only pays on a page that is not
+        // there yet.
+        //
+        // So both halves of this pair are run the same way: release_log() drops
+        // the mapping and its page-cache pages first, and each half draws its
+        // own picks so the first cannot warm the second. Only the field engine
+        // has the piece decomposition prefetch_gather needs, so only it gets
+        // these two rows.
+        if constexpr (requires { t.release_log(std::size_t{}); t.raw_base(); }) {
+            constexpr std::size_t chunk = 4096;
+            std::vector<storage::record_id> picks(chunk);
+            std::vector<std::byte> buf(chunk * value_bytes);
+
+            auto cold_pass = [&](uint64_t seed, const char* label, bool use_prefetch) {
+                t.sync();                       // clean pages, so they are droppable
+                t.release_log(t.current_offset());
+                xorshift r(seed);
+                storage::prefetch_gather g(64);
+                auto mm = mark();
+                for (std::size_t done = 0; done < n_ops; done += chunk) {
+                    const std::size_t k = std::min(chunk, n_ops - done);
+                    for (std::size_t j = 0; j < k; ++j) picks[j] = ids[r.range(n_records)];
+                    std::span<const storage::record_id> span{ picks.data(), k };
+                    if (use_prefetch) {
+                        g.read_many(t, span, buf.data(), value_bytes);
+                    } else {
+                        for (std::size_t j = 0; j < k; ++j)
+                            (void)t.read_raw(span[j], std::span<std::byte>{ buf.data() + j * value_bytes, value_bytes });
+                    }
+                    sink = (uint64_t)buf[0];
+                }
+                row(label, n_ops, mm);
+            };
+            cold_pass(4242, "cold read", false);
+            cold_pass(9797, "cold read + prefetch", true);
+        }
         (void)sink;
     }
 

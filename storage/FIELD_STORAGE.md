@@ -674,6 +674,8 @@ The read row is the cost, and it is real only while the data fits.
 
 No query language, no planner, no joins. No secondary indexes - those live in
 user code over the observer (`bench/app_layer.hpp` is a worked example with
-unique constraints, foreign keys, triggers and staged transactions). No
-concurrency of any kind. No replication, though the single application point is
-the seam one would attach to.
+unique constraints, foreign keys, triggers and staged transactions).
+
+No MVCC, no snapshots, no concurrent *writers* - one writer owns the index.
+Concurrent readers exist in two narrow forms and no others: freely while no
+writer runs (§12), and inside a commit via the seqlock (§11c).

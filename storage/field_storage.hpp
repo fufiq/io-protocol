@@ -228,6 +228,59 @@ namespace storage {
     };
 
     // =====================================================================
+    // SHARDING - the answer to more than one core.
+    //
+    // One field_storage is one writer, and that is not a ceiling, it is the
+    // unit of scale. Nothing is shared between two instances: every `static`
+    // in this file is a pure function, every scratch buffer is a local, and
+    // all mutable state lives behind the instance's own two mappings. So N
+    // instances in one process are N independent engines, and N threads each
+    // owning one of them need no lock, no atomic and no coordination at all.
+    // This is the shard-per-core arrangement, and it scales the way it does
+    // precisely because there is nothing to contend for.
+    //
+    // The only thing standing in the way was that a spec names its files as
+    // compile-time strings, so sixteen shards would mean writing sixteen specs
+    // by hand. shard_path builds them instead: "data.log" becomes "data.0.log",
+    // "data.1.log" and so on, at compile time, so each shard is still a
+    // distinct type with its paths baked in and nothing is resolved at runtime.
+    //
+    // What sharding does NOT give you is a transaction across two shards. Inside
+    // one shard the commit flag in the layer above is enough (see
+    // bench/app_txn.hpp); across shards it is two-phase commit, which is a
+    // different problem and is not solved here.
+    template <fixed_string base, std::size_t shard>
+    consteval auto make_shard_path() {
+        constexpr std::size_t n = sizeof(base.value);              // includes the NUL
+        constexpr std::size_t digits = shard < 10 ? 1 : shard < 100 ? 2 : 3;
+        static_assert(shard < 1000, "shard_path formats at most three digits");
+
+        // Split at the last '.', so "data.log" shards as "data.0.log" rather
+        // than "data.log.0" - the extension stays where tools expect it.
+        constexpr std::size_t dot = [] {
+            std::size_t at = n - 1;                                // default: append
+            for (std::size_t i = 0; i + 1 < n; ++i) if (base.value[i] == '.') at = i;
+            return at;
+        }();
+
+        std::array<char, n + digits + 1> out{};
+        std::size_t w = 0;
+        for (std::size_t i = 0; i < dot; ++i) out[w++] = base.value[i];
+        out[w++] = '.';
+        for (std::size_t d = digits; d-- > 0;) {
+            std::size_t p = 1;
+            for (std::size_t k = 0; k < d; ++k) p *= 10;
+            out[w++] = (char)('0' + (shard / p) % 10);
+        }
+        for (std::size_t i = dot; i + 1 < n; ++i) out[w++] = base.value[i];
+        out[w] = '\0';
+        return out;
+    }
+
+    template <fixed_string base, std::size_t shard>
+    inline constexpr auto shard_path = fixed_string(make_shard_path<base, shard>());
+
+    // =====================================================================
     template <typename spec, typename observer = null_observer>
     class field_storage {
     public:

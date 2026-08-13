@@ -70,6 +70,10 @@
 #ifdef HAVE_LMDB
 #include <lmdb.h>
 #endif
+#ifdef HAVE_OBJECTBOX
+#include <objectbox.h>
+#include <flatbuffers/flatbuffers.h>
+#endif
 
 namespace {
 
@@ -80,11 +84,12 @@ namespace {
     bool do_sync = false;
     std::chrono::microseconds barrier_us{1000};
     std::size_t barrier_ops = 1000;
-    // LMDB's durability unit is the transaction - there is no way to make half
-    // a transaction durable. So in the sync column its barrier IS its commit,
-    // and this is how many operations one transaction holds. It is the knob
-    // that sets LMDB's crash window, the way barrier_ops/barrier_us sets ours.
-    std::size_t lmdb_commit_ops = 10'000;
+    // For LMDB and ObjectBox the durability unit is the transaction - there is
+    // no way to make half a transaction durable. So in the sync column their
+    // barrier IS their commit, and this is how many operations one transaction
+    // holds. It is the knob that sets their crash window, the way
+    // barrier_ops/barrier_us sets ours.
+    std::size_t commit_ops = 10'000;
 
     // One barrier per barrier_us at most. The clock is read on every operation
     // - clock_gettime is a vDSO call of a few tens of nanoseconds, so at 200000
@@ -453,7 +458,7 @@ namespace {
             uint64_t k = be_key(i + 1);
             MDB_val mk{ sizeof(k), &k }, mv{ sizeof(b), &b };
             lmdb_check(mdb_put(txn, dbi, &mk, &mv, MDB_APPEND), "put");
-            if ((i + 1) % lmdb_commit_ops == 0) {
+            if ((i + 1) % commit_ops == 0) {
                 lmdb_check(mdb_txn_commit(txn), "commit");   // durable here iff flags == 0
                 lmdb_check(mdb_txn_begin(env, nullptr, 0, &txn), "txn_begin");
                 ++bc.fired;
@@ -488,7 +493,7 @@ namespace {
                 MDB_val nv{ sizeof(cur), &cur };
                 lmdb_check(mdb_put(txn, dbi, &mk, &nv, 0), "put_upd");
             }
-            if ((i + 1) % lmdb_commit_ops == 0) {
+            if ((i + 1) % commit_ops == 0) {
                 lmdb_check(mdb_txn_commit(txn), "commit");
                 lmdb_check(mdb_txn_begin(env, nullptr, 0, &txn), "txn_begin");
                 ++bc.fired;
@@ -510,6 +515,158 @@ namespace {
     }
 #endif
 
+    // ------------------------------------------------------------ objectbox
+#ifdef HAVE_OBJECTBOX
+
+    // ObjectBox stores whole objects as FlatBuffers, so there is no such thing
+    // as a partial write here: an update to one field is a read, a rebuild and
+    // a put of the entire object. That is not a handicap imposed by this
+    // benchmark, it is what the storage format is - and it is exactly the axis
+    // the field engine was built to attack, so it has to be measured as it is.
+    //
+    // Objects are built with the official FlatBufferBuilder rather than by
+    // hand: property id N maps to FlatBuffers slot N-1, and getting that wrong
+    // would store bytes ObjectBox cannot read. Verified separately by writing
+    // objects and reading them back through ObjectBox's own reader.
+
+    constexpr obx_schema_id obx_entity = 1;
+    constexpr std::size_t obx_payload_bytes = value_bytes - 16;   // + id + counter
+
+    void obx_check(bool ok, const char* what) {
+        if (!ok) { std::printf("objectbox: %s: %s\n", what, obx_last_error_message()); std::exit(1); }
+    }
+
+    std::pair<const uint8_t*, std::size_t>
+    obx_build(flatbuffers::FlatBufferBuilder& fbb, uint64_t id, uint64_t counter,
+              const uint8_t* payload, std::size_t len) {
+        fbb.Clear();
+        const auto vec = fbb.CreateVector(payload, len);
+        const auto start = fbb.StartTable();
+        fbb.AddElement<uint64_t>(4, id, 0);
+        fbb.AddElement<uint64_t>(6, counter, 0);
+        fbb.AddOffset(8, vec);
+        fbb.Finish(flatbuffers::Offset<void>(fbb.EndTable(start)));
+        return { fbb.GetBufferPointer(), fbb.GetSize() };
+    }
+
+    void run_objectbox() {
+        ::system("rm -rf vm_obx && mkdir -p vm_obx");
+
+        OBX_model* model = obx_model();
+        obx_check(model != nullptr, "model");
+        obx_model_entity(model, "Blob", obx_entity, 1001);
+        obx_model_property(model, "id", OBXPropertyType_Long, 1, 2001);
+        obx_model_property_flags(model, OBXPropertyFlags_ID);
+        obx_model_property(model, "counter", OBXPropertyType_Long, 2, 2002);
+        obx_model_property(model, "payload", OBXPropertyType_ByteVector, 3, 2003);
+        obx_model_entity_last_property_id(model, 3, 2003);
+        obx_model_last_entity_id(model, obx_entity, 1001);
+        obx_check(obx_model_error_code(model) == 0, "model build");
+
+        OBX_store_options* opt = obx_opt();
+        obx_opt_directory(opt, "vm_obx");
+        // Same headroom argument as LMDB's map: a store needs more room than
+        // the bytes it holds, and this is a cap rather than an allocation.
+        obx_opt_max_db_size_in_kb(opt, 4ull * 1024 * 1024);
+        // THERE IS NO RAW COLUMN FOR OBJECTBOX, and that is a property of the
+        // engine rather than a gap in this benchmark. OBXWalFlags_NoSyncFile
+        // ("does not wait for the disk to acknowledge; faster but not ACID
+        // compliant") is the obvious analogue of MDB_NOSYNC, but asking for it
+        // fails to open: "WAL is not yet supported by disk based DB provider"
+        // as of 5.3.2. Every commit syncs, with no way to opt out.
+        //
+        // So ObjectBox is always measured durable, and the only thing that
+        // moves is commit_ops - the transaction size, which IS its crash
+        // window. That is the axis §8a compares on anyway, so the comparison is
+        // the honest one; it just means its "no durability" cell is really
+        // "the fewest syncs the API permits", one transaction for the phase.
+        obx_check(obx_opt_model(opt, model) == 0, "opt_model");
+
+        OBX_store* store = obx_store_open(opt);
+        obx_check(store != nullptr, "store_open");
+
+        std::vector<uint8_t> payload(obx_payload_bytes, 0xAB);
+        flatbuffers::FlatBufferBuilder fbb(value_bytes + 128);
+
+        barrier_clock bc;
+        auto m = mark();
+        {
+            OBX_txn* txn = obx_txn_write(store);
+            OBX_cursor* cur = obx_cursor(txn, obx_entity);
+            for (std::size_t i = 0; i < n_records; ++i) {
+                auto [bytes, size] = obx_build(fbb, i + 1, i, payload.data(), payload.size());
+                obx_check(obx_cursor_put(cur, i + 1, bytes, size) == 0, "put");
+                if ((i + 1) % commit_ops == 0) {
+                    obx_cursor_close(cur);
+                    obx_check(obx_txn_success(txn) == 0, "commit");
+                    ++bc.fired;
+                    txn = obx_txn_write(store);
+                    cur = obx_cursor(txn, obx_entity);
+                }
+            }
+            obx_cursor_close(cur);
+            obx_check(obx_txn_success(txn) == 0, "commit");
+            ++bc.fired;
+        }
+        row("fill", n_records, m, bc.fired);
+
+        xorshift rng(9);
+        volatile uint64_t sink = 0;
+        {
+            OBX_txn* txn = obx_txn_read(store);
+            OBX_cursor* cur = obx_cursor(txn, obx_entity);
+            m = mark();
+            for (std::size_t i = 0; i < n_ops; ++i) {
+                const void* data = nullptr;
+                std::size_t size = 0;
+                if (obx_cursor_get(cur, rng.range(n_records) + 1, &data, &size) == 0)
+                    sink = flatbuffers::GetRoot<flatbuffers::Table>(data)->GetField<uint64_t>(6, 0);
+            }
+            row("random read", n_ops, m);
+            obx_cursor_close(cur);
+            obx_txn_close(txn);
+        }
+
+        bc = barrier_clock{};
+        {
+            std::vector<uint8_t> keep(obx_payload_bytes);
+            OBX_txn* txn = obx_txn_write(store);
+            OBX_cursor* cur = obx_cursor(txn, obx_entity);
+            m = mark();
+            for (std::size_t i = 0; i < n_ops; ++i) {
+                const obx_id id = rng.range(n_records) + 1;
+                const void* data = nullptr;
+                std::size_t size = 0;
+                if (obx_cursor_get(cur, id, &data, &size) == 0) {
+                    // Read, modify, write the WHOLE object. The payload has to
+                    // be carried across because a put replaces everything.
+                    const auto* root = flatbuffers::GetRoot<flatbuffers::Table>(data);
+                    const auto* vec = root->GetPointer<const flatbuffers::Vector<uint8_t>*>(8);
+                    std::memcpy(keep.data(), vec->data(), keep.size());
+                    auto [bytes, nsize] = obx_build(fbb, id, i, keep.data(), keep.size());
+                    obx_check(obx_cursor_put(cur, id, bytes, nsize) == 0, "put_upd");
+                }
+                if ((i + 1) % commit_ops == 0) {
+                    obx_cursor_close(cur);
+                    obx_check(obx_txn_success(txn) == 0, "commit");
+                    ++bc.fired;
+                    txn = obx_txn_write(store);
+                    cur = obx_cursor(txn, obx_entity);
+                }
+            }
+            obx_cursor_close(cur);
+            obx_check(obx_txn_success(txn) == 0, "commit");
+            ++bc.fired;
+            row("random update", n_ops, m, bc.fired);
+        }
+        (void)sink;
+
+        obx_store_close(store);
+        ::system("du -sm vm_obx | sed 's/^/         objectbox on disk: /;s/\tvm_obx/ MB/'");
+        ::system("rm -rf vm_obx");
+    }
+#endif
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -519,7 +676,7 @@ int main(int argc, char** argv) {
     n_ops = argc > 4 ? (std::size_t)std::strtoull(argv[4], nullptr, 10) : 10'000;
     barrier_us = std::chrono::microseconds(argc > 5 ? std::strtoull(argv[5], nullptr, 10) : 1000);
     barrier_ops = argc > 6 ? (std::size_t)std::strtoull(argv[6], nullptr, 10) : 1000;
-    lmdb_commit_ops = argc > 7 ? (std::size_t)std::strtoull(argv[7], nullptr, 10) : 10'000;
+    commit_ops = argc > 7 ? (std::size_t)std::strtoull(argv[7], nullptr, 10) : 10'000;
     n_records = (std::size_t)(mb * 1048576.0 / value_bytes);
     if (n_records >= max_ids) { std::printf("too many records for max_ids\n"); return 1; }
 
@@ -541,6 +698,10 @@ int main(int argc, char** argv) {
 #ifdef HAVE_LMDB
     } else if (engine == "lmdb") {
         run_lmdb();
+#endif
+#ifdef HAVE_OBJECTBOX
+    } else if (engine == "objectbox") {
+        run_objectbox();
 #endif
 #ifdef HAVE_POSTGRES
     } else if (engine == "pg") {

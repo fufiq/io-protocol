@@ -1,0 +1,16 @@
+{
+  "records": [
+    {
+      "name": "device",
+      "tag": 1,
+      "fields": [
+        { "name": "serial",       "type": "u64" },
+        { "name": "last_seen_ms", "type": "u64" },
+        { "name": "credit",       "type": "i64" },
+        { "name": "firmware",     "type": "u32" },
+        { "name": "status",       "type": "u8"  },
+        { "name": "name",         "type": "char", "count": 40 }
+      ]
+    }
+  ]
+}

@@ -292,7 +292,7 @@ namespace storage::platform {
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
-#if defined(__x86_64__) || defined(__i386__)
+#if defined(__x86_64__)
 #include <nmmintrin.h>   // _mm_crc32_u8/_mm_crc32_u64 - hardware CRC32C (SSE4.2)
 #elif defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
 #include <arm_acle.h>    // __crc32cb/__crc32cd - the same function, ARM's spelling
@@ -386,7 +386,12 @@ namespace storage {
         return crc;
     }
 
-#if defined(__x86_64__) || defined(__i386__)
+    // __x86_64__ and not also __i386__: _mm_crc32_u64 does not exist on 32-bit
+    // x86, only _mm_crc32_u32 does. The wider guard compiled here and failed on
+    // an Android i686 build, which is an ABI gradle still emits by default.
+    // 32-bit x86 falls through to the software path, which is correct and only
+    // slower, and is a dead ABI besides.
+#if defined(__x86_64__)
     __attribute__((target("sse4.2")))
     inline uint32_t crc32c(const void* data, std::size_t len, uint32_t seed = 0xFFFFFFFFu) noexcept {
         const uint8_t* p = (const uint8_t*)data;

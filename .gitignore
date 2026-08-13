@@ -16,3 +16,10 @@ chats/
 *.log
 *.idx
 *.ckp
+
+# examples/expo-android is checked in as source only: the generated project,
+# node_modules and the copied engine header are produced by its setup.sh.
+examples/expo-android/node_modules/
+examples/expo-android/android/
+examples/expo-android/ios/
+examples/expo-android/modules/fieldstore/android/src/main/cpp/field_storage.hpp

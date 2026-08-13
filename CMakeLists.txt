@@ -122,11 +122,21 @@ add_custom_target(amalgamate
 add_executable(amalgam_smoke tools/amalgam_smoke.cpp)
 target_include_directories(amalgam_smoke PRIVATE ${CMAKE_SOURCE_DIR}/dist)
 
+# The same smoke test with std::atomic_ref forced off, so the compiler-builtin
+# fallback is executed here rather than only on the platform that needs it.
+# libc++ grew atomic_ref in LLVM 19 and the Android NDK ships 18 as of r27, so
+# that path is what Android actually runs - and a path that only ever runs on a
+# phone is one nobody has watched work.
+add_executable(amalgam_smoke_builtins tools/amalgam_smoke.cpp)
+target_include_directories(amalgam_smoke_builtins PRIVATE ${CMAKE_SOURCE_DIR}/dist)
+target_compile_definitions(amalgam_smoke_builtins PRIVATE STORAGE_FORCE_ATOMIC_BUILTINS)
+
 enable_testing()
 add_test(NAME unit_tests COMMAND unit_tests)
 add_test(NAME replication_tests COMMAND replication_tests)
 add_test(NAME amalgam_current COMMAND ${CMAKE_SOURCE_DIR}/tools/amalgamate.py --check)
 add_test(NAME amalgam_smoke COMMAND amalgam_smoke)
+add_test(NAME amalgam_smoke_builtins COMMAND amalgam_smoke_builtins)
 
 # runtime/fiber.hpp switches stacks with ucontext, which ASan cannot follow: its
 # stack-use-after-return "fake stack" gets confused when a real stack pointer

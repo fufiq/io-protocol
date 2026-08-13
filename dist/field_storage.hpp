@@ -2090,6 +2090,22 @@ namespace storage {
     //
     // Both sides must use them. A relaxed load racing a plain store is still a
     // data race by the standard, so the writer's stores below are converted too.
+    //
+    // std::atomic_ref is the spelling; the compiler builtins are the fallback,
+    // and the fallback is not hypothetical - libc++ only grew atomic_ref in
+    // LLVM 19, and the Android NDK ships 18 as of r27, so the engine did not
+    // compile for Android at all until this existed. The two are the same
+    // instructions: atomic_ref lowers to exactly these builtins for a
+    // lock-free type, and ThreadSanitizer instruments __atomic_* the same way,
+    // so nothing above is weakened by taking the second path.
+    //
+    // STORAGE_FORCE_ATOMIC_BUILTINS exists so the fallback is a TESTED path and
+    // not merely a compiled one. Without it the branch is dead code on any
+    // machine whose library has atomic_ref - which is every machine this is
+    // developed on - and dead code that only runs on a phone is how a release
+    // ships something nobody ever executed. ctest builds and runs the smoke
+    // test both ways.
+#if defined(__cpp_lib_atomic_ref) && !defined(STORAGE_FORCE_ATOMIC_BUILTINS)
     template <typename word>
     inline word load_relaxed(const word& w) noexcept {
         return std::atomic_ref<word>(const_cast<word&>(w)).load(std::memory_order_relaxed);
@@ -2098,6 +2114,16 @@ namespace storage {
     inline void store_relaxed(word& w, word v) noexcept {
         std::atomic_ref<word>(w).store(v, std::memory_order_relaxed);
     }
+#else
+    template <typename word>
+    inline word load_relaxed(const word& w) noexcept {
+        return __atomic_load_n(&w, __ATOMIC_RELAXED);
+    }
+    template <typename word>
+    inline void store_relaxed(word& w, word v) noexcept {
+        __atomic_store_n(&w, v, __ATOMIC_RELAXED);
+    }
+#endif
 
     struct field_slot {
         uint64_t base;          // 8 - log offset of the CREATE's payload; 0 = no record

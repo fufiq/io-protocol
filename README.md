@@ -7,7 +7,7 @@ the seam - it is the only component that touches both.
 
 | | what it is | depends on | platforms |
 |---|---|---|---|
-| `storage/` | the field-granular engine | nothing but libstdc++ and POSIX | Linux, macOS/iOS, Android |
+| `storage/` | the field-granular engine | nothing but libstdc++ and POSIX | Linux, Android; macOS/iOS unverified |
 | `embedded/` | the four system calls that differ per platform | as above | as above |
 | `replication/` | WAL shipping and snapshot bootstrap | `net/` | Linux |
 | `net/` | the UDP transport, levels 1-7 | `liburing`, `libsodium` | Linux |
@@ -255,11 +255,12 @@ cmake --build build-asan -j$(nproc)
 ctest --test-dir build-asan --output-on-failure
 ```
 
-`ctest` runs four cases: `unit_tests` (**197 doctest cases, 12,906
+`ctest` runs five cases: `unit_tests` (**197 doctest cases, 12,906
 assertions**), `replication_tests` (**71 checks**, every applier scenario
 against both engines, over real loopback endpoint pairs for the networked
-half), `amalgam_current` (the single-header build is not stale) and
-`amalgam_smoke` (it compiles and works on its own).
+half), `amalgam_current` (the single-header build is not stale), `amalgam_smoke`
+(it compiles and works on its own) and `amalgam_smoke_builtins` (the same,
+with `std::atomic_ref` forced off, which is the path Android takes).
 
 Seven libFuzzer targets live in `tests/fuzz/` behind `-DENABLE_FUZZERS=ON`
 (needs clang), covering the Noise handshake, packet assembly, SACK decoding,
@@ -282,14 +283,30 @@ depends on - that space is genuinely reserved rather than sparse, that
 preallocating twice is idempotent, that a page-aligned subrange flushes -
 rather than that the calls returned zero.
 
-**The Darwin paths are unverified.** They were written against Apple's
-documented behaviour and reviewed, never compiled and never run, because the
-machine this was developed on has no Darwin toolchain. Review already caught
-one bug a compiler would not have, which is a fair warning about the rest; see
-[`embedded/README.md`](embedded/README.md). The ARM64 paths, by contrast, *are*
-verified - the CRC32C implementation compiles to the right instructions under a
-cross-targeted clang, and falls back to software when the CRC extension is
-absent.
+### What is verified where
+
+| | compiles | tests run |
+|---|---|---|
+| Linux x86-64 | yes | yes - `ctest`, Release and ASan/UBSan |
+| Android arm64 | **yes**, NDK r27 clang, API 24 | no - no device or emulator here |
+| macOS / iOS | **no** - no Darwin toolchain here | no |
+
+Android is a real build, not an argument: the amalgamated header compiles clean
+for `aarch64-linux-android24`, and both CRC paths are exercised - the default
+`armv8-a` target selects the software fallback, `-march=armv8-a+crc` emits 74
+`crc32c` instructions. Two things had to be fixed to get there, and neither
+would have been found by reasoning: `crc32c` was x86-only, and `std::atomic_ref`
+does not exist in the NDK's libc++ (LLVM 19 added it; r27 ships 18), so the
+engine now falls back to the compiler's `__atomic_*` builtins - a path `ctest`
+runs here via `STORAGE_FORCE_ATOMIC_BUILTINS`, because a branch that only
+executes on a phone is one nobody has watched work.
+
+**The Darwin paths are unverified**, and that is the honest gap in this release.
+They were written against Apple's documented behaviour and reviewed, never
+compiled and never run. Review already caught one bug a compiler would not have,
+which is a fair warning about the rest; see
+[`embedded/README.md`](embedded/README.md). Run `platform_check` first on a Mac
+and expect to fix something.
 
 # What is not here
 

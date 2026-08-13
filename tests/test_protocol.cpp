@@ -59,22 +59,22 @@ struct peer {
     // members initialize in declaration order, not list order.
     crypto::key_pair local_keys;
     crypto::public_key static_pub;
-    protocol_endpoint<keepalive_interval_ms, liveness_timeout_ms, handshake_timeout_ms> endpoint;
+    uring_io io;
+    protocol_endpoint<uring_io, keepalive_interval_ms, liveness_timeout_ms, handshake_timeout_ms> endpoint;
     std::vector<event> events;
 
     explicit peer(endpoint_config config = {})
         : fd(make_bound_udp_socket(&port)), ring(2048), local_keys(crypto::x25519_generate()),
-          static_pub(local_keys.pub), endpoint(ring, fd, std::move(local_keys), config) {
+          static_pub(local_keys.pub), io(ring, fd, config.send_pool_size, config.recv_num_bufs, config.recv_buf_size),
+          endpoint(io, std::move(local_keys), config) {
         endpoint.arm();
     }
 
-    // Non-blocking: submits whatever's pending, drains only completions
-    // already available (submit_and_wait(0) never blocks), then pop_all's
-    // whatever landed in the incoming queue this round - not a callback,
-    // just a batch of Events the test can inspect directly.
+    // Non-blocking: a zero timeout drains only what has already arrived, then
+    // pop_all's whatever landed in the incoming queue this round - not a
+    // callback, just a batch of Events the test can inspect directly.
     void step() {
-        ring.submit_and_wait(0);
-        ring.drain_cqes([&](io_uring_cqe* cqe) { endpoint.handle_cqe(cqe); });
+        endpoint.poll_io(std::chrono::milliseconds{0});
         for (auto& ev : endpoint.poll_incoming()) events.push_back(std::move(ev));
         endpoint.tick(std::chrono::steady_clock::now());
     }

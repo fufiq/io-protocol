@@ -44,7 +44,7 @@
 // never reach the application as a message_received event, so handle_cqe's
 // case 6 routes it to handle_keepalive(), not handle_data().
 //
-// Single-threaded, one protocol_endpoint per io_uring ring/UDP socket - exactly the
+// Single-threaded, one protocol_endpoint per UDP socket - exactly the
 // model every level was benchmarked under. Horizontal scaling (level 1's
 // research note on SO_REUSEPORT + shared-nothing workers) means running N
 // independent Endpoints, each owning its own ring/socket/static identity's
@@ -66,7 +66,8 @@
 #include "noise_ik.hpp"
 #include "reliability.hpp"
 #include "transport_connection.hpp"
-#include "uring_ring.hpp"
+#include "io_backend.hpp"
+#include "uring_io.hpp"
 
 #include <algorithm>
 #include <array>
@@ -80,7 +81,6 @@
 
 namespace protocol {
 
-constexpr size_t hdr_len = 1 + 8; // type + conn_id
 
 // 96 entries * 14B + 1B count + 9B header = 1354B, comfortably under the MTU - see the same
 // constant's reasoning in level6_reliability_server.cpp, which this supersedes.
@@ -164,7 +164,12 @@ struct event {
 // chrono::duration isn't a structural type (its representation member
 // isn't guaranteed public), so it can't be used as a non-type template
 // parameter itself.
-template <size_t keepalive_interval_ms = 20000, size_t liveness_timeout_ms = 60000, size_t handshake_timeout_ms = 5000>
+// `io` is the network and nothing else - see io_backend.hpp for the three calls
+// that make one. It is a template parameter rather than a base class because
+// the alternative is a virtual dispatch on the per-packet path, and because the
+// protocol genuinely does not care: it needs bytes in and bytes out.
+template <typename io_backend = uring_io,
+          size_t keepalive_interval_ms = 20000, size_t liveness_timeout_ms = 60000, size_t handshake_timeout_ms = 5000>
     requires (keepalive_interval_ms > 0 && liveness_timeout_ms > keepalive_interval_ms && handshake_timeout_ms > 0)
 class protocol_endpoint {
 public:
@@ -187,14 +192,20 @@ public:
     // timescales.
     static constexpr std::chrono::milliseconds handshake_timeout{handshake_timeout_ms};
 
-    protocol_endpoint(uring_ring& ring, int fd, crypto::key_pair local_static, endpoint_config config = {})
-        : ring(ring), fd(fd), local_static(std::move(local_static)), config(config), receiver(ring, fd, multishot_recv_tag, config.recv_num_bufs, config.recv_buf_size),
-          cookie_state(), load_state(config.load_threshold_per_sec), send_pool(config.send_pool_size), send_tag_base(1ull << 40) {
-        for (uint32_t i = 0; i < send_pool.size(); ++i) free_send_bufs.push_back(i);
-    }
+    protocol_endpoint(io_backend& io, crypto::key_pair local_static, endpoint_config config = {})
+        : io(io), local_static(std::move(local_static)), config(config),
+          cookie_state(), load_state(config.load_threshold_per_sec) {}
 
-    // Call once at startup, mirroring multishot_udp_receiver::arm().
-    void arm() { receiver.arm(); }
+    // Call once at startup.
+    void arm() { io.arm(); }
+
+    // Wait up to `timeout` for traffic and process everything that arrives.
+    // Replaced handle_cqe(cqe): a completion queue is an io_uring concept and
+    // every caller was writing the same submit-then-drain dance around it.
+    // Results land in the queue poll_incoming() drains.
+    void poll_io(std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) {
+        io.poll(timeout, [this](const datagram& d) { on_datagram(d); });
+    }
 
     // Initiator role: begin a handshake to a known peer. `conn_id` is
     // caller-chosen and must be unique among this endpoint's current
@@ -232,29 +243,19 @@ public:
     // with no window at all (there's no ack to grow or shrink one from).
     void send_message(uint64_t conn_id, std::vector<uint8_t> data, bool reliable = false) { outgoing_queues[conn_id].push_back(queued_send{std::move(data), reliable}); }
 
-    // Feed one CQE whose user_data matches this endpoint's tags (recv_tag()
-    // for the receiver, or any of this endpoint's own send-completion tags
-    // - callers don't need to distinguish, just route every CQE for this
-    // endpoint's fd through here). Results, if any, land in the queue
-    // poll_incoming() drains - this call itself never returns anything.
-    void handle_cqe(const io_uring_cqe* cqe) {
-        uint64_t data = io_uring_cqe_get_data64(cqe);
-        if (data & send_tag_base) {
-            free_send_bufs.push_back((uint32_t)(data & ~send_tag_base));
-            return;
-        }
+    // One received datagram, already framed. Called by poll_io() for each one
+    // the backend delivers; results land in the queue poll_incoming() drains.
+    void on_datagram(const datagram& frag) {
+        if (frag.payload_len <= hdr_len) return;
 
-        auto frag = receiver.handle_cqe(cqe);
-        if (!frag || frag->payload_len <= hdr_len) return;
-
-        uint8_t type = frag->payload[0];
+        uint8_t type = frag.payload[0];
         uint64_t conn_id;
-        std::memcpy(&conn_id, frag->payload + 1, 8);
-        const uint8_t* body = frag->payload + hdr_len;
-        size_t body_len = frag->payload_len - hdr_len;
+        std::memcpy(&conn_id, frag.payload + 1, 8);
+        const uint8_t* body = frag.payload + hdr_len;
+        size_t body_len = frag.payload_len - hdr_len;
 
         switch (type) {
-            case 1: handle_message1(conn_id, body, body_len, frag->peer_addr, frag->peer_addr_len); break;
+            case 1: handle_message1(conn_id, body, body_len, frag.peer_addr, frag.peer_addr_len); break;
             case 2: handle_message2(conn_id, body, body_len); break;
             case 3: handle_data(conn_id, body, body_len); break;
             case 4: handle_cookie_reply(conn_id, body, body_len); break;
@@ -273,9 +274,8 @@ public:
         return out;
     }
 
-    // Call once per event-loop iteration, after the whole CQE batch has
-    // been drained through handle_cqe(): re-arms the receiver if needed,
-    // flushes provided buffers back to the kernel, sends any due SACKs,
+    // Call once per event-loop iteration, after poll_io() has delivered
+    // whatever arrived: sends any due SACKs,
     // fires any due retransmits, and flushes whatever send_message() has
     // queued (subject to each reliable session's congestion window). This
     // is where the "batch everything" principle from every earlier level
@@ -351,11 +351,9 @@ public:
             }
         }
 
-        receiver.flush();
         cookie_state.maybe_rotate(now);
     }
 
-    uint64_t recv_tag() const { return receiver.tag(); }
     size_t session_count() const { return sessions.size(); }
     size_t pending_handshake_count() const { return pending_initiators.size(); }
 
@@ -457,25 +455,19 @@ private:
         std::chrono::steady_clock::time_point started_at{};
     };
 
-    struct send_slot {
-        std::array<uint8_t, 2048> buf;
-        sockaddr_storage addr{};
-        iovec iov{};
-        msghdr msg{};
-    };
-
-    // The two things send_slot::buf actually has to hold: a single max-size data packet
+    // The two things a backend's send buffer actually has to hold: a single
+    // max-size data packet
     // (nonce + fragment header + largest payload + AEAD tag), and a full SACK batch
     // (see max_sack_entries_per_packet's own comment on the 1354-byte figure). Both are
     // computed from the same constants the wire format itself uses, not re-guessed here -
-    // if either grows past what a send_slot can hold, this fails the build instead of
+    // if either grows past what a send buffer can hold, this fails the build instead of
     // silently truncating a packet at runtime.
     static constexpr size_t max_data_wire_packet_len =
         hdr_len + transport::nonce_len + assembly::fragment_header_len + assembly::max_fragment_payload + crypto::aead_tag_len;
     static constexpr size_t max_sack_wire_packet_len = hdr_len + 1 + max_sack_entries_per_packet * reliability::sack_wire_len;
     static constexpr size_t max_keepalive_wire_packet_len = hdr_len + transport::nonce_len + crypto::aead_tag_len;
     static_assert(max_data_wire_packet_len <= 2048 && max_sack_wire_packet_len <= 2048 && max_keepalive_wire_packet_len <= 2048,
-                  "send_slot::buf must be large enough for the biggest data, SACK, or keepalive packet the wire format can produce");
+                  "a backend send buffer must hold the biggest data, SACK or keepalive packet the wire format can produce");
 
     struct queued_send {
         std::vector<uint8_t> data;
@@ -483,30 +475,7 @@ private:
     };
 
     void send_wire(uint8_t type, const uint8_t* body, size_t body_len, uint64_t conn_id, const sockaddr* addr, socklen_t addr_len) {
-        if (free_send_bufs.empty()) {
-            ++dropped_missing_send_buffer_count;
-            return;
-        }
-        uint32_t buf_idx = free_send_bufs.back();
-        free_send_bufs.pop_back();
-        send_slot& s = send_pool[buf_idx];
-
-        s.buf[0] = type;
-        std::memcpy(s.buf.data() + 1, &conn_id, 8);
-        std::memcpy(s.buf.data() + hdr_len, body, body_len);
-        std::memcpy(&s.addr, addr, addr_len);
-
-        s.iov.iov_base = s.buf.data();
-        s.iov.iov_len = hdr_len + body_len;
-        std::memset(&s.msg, 0, sizeof(s.msg));
-        s.msg.msg_name = &s.addr;
-        s.msg.msg_namelen = addr_len;
-        s.msg.msg_iov = &s.iov;
-        s.msg.msg_iovlen = 1;
-
-        io_uring_sqe* sqe = ring.get_sqe();
-        io_uring_prep_sendmsg(sqe, fd, &s.msg, 0);
-        io_uring_sqe_set_data64(sqe, send_tag_base | buf_idx);
+        if (!io.send(type, conn_id, body, body_len, addr, addr_len)) ++dropped_missing_send_buffer_count;
     }
 
     void handle_message1(uint64_t conn_id, const uint8_t* payload, size_t payload_len, const sockaddr* peer_addr, socklen_t peer_addr_len) {
@@ -692,7 +661,7 @@ private:
             // (self-healing for reliable sends via the retransmit path; an accepted, pre-existing
             // small loss risk for fire-and-forget ones), starting a brand new item we *know* has no
             // room for is pointless work. Leaving it queued costs nothing - it tries again next tick.
-            if (free_send_bufs.empty()) break;
+            if (!io.can_send()) break;
 
             queued_send& item = queue.front();
             if (item.reliable) {
@@ -714,11 +683,9 @@ private:
         return sent_anything;
     }
 
-    uring_ring& ring;
-    int fd;
+    io_backend& io;
     crypto::key_pair local_static;
     endpoint_config config;
-    multishot_udp_receiver receiver;
     anti_dos::cookie_secret cookie_state;
     anti_dos::load_gate load_state;
 
@@ -727,10 +694,6 @@ private:
     std::unordered_map<uint64_t, std::deque<queued_send>> outgoing_queues;
 
     std::vector<event> incoming_queue;
-
-    std::vector<send_slot> send_pool;
-    std::vector<uint32_t> free_send_bufs;
-    uint64_t send_tag_base;
 
     uint64_t dropped_missing_send_buffer_count = 0;
     uint64_t handshake_rejected = 0;

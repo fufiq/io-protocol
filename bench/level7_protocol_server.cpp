@@ -57,7 +57,8 @@ int main(int argc, char** argv) {
     config.load_threshold_per_sec = load_threshold;
     config.reliable_initial_cwnd = initial_cwnd;
     config.reliable_initial_ssthresh = initial_ssthresh;
-    protocol::protocol_endpoint<> endpoint(ring, fd, std::move(server_static), config);
+    protocol::uring_io io(ring, fd, config.send_pool_size, config.recv_num_bufs, config.recv_buf_size);
+    protocol::protocol_endpoint<> endpoint(io, std::move(server_static), config);
     endpoint.arm();
     ring.submit();
 
@@ -69,8 +70,7 @@ int main(int argc, char** argv) {
 
     constexpr auto tick_timeout = std::chrono::milliseconds(20);
     for (;;) {
-        ring.submit_and_wait_timeout(1, tick_timeout);
-        ring.drain_cqes([&](io_uring_cqe* cqe) { endpoint.handle_cqe(cqe); });
+        endpoint.poll_io(tick_timeout);
         for (auto& ev : endpoint.poll_incoming()) {
             switch (ev.type) {
                 case protocol::event::event_type::handshake_established: ++handshakes; break;

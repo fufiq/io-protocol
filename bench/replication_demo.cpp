@@ -77,9 +77,8 @@ sockaddr_in loopback_addr(uint16_t port) {
     return a;
 }
 
-void step(uring_ring& ring, protocol::protocol_endpoint<>& ep, auto&& on_event) {
-    ring.submit_and_wait(0);
-    ring.drain_cqes([&](io_uring_cqe* cqe) { ep.handle_cqe(cqe); });
+void step(protocol::protocol_endpoint<>& ep, auto&& on_event) {
+    ep.poll_io(std::chrono::milliseconds{0});
     for (auto& ev : ep.poll_incoming()) on_event(ev);
 }
 
@@ -100,11 +99,16 @@ int main() {
     auto primary_keys = crypto::x25519_generate();
     crypto::public_key primary_pub = primary_keys.pub;
 
-    protocol::protocol_endpoint<> primary_ep(primary_ring, primary_fd, std::move(primary_keys));
-    protocol::protocol_endpoint<> a_ep(a_ring, a_fd, crypto::x25519_generate());
-    protocol::protocol_endpoint<> b_ep(b_ring, b_fd, crypto::x25519_generate());
-    protocol::protocol_endpoint<> c_ep(c_ring, c_fd, crypto::x25519_generate());
-    protocol::protocol_endpoint<> d_ep(d_ring, d_fd, crypto::x25519_generate());
+    protocol::uring_io primary_ep_io(primary_ring, primary_fd);
+    protocol::protocol_endpoint<> primary_ep(primary_ep_io, std::move(primary_keys));
+    protocol::uring_io a_ep_io(a_ring, a_fd);
+    protocol::protocol_endpoint<> a_ep(a_ep_io, crypto::x25519_generate());
+    protocol::uring_io b_ep_io(b_ring, b_fd);
+    protocol::protocol_endpoint<> b_ep(b_ep_io, crypto::x25519_generate());
+    protocol::uring_io c_ep_io(c_ring, c_fd);
+    protocol::protocol_endpoint<> c_ep(c_ep_io, crypto::x25519_generate());
+    protocol::uring_io d_ep_io(d_ring, d_fd);
+    protocol::protocol_endpoint<> d_ep(d_ep_io, crypto::x25519_generate());
     primary_ep.arm(); a_ep.arm(); b_ep.arm(); c_ep.arm(); d_ep.arm();
 
     storage::storage<primary_spec> primary_table;
@@ -168,11 +172,11 @@ int main() {
             shipper.ship_snapshot(primary_table, primary_ep, key);
 
         shipper.tick(primary_table, primary_ep);
-        step(primary_ring, primary_ep, primary_on_event);
-        step(a_ring, a_ep, a_on_event);
-        step(b_ring, b_ep, b_on_event);
-        step(c_ring, c_ep, c_on_event);
-        step(d_ring, d_ep, d_on_event);
+        step(primary_ep, primary_on_event);
+        step(a_ep, a_on_event);
+        step(b_ep, b_on_event);
+        step(c_ep, c_on_event);
+        step(d_ep, d_on_event);
         auto now = std::chrono::steady_clock::now();
         primary_ep.tick(now); a_ep.tick(now); b_ep.tick(now); c_ep.tick(now); d_ep.tick(now);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));

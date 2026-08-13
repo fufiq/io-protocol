@@ -328,9 +328,8 @@ sockaddr_in loopback_addr(uint16_t port) {
     return a;
 }
 
-void step(uring_ring& ring, protocol::protocol_endpoint<>& ep, auto&& on_event) {
-    ring.submit_and_wait(0);
-    ring.drain_cqes([&](io_uring_cqe* cqe) { ep.handle_cqe(cqe); });
+void step(protocol::protocol_endpoint<>& ep, auto&& on_event) {
+    ep.poll_io(std::chrono::milliseconds{0});
     for (auto& ev : ep.poll_incoming()) on_event(ev);
 }
 
@@ -348,8 +347,10 @@ void test_disconnect_reconnect_resume() {
     uring_ring pring(2048), rring(2048);
     auto pkeys = crypto::x25519_generate();
     crypto::public_key ppub = pkeys.pub;
-    protocol::protocol_endpoint<> pep(pring, pfd, std::move(pkeys));
-    protocol::protocol_endpoint<> rep(rring, rfd, crypto::x25519_generate());
+    protocol::uring_io pep_io(pring, pfd);
+    protocol::protocol_endpoint<> pep(pep_io, std::move(pkeys));
+    protocol::uring_io rep_io(rring, rfd);
+    protocol::protocol_endpoint<> rep(rep_io, crypto::x25519_generate());
     pep.arm(); rep.arm();
 
     storage::storage<file_spec_p> ptable;
@@ -384,8 +385,8 @@ void test_disconnect_reconnect_resume() {
     };
     auto pump = [&] {
         shipper.tick(ptable, pep);
-        step(pring, pep, p_on_event);
-        if (replica_alive) step(rring, rep, r_on_event);
+        step(pep, p_on_event);
+        if (replica_alive) step(rep, r_on_event);
         auto now = std::chrono::steady_clock::now();
         pep.tick(now);
         if (replica_alive) rep.tick(now);
@@ -437,8 +438,10 @@ void test_sync_before_ack() {
     uring_ring pring(2048), rring(2048);
     auto pkeys = crypto::x25519_generate();
     crypto::public_key ppub = pkeys.pub;
-    protocol::protocol_endpoint<> pep(pring, pfd, std::move(pkeys));
-    protocol::protocol_endpoint<> rep(rring, rfd, crypto::x25519_generate());
+    protocol::uring_io pep_io(pring, pfd);
+    protocol::protocol_endpoint<> pep(pep_io, std::move(pkeys));
+    protocol::uring_io rep_io(rring, rfd);
+    protocol::protocol_endpoint<> rep(rep_io, crypto::x25519_generate());
     pep.arm(); rep.arm();
 
     storage::storage<file_spec_p> ptable;
@@ -481,8 +484,8 @@ void test_sync_before_ack() {
     };
     auto pump = [&] {
         shipper.tick(ptable, pep);
-        step(pring, pep, p_on_event);
-        step(rring, rep, r_on_event);
+        step(pep, p_on_event);
+        step(rep, r_on_event);
         auto now = std::chrono::steady_clock::now();
         pep.tick(now); rep.tick(now);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -528,7 +531,8 @@ void test_replica_restart_from_own_file() {
     uring_ring pring(2048);
     auto pkeys = crypto::x25519_generate();
     crypto::public_key ppub = pkeys.pub;
-    protocol::protocol_endpoint<> pep(pring, pfd, std::move(pkeys));
+    protocol::uring_io pep_io(pring, pfd);
+    protocol::protocol_endpoint<> pep(pep_io, std::move(pkeys));
     pep.arm();
 
     storage::storage<file_spec_p> ptable;
@@ -544,7 +548,8 @@ void test_replica_restart_from_own_file() {
     {
         int rfd = make_bound_udp_socket(&rport);
         uring_ring rring(2048);
-        protocol::protocol_endpoint<> rep(rring, rfd, crypto::x25519_generate());
+        protocol::uring_io rep_io(rring, rfd);
+    protocol::protocol_endpoint<> rep(rep_io, crypto::x25519_generate());
         rep.arm();
         storage::storage<file_spec_r> rtable;
         replication::replica_applier applier;
@@ -574,8 +579,8 @@ void test_replica_restart_from_own_file() {
         bool ok = false;
         for (int i = 0; i < 4000 && !ok; ++i) {
             shipper.tick(ptable, pep);
-            step(pring, pep, p_on_event);
-            step(rring, rep, r_on_event);
+            step(pep, p_on_event);
+            step(rep, r_on_event);
             auto now = std::chrono::steady_clock::now();
             pep.tick(now); rep.tick(now);
             auto c = shipper.replicated_offset(rpub);
@@ -604,7 +609,8 @@ void test_replica_restart_from_own_file() {
 
     int rfd2 = make_bound_udp_socket(&rport);
     uring_ring rring2(2048);
-    protocol::protocol_endpoint<> rep2(rring2, rfd2, crypto::x25519_generate());
+    protocol::uring_io rep2_io(rring2, rfd2);
+    protocol::protocol_endpoint<> rep2(rep2_io, crypto::x25519_generate());
     rep2.arm();
     replication::replica_applier applier2;
     crypto::public_key rpub2{};
@@ -634,8 +640,8 @@ void test_replica_restart_from_own_file() {
     bool ok2 = false;
     for (int i = 0; i < 6000 && !ok2; ++i) {
         shipper.tick(ptable, pep);
-        step(pring, pep, p_on_event2);
-        step(rring2, rep2, r_on_event2);
+        step(pep, p_on_event2);
+        step(rep2, r_on_event2);
         auto now = std::chrono::steady_clock::now();
         pep.tick(now); rep2.tick(now);
         auto c = shipper.replicated_offset(rpub2);
@@ -664,6 +670,9 @@ struct sync_rig {
     int pfd, r1fd, r2fd;
     uring_ring pring{2048}, r1ring{2048}, r2ring{2048};
     crypto::public_key ppub;
+    // The backends are members too, and declared BEFORE the endpoints that
+    // hold references to them - members initialize in declaration order.
+    protocol::uring_io pio{pring, pfd}, r1io{r1ring, r1fd}, r2io{r2ring, r2fd};
     protocol::protocol_endpoint<> pep, r1ep, r2ep;
     storage::storage<file_spec_p> ptable;
     replication::primary_shipper shipper;
@@ -681,7 +690,7 @@ struct sync_rig {
     sync_rig(crypto::key_pair pk)
         : pfd(make_bound_udp_socket(&pport)), r1fd(make_bound_udp_socket(&r1port)), r2fd(make_bound_udp_socket(&r2port)),
           ppub(pk.pub),
-          pep(pring, pfd, std::move(pk)), r1ep(r1ring, r1fd, gen()), r2ep(r2ring, r2fd, gen()) {
+          pep(pio, std::move(pk)), r1ep(r1io, gen()), r2ep(r2io, gen()) {
         pep.arm(); r1ep.arm(); r2ep.arm();
     }
     ~sync_rig() { close(pfd); close(r1fd); close(r2fd); }
@@ -694,7 +703,7 @@ struct sync_rig {
 
     void pump() {
         shipper.tick(ptable, pep);
-        step(pring, pep, [&](protocol::event& ev) {
+        step(pep, [&](protocol::event& ev) {
             crypto::public_key* which = ev.conn_id == 1 ? &r1pub : &r2pub;
             if (ev.type == protocol::event::event_type::handshake_established) {
                 *which = ev.peer_static;
@@ -706,12 +715,12 @@ struct sync_rig {
                 else if (k == replication::msg_kind::resync_request) shipper.ship_snapshot(ptable, pep, *which);
             }
         });
-        if (r1_alive) step(r1ring, r1ep, [&](protocol::event& ev) {
+        if (r1_alive) step(r1ep, [&](protocol::event& ev) {
             if (ev.type == protocol::event::event_type::handshake_established) r1applier.on_reconnected();
             else if (ev.type == protocol::event::event_type::message_received)
                 r1applier.on_message(r1table, ev.msg_id, ev.data, [&](const std::vector<uint8_t>& r) { r1ep.send_message(1, r, true); });
         });
-        if (r2_alive) step(r2ring, r2ep, [&](protocol::event& ev) {
+        if (r2_alive) step(r2ep, [&](protocol::event& ev) {
             if (ev.type == protocol::event::event_type::handshake_established) r2applier.on_reconnected();
             else if (ev.type == protocol::event::event_type::message_received)
                 r2applier.on_message(r2table, ev.msg_id, ev.data, [&](const std::vector<uint8_t>& r) { r2ep.send_message(2, r, true); });

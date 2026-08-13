@@ -122,7 +122,8 @@ int main(int argc, char** argv) {
     if (initial_cwnd != 0) config.reliable_initial_cwnd = initial_cwnd;
     if (initial_ssthresh != 0) config.reliable_initial_ssthresh = initial_ssthresh;
     auto client_static = crypto::x25519_generate();
-    protocol::protocol_endpoint<> endpoint(ring, fd, std::move(client_static), config);
+    protocol::uring_io io(ring, fd, config.send_pool_size, config.recv_num_bufs, config.recv_buf_size);
+    protocol::protocol_endpoint<> endpoint(io, std::move(client_static), config);
     endpoint.arm();
 
     endpoint.connect(conn_id, server_pub, (sockaddr*)&dst, sizeof(dst));
@@ -131,8 +132,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, "[client] connecting...\n");
     bool established = false;
     while (!established) {
-        ring.submit_and_wait_timeout(1, tick_timeout);
-        ring.drain_cqes([&](io_uring_cqe* cqe) { endpoint.handle_cqe(cqe); });
+        endpoint.poll_io(tick_timeout);
         for (auto& ev : endpoint.poll_incoming()) {
             if (ev.type == protocol::event::event_type::handshake_established) established = true;
             if (ev.type == protocol::event::event_type::handshake_failed) {
@@ -166,8 +166,7 @@ int main(int argc, char** argv) {
         auto now = std::chrono::steady_clock::now();
         if (now >= deadline) break;
 
-        ring.submit_and_wait_timeout(1, tick_timeout);
-        ring.drain_cqes([&](io_uring_cqe* cqe) { endpoint.handle_cqe(cqe); });
+        endpoint.poll_io(tick_timeout);
         for (auto& ev : endpoint.poll_incoming()) (void)ev; // client doesn't expect inbound messages in this benchmark
 
         // Top up *before* tick(), not after: whatever tick() doesn't drain into SQEs this

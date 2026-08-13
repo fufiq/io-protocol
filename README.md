@@ -36,13 +36,13 @@ All three engines at an **identical 10,000-record crash window**, on the same
 1-vCPU VPS, one process per cell, page cache dropped between them. Detail and
 method in [§8b](storage/FIELD_STORAGE.md).
 
-| 1 GB on 960 MB of RAM | this engine | LMDB | ObjectBox |
+| 1 GB on 960 MB of RAM, 300,000 operations | this engine | LMDB | ObjectBox |
 |---|---|---|---|
-| random update | **914,689** | 2,572 | 2,033 |
-| major faults over 50,000 updates | **43** | 29,116 | 37,026 |
-| iowait during the update phase | **0.01 s** | 12.89 s | 15.92 s |
-| random read | **5,073** | 3,759 | 2,525 |
-| fill | 245,035 | **272,346** | 171,491 |
+| random update | **543,070** | 2,308 | 1,758 |
+| major faults over 300,000 updates | **164** | 180,305 | 229,770 |
+| iowait during the update phase | **0.01 s** | 90.74 s | 116.59 s |
+| random read | **5,461** | 4,131 | 2,753 |
+| fill | 249,105 | **283,158** | 178,002 |
 | on disk per 1 GB of data | **1.05 GB** | 1.34 GB | 2.11 GB |
 
 The update column is the design, and the two rows under it say why: an append
@@ -53,6 +53,11 @@ wait for. Both in-place designs stall on the device.
 contiguous record is 4x faster to read, because a read there is a pointer and
 here it is a gather. Out of RAM the two converge, since every read is a fault
 either way.
+
+One caveat the spec spells out: an out-of-RAM *update* rate for this engine
+depends on how much of the set a run sweeps, because it is the only engine here
+that is not fault-bound anyway. Read it as a range - three runs of the cell
+above gave 377,015, 435,691 and 543,070 - not as a figure.
 
 One writer per instance, which is the unit of scale rather than a ceiling -
 sixteen independent instances on this desktop reach **125.8M updates/sec**, and

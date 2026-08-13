@@ -425,39 +425,59 @@ the closest commercial thing to what this engine argues against, so it is the
 sharper test than LMDB.
 
 All three engines below ran at an **identical 10,000-record crash window** - 21
-barriers each at 200 MB, 103 each at 1 GB - on the same VPS, one process per
-cell, page cache dropped between.
+barriers each at 200 MB, 103 each at 1 GB - and at an identical 300,000
+operations, on the same VPS, one process per cell, page cache dropped between.
 
 **200 MB, fits in RAM:**
 
 | | field | LMDB | ObjectBox |
 |---|---|---|---|
-| fill | 244,108 | **278,683** | 137,935 |
-| random read | **1,226,741** | 684,709 | 321,006 |
-| random update | **1,966,920** | 9,331 | 8,621 |
-| iowait during the update phase | **0.00 s** | 16.98 s | 18.39 s |
+| fill | 268,317 | **307,280** | 204,866 |
+| random read | **1,324,240** | 759,249 | 508,917 |
+| random update | **2,152,052** | 9,351 | 8,699 |
+| iowait during the update phase | **0.00 s** | 17.83 s | 19.25 s |
 
 **1 GB on 960 MB of RAM, out of RAM:**
 
 | | field | LMDB | ObjectBox |
 |---|---|---|---|
-| fill | 245,035 | **272,346** | 171,491 |
-| random read | **5,073** | 3,759 | 2,525 |
-| random update | **914,689** | 2,572 | 2,033 |
-| major faults over 50,000 updates | **43** | 29,116 | 37,026 |
-| iowait during the update phase | **0.01 s** | 12.89 s | 15.92 s |
+| fill | 249,105 | **283,158** | 178,002 |
+| random read | **5,461** | 4,131 | 2,753 |
+| random update | **543,070** | 2,308 | 1,758 |
+| major faults over 300,000 updates | **164** | 180,305 | 229,770 |
+| iowait during the update phase | **0.01 s** | 90.74 s | 116.59 s |
 | on disk per 1 GB of data | **1.05 GB** | 1.34 GB | 2.11 GB |
 
-**The update column is 228x in RAM and 450x out of it**, and the row underneath
-says why both times: 43 major faults against 37,026, and no iowait against 16
-seconds of it. FlatBuffers has no partial write, so changing eight bytes of a
-1 KB object carries the whole object back through the builder and lands it on a
-page that has to be found, faulted and written. Appending the eight bytes
-touches no page of the record.
+**The update column is 247x in RAM and 309x out of it**, and the row underneath
+says why both times: 164 major faults against 229,770, and no iowait against
+nearly two minutes of it. FlatBuffers has no partial write, so changing eight
+bytes of a 1 KB object carries the whole object back through the builder and
+lands it on a page that has to be found, faulted and written. Appending the
+eight bytes touches no page of the record.
+
+### How many operations you run changes one of these numbers
+
+Only one, and only this engine's. An earlier version of the table above ran
+50,000 operations instead of 300,000 and reported **914,689** updates/sec out of
+RAM rather than 543,070.
+
+That is not noise, and it is not wrong - it is what a random workload over a
+dataset that does not fit means. At 50,000 operations you touch 5% of a
+million-record set; at 300,000 you touch a quarter of it, and the update phase
+inherits whatever the read phase before it left resident. **This engine is the
+only one the effect is visible on, because it is the only one that is not
+fault-bound anyway**: over the same change LMDB moved 2,666 → 2,308, a sixth of
+the distance.
+
+So an out-of-RAM update rate for this engine is only meaningful together with
+how much of the set was swept, and its own run-to-run spread at 300,000 is
+wide - 377,015, 435,691 and 543,070 across three runs. The comparison survives
+all of it: the narrowest reading still puts it 163x ahead of LMDB. The absolute
+number should be read as a range, not a figure.
 
 **The read result contradicted the prediction that motivated the measurement.**
 Zero-copy FlatBuffers over mmap was expected to beat a design that copies every
-record out, and instead it lost by 3.8x in RAM. The copy was never the cost: a
+record out, and instead it lost by 2.6x in RAM. The copy was never the cost: a
 1 KB memcpy is tens of nanoseconds, while finding the object is a B+tree descent
 of several cache misses against one indexed load into a resident slot array.
 Zero-copy optimises the part that was already cheap.

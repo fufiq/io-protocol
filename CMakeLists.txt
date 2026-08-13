@@ -109,6 +109,17 @@ enable_testing()
 add_test(NAME unit_tests COMMAND unit_tests)
 add_test(NAME replication_tests COMMAND replication_tests)
 
+# runtime/fiber.hpp switches stacks with ucontext, which ASan cannot follow: its
+# stack-use-after-return "fake stack" gets confused when a real stack pointer
+# jumps to an unrelated region mid-function, and any fiber that yields a frame
+# or two deep then SEGVs on the next resume. fiber.hpp has documented this at
+# length for a while; it was not wired into the build, so an ASan run of the
+# fiber tests crashed and looked like a bug in what it was testing.
+#
+# Turning that one check off leaves the rest of ASan and all of UBSan intact.
+set_tests_properties(unit_tests replication_tests
+                     PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_stack_use_after_return=0")
+
 # --- fuzzers ---------------------------------------------------------------
 # libFuzzer needs clang; these are opt-in so a gcc build stays unaffected.
 if(ENABLE_FUZZERS)

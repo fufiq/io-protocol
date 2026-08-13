@@ -16,7 +16,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     constexpr size_t region_size = 1u << 20;
     std::vector<std::byte> region(region_size, std::byte{0});
     storage::storage<> table(region.data());
-    replication::replica_applier<storage::storage_spec<>> applier;
+    replication::replica_applier applier;
 
     // Drive several messages out of one input, varying msg_id so the
     // reorder buffer and the in-order drain both get exercised.

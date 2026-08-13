@@ -114,11 +114,11 @@ int main() {
     storage::storage<replica_c_spec> c_table;
     storage::storage<replica_d_spec> d_table;
 
-    replication::primary_shipper<primary_spec> shipper;
-    replication::replica_applier<replica_a_spec> a_applier;
-    replication::replica_applier<replica_b_spec> b_applier;
-    replication::replica_applier<replica_c_spec> c_applier;
-    replication::replica_applier<replica_d_spec> d_applier;
+    replication::primary_shipper shipper;
+    replication::replica_applier a_applier;
+    replication::replica_applier b_applier;
+    replication::replica_applier c_applier;
+    replication::replica_applier d_applier;
 
     crypto::public_key a_pub{}, b_pub{}, c_pub{}, d_pub{};
     bool a_up = false, b_up = false, c_up = false, d_up = false;

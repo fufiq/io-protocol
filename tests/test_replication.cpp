@@ -17,6 +17,7 @@
 // Build: g++ -std=c++26 -O2 -Wall -Wextra -Isrc -luring -lsodium src/replication_tests.cpp -o replication_tests
 
 #include "../replication/replication.hpp"
+#include "../storage/field_storage.hpp"
 #include "../runtime/fiber.hpp"
 
 #include <arpa/inet.h>
@@ -27,6 +28,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <string>
 #include <thread>
 
 namespace {
@@ -64,32 +67,93 @@ std::vector<uint8_t> make_snapshot_done(uint64_t resume_offset) {
 
 using mem_spec = storage::storage_spec<>; // shared: caller-provided region, no file
 
-// A primary-ish storage over a plain heap buffer, plus the offsets of each
-// write so tests can slice its WAL at real record boundaries.
-struct wal_source {
+// =========================================================================
+// TWO ENGINES BEHIND ONE SHAPE.
+//
+// replica_applier and primary_shipper take the table as `auto&` and never name
+// its type, so replication is engine-agnostic by construction. It was never
+// actually RUN against the field engine, though, and "should work" is not a
+// test - so every scenario below is a template and every one of them runs twice.
+//
+// The two engines differ in exactly two ways, both documented:
+//   - storage.hpp lives in a region the caller owns; the field engine owns
+//     files, so it needs a directory. That is what the constructor argument is.
+//   - get<T>() returns a pointer from one and an optional from the other, which
+//     is why the reads below say `auto` and never `const account*`
+//     (FIELD_STORAGE.md §5).
+// =========================================================================
+
+struct heap_engine {
+    static constexpr const char* name = "storage.hpp";
     std::vector<std::byte> region{4ull * 1024 * 1024};
-    storage::storage<mem_spec> table{region.data()};
-    std::vector<std::size_t> marks{0};
-    void mark() { marks.push_back(table.current_offset()); }
+    storage::storage<mem_spec> t{region.data()};
+    explicit heap_engine(const char*) {}
+    auto& table() { return t; }
 };
+
+using rep_fspec = storage::field_spec<"t_rep.log", 4ull * 1024 * 1024,
+                                      "t_rep.idx", 8192, 8192, 8, 64>;
+
+struct field_engine {
+    static constexpr const char* name = "field_storage.hpp";
+    std::string dir;
+    std::unique_ptr<storage::field_storage<rep_fspec>> t;
+    explicit field_engine(const char* d) : dir(d) {
+        ::mkdir(dir.c_str(), 0755);
+        t = std::make_unique<storage::field_storage<rep_fspec>>(
+                storage::storage_paths::under<rep_fspec>(dir));
+    }
+    ~field_engine() {
+        t.reset();
+        std::remove((dir + "/t_rep.log").c_str());
+        std::remove((dir + "/t_rep.idx").c_str());
+        ::rmdir(dir.c_str());
+    }
+    auto& table() { return *t; }
+};
+
+// A primary-ish storage plus the offsets of each write, so a test can slice its
+// WAL at real record boundaries.
+template <typename engine>
+struct wal_source : engine {
+    std::vector<std::size_t> marks{0};
+    using engine::engine;
+    void mark() { marks.push_back(this->table().current_offset()); }
+};
+
+// Reads that mean the same thing on both engines. `auto` is doing the work:
+// one of these is a pointer and the other an optional, and both are contextually
+// convertible to bool and both arrow into the record.
+template <typename table_t>
+bool present(table_t& t, storage::record_id id) {
+    auto v = t.template get<account>(id);
+    return (bool)v;
+}
+template <typename table_t>
+uint64_t balance_of(table_t& t, storage::record_id id, uint64_t missing = ~0ull) {
+    auto v = t.template get<account>(id);
+    return v ? v->balance : missing;
+}
 
 // =========================================================================
 // Unit tests - replica_applier driven directly, no network
 // =========================================================================
 
+template <typename engine>
 void test_out_of_order_delivery() {
-    wal_source src;
-    auto id1 = src.table.create(account{10}); src.mark();
-    auto id2 = src.table.create(account{20}); src.mark();
-    src.table.update<&account::balance>(id1, 99); src.mark();
+    wal_source<engine> src("t_rep_oo_p");
+    auto& stable = src.table();
+    auto id1 = stable.create(account{10}); src.mark();
+    auto id2 = stable.create(account{20}); src.mark();
+    stable.template update<&account::balance>(id1, 99); src.mark();
 
-    std::vector<std::byte> rregion(4ull * 1024 * 1024);
-    storage::storage<mem_spec> rtable(rregion.data());
-    replication::replica_applier<mem_spec> applier;
+    engine dst("t_rep_oo_r");
+    auto& rtable = dst.table();
+    replication::replica_applier applier;
     auto noop = [](const std::vector<uint8_t>&) {};
 
     auto slice = [&](int i) {
-        return make_wal_batch(src.marks[i], src.table.raw_base() + src.marks[i], src.marks[i + 1] - src.marks[i]);
+        return make_wal_batch(src.marks[i], stable.raw_base() + src.marks[i], src.marks[i + 1] - src.marks[i]);
     };
 
     // Deliver 2, then 1 - neither may apply, since msg_id 0 is missing.
@@ -100,34 +164,33 @@ void test_out_of_order_delivery() {
 
     // msg_id 0 arrives - all three must now drain in order, in one go.
     applier.on_message(rtable, 0, slice(0), noop);
-    CHECK(applier.applied_offset() == src.table.current_offset(),
-          "expected fully caught up (%zu), got %zu", src.table.current_offset(), applier.applied_offset());
+    CHECK(applier.applied_offset() == stable.current_offset(),
+          "expected fully caught up (%zu), got %zu", stable.current_offset(), applier.applied_offset());
     CHECK(applier.reorder_buffer_size() == 0, "reorder buffer should be drained, got %zu", applier.reorder_buffer_size());
 
-    const account* r1 = rtable.get<account>(id1);
-    const account* r2 = rtable.get<account>(id2);
-    CHECK(r1 && r1->balance == 99, "id1 should be 99 after in-order replay");
-    CHECK(r2 && r2->balance == 20, "id2 should be 20");
+    CHECK(balance_of(rtable, id1) == 99, "id1 should be 99 after in-order replay");
+    CHECK(balance_of(rtable, id2) == 20, "id2 should be 20");
 }
 
+template <typename engine>
 void test_duplicate_message_not_applied_twice() {
-    wal_source src;
-    auto id1 = src.table.create(account{5}); src.mark();
+    wal_source<engine> src("t_rep_dup_p");
+    auto& stable = src.table();
+    auto id1 = stable.create(account{5}); src.mark();
 
-    std::vector<std::byte> rregion(4ull * 1024 * 1024);
-    storage::storage<mem_spec> rtable(rregion.data());
-    replication::replica_applier<mem_spec> applier;
+    engine dst("t_rep_dup_r");
+    auto& rtable = dst.table();
+    replication::replica_applier applier;
     auto noop = [](const std::vector<uint8_t>&) {};
 
-    auto batch = make_wal_batch(0, src.table.raw_base(), src.marks[1]);
+    auto batch = make_wal_batch(0, stable.raw_base(), src.marks[1]);
     applier.on_message(rtable, 0, batch, noop);
     std::size_t after_first = applier.applied_offset();
 
     applier.on_message(rtable, 0, batch, noop); // exact duplicate
     CHECK(applier.applied_offset() == after_first,
           "a duplicate msg_id must not advance applied_offset (%zu -> %zu)", after_first, applier.applied_offset());
-    const account* r1 = rtable.get<account>(id1);
-    CHECK(r1 && r1->balance == 5, "record should still be intact after a duplicate");
+    CHECK(balance_of(rtable, id1) == 5, "record should still be intact after a duplicate");
 
     // A duplicate must not accumulate either: anything at or below
     // next_msg_id is dropped on arrival rather than parked in the buffer,
@@ -136,98 +199,104 @@ void test_duplicate_message_not_applied_twice() {
           "a duplicate must not stay parked in the reorder buffer, got %zu", applier.reorder_buffer_size());
 }
 
+template <typename engine>
 void test_gap_never_fills() {
-    wal_source src;
-    src.table.create(account{1}); src.mark();
+    wal_source<engine> src("t_rep_gap_p");
+    auto& stable = src.table();
+    stable.create(account{1}); src.mark();
 
-    std::vector<std::byte> rregion(4ull * 1024 * 1024);
-    storage::storage<mem_spec> rtable(rregion.data());
-    replication::replica_applier<mem_spec> applier;
+    engine dst("t_rep_gap_r");
+    auto& rtable = dst.table();
+    replication::replica_applier applier;
     auto noop = [](const std::vector<uint8_t>&) {};
 
     for (uint32_t id = 1; id <= 5; ++id) // msg_id 0 never arrives
-        applier.on_message(rtable, id, make_wal_batch(0, src.table.raw_base(), src.marks[1]), noop);
+        applier.on_message(rtable, id, make_wal_batch(0, stable.raw_base(), src.marks[1]), noop);
 
     CHECK(applier.applied_offset() == 0, "nothing may apply while the head of the sequence is missing");
     CHECK(applier.reorder_buffer_size() == 5, "all 5 should still be buffered, got %zu", applier.reorder_buffer_size());
 }
 
+template <typename engine>
 void test_from_offset_mismatch_requests_resync() {
-    wal_source src;
-    src.table.create(account{7}); src.mark();
+    wal_source<engine> src("t_rep_mis_p");
+    auto& stable = src.table();
+    stable.create(account{7}); src.mark();
 
-    std::vector<std::byte> rregion(4ull * 1024 * 1024);
-    storage::storage<mem_spec> rtable(rregion.data());
-    replication::replica_applier<mem_spec> applier;
+    engine dst("t_rep_mis_r");
+    auto& rtable = dst.table();
+    replication::replica_applier applier;
 
     std::vector<uint8_t> reply;
     auto capture = [&](const std::vector<uint8_t>& r) { reply = r; };
 
     // Claims to start at 4096; the replica has nothing.
-    applier.on_message(rtable, 0, make_wal_batch(4096, src.table.raw_base(), src.marks[1]), capture);
+    applier.on_message(rtable, 0, make_wal_batch(4096, stable.raw_base(), src.marks[1]), capture);
 
     CHECK(!reply.empty() && (replication::msg_kind)reply[0] == replication::msg_kind::resync_request,
           "a from_offset mismatch must emit resync_request, got kind=%d", reply.empty() ? -1 : (int)reply[0]);
     CHECK(applier.applied_offset() == 0, "nothing may be applied from a mismatched batch");
 }
 
+template <typename engine>
 void test_snapshot_replaces_stale_state() {
     // Replica has stale data; a snapshot must wipe it, not merge with it.
     // The stale set must contain ids the snapshot does NOT - otherwise
     // "still present" proves nothing, since ids are assigned per-storage
     // from 1 and would collide by construction.
-    wal_source stale;
-    stale.table.create(account{111});
-    stale.table.create(account{222});
-    auto ghost = stale.table.create(account{666}); // id 3 - the snapshot below only has id 1
+    wal_source<engine> stale("t_rep_snap_s");
+    auto& sttable = stale.table();
+    sttable.create(account{111});
+    sttable.create(account{222});
+    auto ghost = sttable.create(account{666}); // id 3 - the snapshot below only has id 1
     stale.mark();
 
-    std::vector<std::byte> rregion(4ull * 1024 * 1024);
-    storage::storage<mem_spec> rtable(rregion.data());
-    replication::replica_applier<mem_spec> applier;
+    engine dst("t_rep_snap_r");
+    auto& rtable = dst.table();
+    replication::replica_applier applier;
     auto noop = [](const std::vector<uint8_t>&) {};
-    applier.on_message(rtable, 0, make_wal_batch(0, stale.table.raw_base(), stale.marks[1]), noop);
-    CHECK(rtable.get<account>(ghost) != nullptr, "precondition: replica has the stale record");
+    applier.on_message(rtable, 0, make_wal_batch(0, sttable.raw_base(), stale.marks[1]), noop);
+    CHECK(present(rtable, ghost), "precondition: replica has the stale record");
 
     // Now a snapshot from a primary that never had `ghost`.
-    wal_source src;
-    auto keep = src.table.create(account{42});
-    src.table.sync();
-    auto snap = src.table.export_snapshot();
+    wal_source<engine> src("t_rep_snap_p");
+    auto& stable = src.table();
+    auto keep = stable.create(account{42});
+    stable.sync();
+    auto snap = stable.export_snapshot();
 
     applier.on_message(rtable, 1, make_snapshot_batch(snap.data(), snap.size()), noop);
-    applier.on_message(rtable, 2, make_snapshot_done(src.table.current_offset()), noop);
+    applier.on_message(rtable, 2, make_snapshot_done(stable.current_offset()), noop);
 
-    CHECK(rtable.get<account>(ghost) == nullptr, "the stale record must be gone after a snapshot reset");
-    const account* k = rtable.get<account>(keep);
-    CHECK(k && k->balance == 42, "the snapshot's own record must be present");
-    CHECK(applier.applied_offset() == src.table.current_offset(),
+    CHECK(!present(rtable, ghost), "the stale record must be gone after a snapshot reset");
+    CHECK(balance_of(rtable, keep) == 42, "the snapshot's own record must be present");
+    CHECK(applier.applied_offset() == stable.current_offset(),
           "applied_offset must jump to the primary's offset (%zu), got %zu",
-          src.table.current_offset(), applier.applied_offset());
+          stable.current_offset(), applier.applied_offset());
 }
 
+template <typename engine>
 void test_snapshot_split_across_messages() {
-    wal_source src;
-    for (int i = 0; i < 20; ++i) src.table.create(account{(uint64_t)i});
-    src.table.sync();
-    auto snap = src.table.export_snapshot();
+    wal_source<engine> src("t_rep_spl_p");
+    auto& stable = src.table();
+    for (int i = 0; i < 20; ++i) stable.create(account{(uint64_t)i});
+    stable.sync();
+    auto snap = stable.export_snapshot();
     CHECK(snap.size() > 64, "precondition: snapshot big enough to split");
 
-    std::vector<std::byte> rregion(4ull * 1024 * 1024);
-    storage::storage<mem_spec> rtable(rregion.data());
-    replication::replica_applier<mem_spec> applier;
+    engine dst("t_rep_spl_r");
+    auto& rtable = dst.table();
+    replication::replica_applier applier;
     auto noop = [](const std::vector<uint8_t>&) {};
 
     std::size_t half = snap.size() / 2;
     applier.on_message(rtable, 0, make_snapshot_batch(snap.data(), half), noop);
     applier.on_message(rtable, 1, make_snapshot_batch(snap.data() + half, snap.size() - half), noop);
-    applier.on_message(rtable, 2, make_snapshot_done(src.table.current_offset()), noop);
+    applier.on_message(rtable, 2, make_snapshot_done(stable.current_offset()), noop);
 
     bool all_present = true;
-    for (storage::record_id id = 1; id <= 20; ++id) {
-        const account* a = rtable.get<account>(id);
-        if (!a || a->balance != id - 1) all_present = false;
-    }
+    for (storage::record_id id = 1; id <= 20; ++id)
+        if (balance_of(rtable, id) != id - 1) all_present = false;
     CHECK(all_present, "every record must survive a snapshot split across two messages");
 }
 
@@ -283,8 +352,8 @@ void test_disconnect_reconnect_resume() {
 
     storage::storage<file_spec_p> ptable;
     storage::storage<file_spec_r> rtable;
-    replication::primary_shipper<file_spec_p> shipper;
-    replication::replica_applier<file_spec_r> applier;
+    replication::primary_shipper shipper;
+    replication::replica_applier applier;
 
     crypto::public_key rpub{};
     bool r_up = false;
@@ -372,8 +441,8 @@ void test_sync_before_ack() {
 
     storage::storage<file_spec_p> ptable;
     storage::storage<file_spec_r> rtable;
-    replication::primary_shipper<file_spec_p> shipper;
-    replication::replica_applier<file_spec_r> applier;
+    replication::primary_shipper shipper;
+    replication::replica_applier applier;
 
     crypto::public_key rpub{};
     bool r_up = false;
@@ -461,7 +530,7 @@ void test_replica_restart_from_own_file() {
     pep.arm();
 
     storage::storage<file_spec_p> ptable;
-    replication::primary_shipper<file_spec_p> shipper;
+    replication::primary_shipper shipper;
     crypto::public_key rpub{};
     sockaddr_in paddr = loopback_addr(pport);
 
@@ -476,7 +545,7 @@ void test_replica_restart_from_own_file() {
         protocol::protocol_endpoint<> rep(rring, rfd, crypto::x25519_generate());
         rep.arm();
         storage::storage<file_spec_r> rtable;
-        replication::replica_applier<file_spec_r> applier;
+        replication::replica_applier applier;
         bool r_up = false;
         uint64_t conn = 1;
 
@@ -535,7 +604,7 @@ void test_replica_restart_from_own_file() {
     uring_ring rring2(2048);
     protocol::protocol_endpoint<> rep2(rring2, rfd2, crypto::x25519_generate());
     rep2.arm();
-    replication::replica_applier<file_spec_r> applier2;
+    replication::replica_applier applier2;
     crypto::public_key rpub2{};
     bool r_up2 = false;
     uint64_t conn2 = 7;
@@ -595,7 +664,7 @@ struct sync_rig {
     crypto::public_key ppub;
     protocol::protocol_endpoint<> pep, r1ep, r2ep;
     storage::storage<file_spec_p> ptable;
-    replication::primary_shipper<file_spec_p> shipper;
+    replication::primary_shipper shipper;
     crypto::public_key r1pub{}, r2pub{};
     bool r1_alive = true, r2_alive = true;
 
@@ -603,7 +672,7 @@ struct sync_rig {
     // coexist without needing two distinct compile-time file paths.
     std::vector<std::byte> r1region{4ull * 1024 * 1024}, r2region{4ull * 1024 * 1024};
     storage::storage<mem_spec> r1table{r1region.data()}, r2table{r2region.data()};
-    replication::replica_applier<mem_spec> r1applier, r2applier;
+    replication::replica_applier r1applier, r2applier;
 
     static crypto::key_pair gen() { return crypto::x25519_generate(); }
 
@@ -790,60 +859,71 @@ void test_sync_commit_from_a_fiber() {
 // restored the replication checkpoint - the counterpart to
 // test_replica_restart_from_own_file, which shows what happens when it
 // doesn't.
+template <typename engine>
 void test_checkpoint_restore_enables_incremental_resume() {
-    wal_source src;
-    src.table.create(account{1});
-    src.table.create(account{2});
+    wal_source<engine> src("t_rep_ckr_p");
+    auto& stable = src.table();
+    stable.create(account{1});
+    stable.create(account{2});
     src.mark();
 
-    std::vector<std::byte> rregion(4ull * 1024 * 1024);
-    storage::storage<mem_spec> rtable(rregion.data());
+    engine dst("t_rep_ckr_r");
+    auto& rtable = dst.table();
     auto noop = [](const std::vector<uint8_t>&) {};
 
     std::size_t saved_checkpoint = 0;
     {
-        replication::replica_applier<mem_spec> applier;
-        applier.on_message(rtable, 0, make_wal_batch(0, src.table.raw_base(), src.marks[1]), noop);
+        replication::replica_applier applier;
+        applier.on_message(rtable, 0, make_wal_batch(0, stable.raw_base(), src.marks[1]), noop);
         saved_checkpoint = applier.applied_offset(); // what the caller would persist
         CHECK(saved_checkpoint == src.marks[1], "precondition: applier caught up");
     } // applier destroyed - replica "restarts"
 
     // More writes happen while it's down.
-    auto id3 = src.table.create(account{3});
+    auto id3 = stable.create(account{3});
     src.mark();
 
     // Fresh applier + restored checkpoint => incremental resume works, no
     // resnapshot needed.
-    replication::replica_applier<mem_spec> restarted;
+    replication::replica_applier restarted;
     restarted.set_applied_offset(saved_checkpoint);
     restarted.on_message(rtable, 0,
-                         make_wal_batch(src.marks[1], src.table.raw_base() + src.marks[1], src.marks[2] - src.marks[1]),
+                         make_wal_batch(src.marks[1], stable.raw_base() + src.marks[1], src.marks[2] - src.marks[1]),
                          noop);
 
-    CHECK(restarted.applied_offset() == src.table.current_offset(),
+    CHECK(restarted.applied_offset() == stable.current_offset(),
           "restored checkpoint should allow incremental catch-up (%zu vs %zu)",
-          restarted.applied_offset(), src.table.current_offset());
-    const account* a3 = rtable.get<account>(id3);
-    CHECK(a3 && a3->balance == 3, "the write made while down must apply after resume");
+          restarted.applied_offset(), stable.current_offset());
+    CHECK(balance_of(rtable, id3) == 3, "the write made while down must apply after resume");
 }
 
 } // namespace
 
 int main() {
+    // Every applier scenario runs against BOTH engines. The label carries which
+    // one, so a failure says immediately whether it is the replication logic or
+    // the storage underneath.
     struct { const char* name; void (*fn)(); } tests[] = {
-        {"out_of_order_delivery", test_out_of_order_delivery},
-        {"duplicate_message_not_applied_twice", test_duplicate_message_not_applied_twice},
-        {"gap_never_fills", test_gap_never_fills},
-        {"from_offset_mismatch_requests_resync", test_from_offset_mismatch_requests_resync},
-        {"snapshot_replaces_stale_state", test_snapshot_replaces_stale_state},
-        {"snapshot_split_across_messages", test_snapshot_split_across_messages},
+        {"out_of_order_delivery [storage.hpp]", test_out_of_order_delivery<heap_engine>},
+        {"out_of_order_delivery [field]", test_out_of_order_delivery<field_engine>},
+        {"duplicate_message_not_applied_twice [storage.hpp]", test_duplicate_message_not_applied_twice<heap_engine>},
+        {"duplicate_message_not_applied_twice [field]", test_duplicate_message_not_applied_twice<field_engine>},
+        {"gap_never_fills [storage.hpp]", test_gap_never_fills<heap_engine>},
+        {"gap_never_fills [field]", test_gap_never_fills<field_engine>},
+        {"from_offset_mismatch_requests_resync [storage.hpp]", test_from_offset_mismatch_requests_resync<heap_engine>},
+        {"from_offset_mismatch_requests_resync [field]", test_from_offset_mismatch_requests_resync<field_engine>},
+        {"snapshot_replaces_stale_state [storage.hpp]", test_snapshot_replaces_stale_state<heap_engine>},
+        {"snapshot_replaces_stale_state [field]", test_snapshot_replaces_stale_state<field_engine>},
+        {"snapshot_split_across_messages [storage.hpp]", test_snapshot_split_across_messages<heap_engine>},
+        {"snapshot_split_across_messages [field]", test_snapshot_split_across_messages<field_engine>},
         {"disconnect_reconnect_resume", test_disconnect_reconnect_resume},
         {"sync_before_ack", test_sync_before_ack},
         {"replica_restart_from_own_file", test_replica_restart_from_own_file},
         {"sync_commit_reaches_quorum", test_sync_commit_reaches_quorum},
         {"sync_commit_times_out_without_quorum", test_sync_commit_times_out_without_quorum},
         {"sync_commit_from_a_fiber", test_sync_commit_from_a_fiber},
-        {"checkpoint_restore_enables_incremental_resume", test_checkpoint_restore_enables_incremental_resume},
+        {"checkpoint_restore_enables_incremental_resume [storage.hpp]", test_checkpoint_restore_enables_incremental_resume<heap_engine>},
+        {"checkpoint_restore_enables_incremental_resume [field]", test_checkpoint_restore_enables_incremental_resume<field_engine>},
     };
     for (auto& t : tests) {
         int before = failures;

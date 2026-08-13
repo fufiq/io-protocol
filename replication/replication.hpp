@@ -106,7 +106,12 @@ namespace replication {
     // Replica side: applies inbound replication traffic for one storage
     // instance/connection pair.
     // =====================================================================
-    template <typename spec>
+    // NOT templated on the storage spec, and deliberately so: every table
+    // interaction below goes through `auto& table`, so this class genuinely
+    // does not depend on which engine is underneath. It carried an unused
+    // <spec> parameter for a while, which claimed a dependency that was not
+    // there and made "does replication work against the field engine?" look
+    // like an open question instead of a compile-time fact.
     class replica_applier {
     public:
         // Feed every message_received event belonging to the replication
@@ -269,7 +274,7 @@ namespace replication {
     // brand-new conn_id, still finds the right resume point), how far it
     // has confirmed applying, and ships whatever's new since then.
     // =====================================================================
-    template <typename spec>
+    // Not templated on the spec either, for the same reason.
     class primary_shipper {
     public:
         // Registers (or re-recognizes, on reconnect) a replica.

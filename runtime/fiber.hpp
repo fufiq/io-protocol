@@ -4,6 +4,26 @@
 // called resume(); scheduler resumes each not-yet-finished fiber in a
 // round-robin pass.
 //
+// ============================================================================
+// LINUX ONLY, and this one is structural rather than untested.
+//
+// makecontext/swapcontext were removed from POSIX in 2008. They are deprecated
+// on macOS and absent from the iOS SDK, so this file cannot be ported by adding
+// shims the way embedded/platform.hpp does - a real port means hand-written
+// per-architecture assembly, which is what Boost.Context is, and pulling in a
+// compiled dependency for it was judged not worth what this file is used for.
+//
+// That is a narrow judgement, not a broad one, because NOTHING ON THE PATH TO A
+// PHONE INCLUDES THIS. storage/ does not, replication/ does not - replication
+// says so in its own header - and the engine and its platform layer are clean.
+// It is used by one test and one demo, both of which exist to show that the
+// glue for a synchronous-commit wait is trivial, which is a thing this project
+// deliberately leaves to the caller.
+//
+// So if an application needs fibers on iOS, it brings its own. This is a
+// demonstration of the pattern, not a runtime anyone is asked to adopt.
+// ============================================================================
+//
 // Honest limitation, unchanged from before: a fiber does NOT turn a
 // blocking syscall (msync, read, etc.) into a non-blocking one by itself -
 // it only gives cooperative stack switching. Calling msync() directly

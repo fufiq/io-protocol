@@ -1,6 +1,7 @@
 #include <doctest/doctest.h>
 
 #include "../net/protocol.hpp"
+#include "../embedded/epoll_udp.hpp"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -41,15 +42,34 @@ sockaddr_in loopback_addr(uint16_t port) {
 // without re-querying protocol_endpoint's own (batch, drain-on-read) queue.
 //
 // Templated purely to pass all three NTTPs through to protocol_endpoint's
-// own: every test uses the library defaults (peer<>) except the ones that
+// own: every test uses the library defaults (peer<tr>) except the ones that
 // specifically need a short interval/timeout to observe something firing
 // within the test's round budget without waiting out the real (multi-
 // second/minute) defaults.
-template <size_t keepalive_interval_ms = 20000, size_t liveness_timeout_ms = 60000, size_t handshake_timeout_ms = 5000>
+// The two transports, so every test below runs on both. What differs is only
+// what a backend needs to exist: io_uring needs a ring to sit on, epoll needs
+// nothing but the socket. Bundling that here is what keeps `peer` from knowing
+// which one it has.
+struct uring_transport {
+    static constexpr const char* name = "io_uring";
+    uring_ring ring{2048};
+    protocol::uring_io io;
+    uring_transport(int fd, const endpoint_config& c)
+        : io(ring, fd, c.send_pool_size, c.recv_num_bufs, c.recv_buf_size) {}
+};
+
+struct epoll_transport {
+    static constexpr const char* name = "epoll";
+    protocol::epoll_udp io;
+    epoll_transport(int fd, const endpoint_config&) : io(fd) {}
+};
+
+template <typename transport = uring_transport,
+          size_t keepalive_interval_ms = 20000, size_t liveness_timeout_ms = 60000, size_t handshake_timeout_ms = 5000>
 struct peer {
     uint16_t port = 0;
     int fd;
-    uring_ring ring;
+    transport tr;
     // crypto::key_pair is move-only (holds a secret_buffer), so it can't be
     // both kept as a member and passed by value into protocol_endpoint's
     // constructor via a copy - generate it once, remember just the
@@ -59,14 +79,12 @@ struct peer {
     // members initialize in declaration order, not list order.
     crypto::key_pair local_keys;
     crypto::public_key static_pub;
-    uring_io io;
-    protocol_endpoint<uring_io, keepalive_interval_ms, liveness_timeout_ms, handshake_timeout_ms> endpoint;
+    protocol_endpoint<decltype(transport::io), keepalive_interval_ms, liveness_timeout_ms, handshake_timeout_ms> endpoint;
     std::vector<event> events;
 
     explicit peer(endpoint_config config = {})
-        : fd(make_bound_udp_socket(&port)), ring(2048), local_keys(crypto::x25519_generate()),
-          static_pub(local_keys.pub), io(ring, fd, config.send_pool_size, config.recv_num_bufs, config.recv_buf_size),
-          endpoint(io, std::move(local_keys), config) {
+        : fd(make_bound_udp_socket(&port)), tr(fd, config), local_keys(crypto::x25519_generate()),
+          static_pub(local_keys.pub), endpoint(tr.io, std::move(local_keys), config) {
         endpoint.arm();
     }
 
@@ -85,9 +103,9 @@ struct peer {
 // rounds so this doesn't spin a whole CPU core needlessly). Loopback round
 // trips are sub-millisecond, so this settles almost immediately for
 // anything that's actually going to succeed. `a`/`b` are `auto&` rather
-// than `peer<>&`: the two sides don't need the same keepalive_interval_ms
-// (the keepalive test below pairs a peer<20> with a peer<>), so this has
-// to accept any instantiation of the peer<> template, not just the default.
+// than `peer<tr>&`: the two sides don't need the same keepalive_interval_ms
+// (the keepalive test below pairs a peer<tr, 20> with a peer<tr>), so this has
+// to accept any instantiation of the peer<tr> template, not just the default.
 bool pump_until(auto& a, auto& b, auto done, int max_rounds = 3000)
     requires std::predicate<decltype(done)>
 {
@@ -120,9 +138,9 @@ const event* find_message(const std::vector<event>& events, uint64_t conn_id) {
 
 } // namespace
 
-TEST_CASE("full handshake establishes sessions on both sides, keyed by the same conn_id") {
-    peer<> server;
-    peer<> client;
+TEST_CASE_TEMPLATE("full handshake establishes sessions on both sides, keyed by the same conn_id", tr, uring_transport, epoll_transport) {
+    peer<tr> server;
+    peer<tr> client;
     uint64_t conn_id = 0xAABBCCDD;
 
     sockaddr_in server_addr = loopback_addr(server.port);
@@ -138,9 +156,9 @@ TEST_CASE("full handshake establishes sessions on both sides, keyed by the same 
     CHECK(server.endpoint.session_count() == 1);
 }
 
-TEST_CASE("handshake_established carries the peer's cryptographically-proven static public key") {
-    peer<> server;
-    peer<> client;
+TEST_CASE_TEMPLATE("handshake_established carries the peer's cryptographically-proven static public key", tr, uring_transport, epoll_transport) {
+    peer<tr> server;
+    peer<tr> client;
     uint64_t conn_id = 42;
 
     sockaddr_in server_addr = loopback_addr(server.port);
@@ -164,9 +182,9 @@ TEST_CASE("handshake_established carries the peer's cryptographically-proven sta
     CHECK(client_side->peer_static == server.static_pub);
 }
 
-TEST_CASE("a single-fragment message sent fire-and-forget arrives intact") {
-    peer<> server;
-    peer<> client;
+TEST_CASE_TEMPLATE("a single-fragment message sent fire-and-forget arrives intact", tr, uring_transport, epoll_transport) {
+    peer<tr> server;
+    peer<tr> client;
     uint64_t conn_id = 1;
 
     sockaddr_in server_addr = loopback_addr(server.port);
@@ -184,12 +202,12 @@ TEST_CASE("a single-fragment message sent fire-and-forget arrives intact") {
     CHECK(received->data == msg);
 }
 
-TEST_CASE("queuing a message before the handshake completes still delivers it once established") {
+TEST_CASE_TEMPLATE("queuing a message before the handshake completes still delivers it once established", tr, uring_transport, epoll_transport) {
     // send_message() before handshake_established used to just fail outright (send_message
     // returned false); now it queues and waits - this is the point of decoupling "produce" from
     // "network readiness."
-    peer<> server;
-    peer<> client;
+    peer<tr> server;
+    peer<tr> client;
     uint64_t conn_id = 6;
 
     sockaddr_in server_addr = loopback_addr(server.port);
@@ -205,9 +223,9 @@ TEST_CASE("queuing a message before the handshake completes still delivers it on
     CHECK(client.endpoint.outgoing_queue_depth(conn_id) == 0);
 }
 
-TEST_CASE("a multi-fragment message reassembles correctly end-to-end") {
-    peer<> server;
-    peer<> client;
+TEST_CASE_TEMPLATE("a multi-fragment message reassembles correctly end-to-end", tr, uring_transport, epoll_transport) {
+    peer<tr> server;
+    peer<tr> client;
     uint64_t conn_id = 2;
 
     sockaddr_in server_addr = loopback_addr(server.port);
@@ -226,9 +244,9 @@ TEST_CASE("a multi-fragment message reassembles correctly end-to-end") {
     CHECK(received->data == msg);
 }
 
-TEST_CASE("a reliable message completes its SACK round-trip (pending drops to zero)") {
-    peer<> server;
-    peer<> client;
+TEST_CASE_TEMPLATE("a reliable message completes its SACK round-trip (pending drops to zero)", tr, uring_transport, epoll_transport) {
+    peer<tr> server;
+    peer<tr> client;
     uint64_t conn_id = 3;
 
     sockaddr_in server_addr = loopback_addr(server.port);
@@ -250,7 +268,7 @@ TEST_CASE("a reliable message completes its SACK round-trip (pending drops to ze
     REQUIRE(pump_until(client, server, [&] { return client.endpoint.reliable_pending_count(conn_id) == 0; }));
 }
 
-TEST_CASE("a responder under load still lets a legitimate client through via the cookie retry") {
+TEST_CASE_TEMPLATE("a responder under load still lets a legitimate client through via the cookie retry", tr, uring_transport, epoll_transport) {
     // threshold=1 means the responder is "under load" starting with this
     // very client's own first handshake attempt (record_attempt runs
     // before the under_load check within the same call) - no separate
@@ -258,8 +276,8 @@ TEST_CASE("a responder under load still lets a legitimate client through via the
     // transparently retry with mac2 once it gets a cookie-reply back.
     endpoint_config server_config;
     server_config.load_threshold_per_sec = 1;
-    peer<> server(server_config);
-    peer<> client;
+    peer<tr> server(server_config);
+    peer<tr> client;
     uint64_t conn_id = 4;
 
     sockaddr_in server_addr = loopback_addr(server.port);
@@ -271,9 +289,9 @@ TEST_CASE("a responder under load still lets a legitimate client through via the
     CHECK(server.endpoint.cookie_replies_sent_count() >= 1);
 }
 
-TEST_CASE("a tampered data packet is rejected by the full stack, not delivered as a message") {
-    peer<> server;
-    peer<> client;
+TEST_CASE_TEMPLATE("a tampered data packet is rejected by the full stack, not delivered as a message", tr, uring_transport, epoll_transport) {
+    peer<tr> server;
+    peer<tr> client;
     uint64_t conn_id = 5;
 
     sockaddr_in server_addr = loopback_addr(server.port);
@@ -303,9 +321,9 @@ TEST_CASE("a tampered data packet is rejected by the full stack, not delivered a
     CHECK(find_message(server.events, conn_id) == nullptr);
 }
 
-TEST_CASE("the reliable congestion window grows on acks and is not exceeded under sustained sends") {
-    peer<> server;
-    peer<> client;
+TEST_CASE_TEMPLATE("the reliable congestion window grows on acks and is not exceeded under sustained sends", tr, uring_transport, epoll_transport) {
+    peer<tr> server;
+    peer<tr> client;
     uint64_t conn_id = 7;
 
     sockaddr_in server_addr = loopback_addr(server.port);
@@ -334,9 +352,9 @@ TEST_CASE("the reliable congestion window grows on acks and is not exceeded unde
     CHECK(received_count == 40);
 }
 
-TEST_CASE("an idle session receives periodic keepalives, invisible to the application") {
-    peer<> server;
-    peer<20> client; // 20ms keepalive_interval_ms: short enough to observe within the test's round budget
+TEST_CASE_TEMPLATE("an idle session receives periodic keepalives, invisible to the application", tr, uring_transport, epoll_transport) {
+    peer<tr> server;
+    peer<tr, 20> client; // 20ms keepalive_interval_ms: short enough to observe within the test's round budget
     uint64_t conn_id = 8;
 
     sockaddr_in server_addr = loopback_addr(server.port);
@@ -356,12 +374,12 @@ TEST_CASE("an idle session receives periodic keepalives, invisible to the applic
     CHECK(server.endpoint.replay_rejected_count() == 0);
 }
 
-TEST_CASE("an unresponsive peer is torn down and reported via peer_unreachable") {
+TEST_CASE_TEMPLATE("an unresponsive peer is torn down and reported via peer_unreachable", tr, uring_transport, epoll_transport) {
     // keepalive_interval_ms=10, liveness_timeout_ms=50: short enough to
     // observe within the test's round budget (protocol_endpoint's own
     // requires clause needs liveness_timeout_ms > keepalive_interval_ms).
-    peer<10, 50> server;
-    peer<> client;
+    peer<tr, 10, 50> server;
+    peer<tr> client;
     uint64_t conn_id = 9;
 
     sockaddr_in server_addr = loopback_addr(server.port);
@@ -391,8 +409,8 @@ TEST_CASE("an unresponsive peer is torn down and reported via peer_unreachable")
     CHECK(ev->peer_static == client.static_pub); // identified by the peer's proven identity, not just the now-dead conn_id
 }
 
-TEST_CASE("a pending handshake whose responder never answers times out with handshake_failed") {
-    peer<20000, 60000, 50> client; // handshake_timeout_ms=50
+TEST_CASE_TEMPLATE("a pending handshake whose responder never answers times out with handshake_failed", tr, uring_transport, epoll_transport) {
+    peer<tr, 20000, 60000, 50> client; // handshake_timeout_ms=50
     uint64_t conn_id = 10;
 
     // A bound-but-otherwise-unused UDP socket: sendto() succeeds (UDP has

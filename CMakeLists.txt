@@ -71,6 +71,9 @@ target_link_libraries(business_demo_heap PRIVATE storage runtime Threads::Thread
 add_executable(replication_demo bench/replication_demo.cpp)
 target_link_libraries(replication_demo PRIVATE replication)
 
+add_executable(shard_scaling bench/shard_scaling.cpp)
+target_link_libraries(shard_scaling PRIVATE storage Threads::Threads)
+
 # --- tests -----------------------------------------------------------------
 include(FetchContent)
 FetchContent_Declare(doctest

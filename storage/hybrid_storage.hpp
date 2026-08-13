@@ -1,4 +1,15 @@
 #pragma once
+// ============================================================================
+// NOT PART OF THE SUPPORTED SURFACE as of the first stable release.
+//
+// The field engine is the one storage this project supports, documents and
+// tests. This file is kept because it works and because its measurements are
+// what justified that choice - deleting it would delete the evidence - but it
+// has no test coverage, no specification, and no compatibility promise. It is
+// still compiled by the benches that use it, so it cannot rot silently.
+//
+// Read it as a record of an experiment, not as an API.
+// ============================================================================
 // hybrid_storage.hpp - one index shape that expresses BOTH previous designs,
 // so the choice between them stops being a choice of engine and becomes a
 // per-record property that the engine can change under load.

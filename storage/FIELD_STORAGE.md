@@ -30,15 +30,19 @@ nothing to fault on. Measured against `storage.hpp` on identical workloads:
 | random update | **254×** faster | **56×** faster |
 | major faults per update | 49 vs 49 | **41 vs 7,986** |
 
-**Choose `storage.hpp` when reads dominate and the data fits in memory.** Its
-record is contiguous, so a read is a pointer: 6,550,781 ops/sec against this
+`storage.hpp` is faster when reads dominate *and* the data fits in memory: its
+record is contiguous, so a read is a pointer - 6,550,781 ops/sec against this
 engine's 1,541,045. That advantage disappears entirely once the data stops
-fitting - out of RAM the two converge (4,747 vs 5,731), because every read is a
+fitting: out of RAM the two converge (4,747 vs 5,731), because every read is a
 fault either way.
 
-**Choose `cached_storage.hpp` if you want both**, sized by one number. It is
-this engine plus a bounded materialization that is a *cache* rather than a
-home; `cache_bytes == 0` degenerates to this engine byte for byte.
+**This engine is the only storage the project supports.** `storage.hpp` remains
+because the field engine is built on its record format, checksums and concepts,
+and it keeps its own tests and its own specification in `HEAP_API.md`.
+`cached_storage.hpp` and `hybrid_storage.hpp` were the two experiments that
+decided this, and they are kept for the same reason a lab notebook is kept -
+they have no tests, no specification and no compatibility promise. Do not build
+on them.
 
 ## 1. Declaring one
 
@@ -499,14 +503,16 @@ void prefetch(record_id) const noexcept;
 bool pin_index() noexcept;
 ```
 
-Three backends implement the same `read_many(engine, ids, out, stride)` - batch
-in, batch out, so the backend is swappable and nothing leaks outward.
+Three backends were written against the same `read_many(engine, ids, out,
+stride)` - batch in, batch out, so the backend is swappable and nothing leaks
+outward. **Only `prefetch_gather.hpp` is supported**; the two Linux-specific
+ones are kept as the measurement that retired them.
 
 | | portability | measured, 512 MB under a 320 MB cap |
 |---|---|---|
 | `prefetch_gather.hpp` | **POSIX, no threads, no pread** | **156,597** |
-| `direct_gather.hpp` | Linux (io_uring + O_DIRECT) | 148,121 |
-| `uring_gather.hpp` | Linux (io_uring) | 99,365 |
+| `direct_gather.hpp` *(unsupported)* | Linux (io_uring + O_DIRECT) | 148,121 |
+| `uring_gather.hpp` *(unsupported)* | Linux (io_uring) | 99,365 |
 | plain `get()` in a loop | anywhere | 1,082 |
 
 **`prefetch_gather` is the one to reach for.** It is a single

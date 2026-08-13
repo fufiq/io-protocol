@@ -1,5 +1,13 @@
 # HEAP_API.md - `storage.hpp` specification
 
+> **Status: supported as a dependency, not as a choice.** `field_storage.hpp` is
+> the engine this project recommends and the one `README.md` points at - see
+> `FIELD_STORAGE.md` §0 for the measurements that decided it. `storage.hpp`
+> stays supported and tested because the field engine is built on its record
+> format, checksums and concepts, and because it is genuinely faster for
+> read-dominated data that fits in memory. New work should start with the field
+> engine unless that last sentence describes it exactly.
+
 > A single append-only storage over mmap, storing any number of types without
 > upfront registration. Strictly single-threaded except for one explicit,
 > narrow exception (`background_compact`, see §7). Opens a file itself only

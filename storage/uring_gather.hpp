@@ -1,4 +1,15 @@
 #pragma once
+// ============================================================================
+// NOT PART OF THE SUPPORTED SURFACE as of the first stable release.
+//
+// The field engine is the one storage this project supports, documents and
+// tests. This file is kept because it works and because its measurements are
+// what justified that choice - deleting it would delete the evidence - but it
+// has no test coverage, no specification, and no compatibility promise. It is
+// still compiled by the benches that use it, so it cannot rot silently.
+//
+// Read it as a record of an experiment, not as an API.
+// ============================================================================
 // uring_gather.hpp - reading records through io_uring instead of through the
 // mapping, so that more than one read can be outstanding at a time.
 //

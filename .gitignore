@@ -9,3 +9,10 @@ compile_commands.json
 
 # Telegram export used for research, 147 MB of chat logs
 chats/
+
+# Engine data files. *.db was here; the replication demo writes *.db.data
+# alongside it, and two 16 MB blobs reached a commit before anyone noticed.
+*.db.data
+*.log
+*.idx
+*.ckp

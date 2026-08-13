@@ -80,6 +80,11 @@ namespace {
     bool do_sync = false;
     std::chrono::microseconds barrier_us{1000};
     std::size_t barrier_ops = 1000;
+    // LMDB's durability unit is the transaction - there is no way to make half
+    // a transaction durable. So in the sync column its barrier IS its commit,
+    // and this is how many operations one transaction holds. It is the knob
+    // that sets LMDB's crash window, the way barrier_ops/barrier_us sets ours.
+    std::size_t lmdb_commit_ops = 10'000;
 
     // One barrier per barrier_us at most. The clock is read on every operation
     // - clock_gettime is a vDSO call of a few tens of nanoseconds, so at 200000
@@ -124,10 +129,6 @@ namespace {
     using inplace_spec = storage::storage_spec<storage::durability::local_sync, "vm_ip.db", log_capacity,
                                                "", "vm_ip.idx", "", max_ids>;
     using field_bench = storage::field_spec<"vm_fd.log", log_capacity, "vm_fd.idx", max_ids, 400'000, 8, value_bytes>;
-
-    double secs(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
-        return std::chrono::duration<double>(b - a).count();
-    }
 
     struct xorshift {
         uint64_t s;
@@ -420,13 +421,21 @@ namespace {
         // fill. The map is address space, not disk - the file grows to what is
         // actually used - so it costs nothing to leave headroom.
         lmdb_check(mdb_env_set_mapsize(env, 2560ull << 20), "set_mapsize");
-        // MDB_WRITEMAP so writes go through the mapping rather than through
-        // write(), which is what makes the fault counts comparable to ours.
         // No MDB_WRITEMAP: with it LMDB writes through the mapping, which its
         // own documentation calls unrecoverable after a system crash when
         // combined with MDB_NOSYNC. It was originally set to make major-fault
         // counts comparable to ours; the comparison being fair matters more.
-        const unsigned flags = MDB_NOSYNC | MDB_NOMETASYNC;
+        //
+        // In the sync column the flags are ZERO - LMDB's own default, where
+        // mdb_txn_commit fsyncs the data file and then the meta page. An
+        // earlier version of this benchmark kept MDB_NOSYNC|MDB_NOMETASYNC in
+        // both columns and fired mdb_env_sync on the shared barrier clock. That
+        // was not durability: the barrier landed between commits, on a file
+        // nothing had been written to since the last one, so it flushed nothing
+        // and cost nothing. It read as LMDB paying 5% for durability when in
+        // fact it was paying for none. The crash window there was one
+        // transaction - 10000 records - against our 27.
+        const unsigned flags = do_sync ? 0u : (MDB_NOSYNC | MDB_NOMETASYNC);
         lmdb_check(mdb_env_open(env, "vm_lmdb", flags, 0644), "env_open");
 
         MDB_txn* txn = nullptr;
@@ -444,14 +453,14 @@ namespace {
             uint64_t k = be_key(i + 1);
             MDB_val mk{ sizeof(k), &k }, mv{ sizeof(b), &b };
             lmdb_check(mdb_put(txn, dbi, &mk, &mv, MDB_APPEND), "put");
-            if ((i + 1) % 10000 == 0) {          // same transaction shape in both columns
-                lmdb_check(mdb_txn_commit(txn), "commit");
+            if ((i + 1) % lmdb_commit_ops == 0) {
+                lmdb_check(mdb_txn_commit(txn), "commit");   // durable here iff flags == 0
                 lmdb_check(mdb_txn_begin(env, nullptr, 0, &txn), "txn_begin");
+                ++bc.fired;
             }
-            if (bc.due()) mdb_env_sync(env, 1);  // and the flush only when asked for
         }
         lmdb_check(mdb_txn_commit(txn), "commit");
-        if (do_sync) mdb_env_sync(env, 1);
+        ++bc.fired;
         row("fill", n_records, m, bc.fired);
 
         xorshift rng(9);
@@ -479,14 +488,14 @@ namespace {
                 MDB_val nv{ sizeof(cur), &cur };
                 lmdb_check(mdb_put(txn, dbi, &mk, &nv, 0), "put_upd");
             }
-            if ((i + 1) % 10000 == 0) {
+            if ((i + 1) % lmdb_commit_ops == 0) {
                 lmdb_check(mdb_txn_commit(txn), "commit");
                 lmdb_check(mdb_txn_begin(env, nullptr, 0, &txn), "txn_begin");
+                ++bc.fired;
             }
-            if (bc.due()) mdb_env_sync(env, 1);
         }
         lmdb_check(mdb_txn_commit(txn), "commit");
-        if (do_sync) mdb_env_sync(env, 1);
+        ++bc.fired;
         row("random update", n_ops, m, bc.fired);
         (void)sink;
 
@@ -510,6 +519,7 @@ int main(int argc, char** argv) {
     n_ops = argc > 4 ? (std::size_t)std::strtoull(argv[4], nullptr, 10) : 10'000;
     barrier_us = std::chrono::microseconds(argc > 5 ? std::strtoull(argv[5], nullptr, 10) : 1000);
     barrier_ops = argc > 6 ? (std::size_t)std::strtoull(argv[6], nullptr, 10) : 1000;
+    lmdb_commit_ops = argc > 7 ? (std::size_t)std::strtoull(argv[7], nullptr, 10) : 10'000;
     n_records = (std::size_t)(mb * 1048576.0 / value_bytes);
     if (n_records >= max_ids) { std::printf("too many records for max_ids\n"); return 1; }
 
@@ -534,7 +544,7 @@ int main(int argc, char** argv) {
 #endif
 #ifdef HAVE_POSTGRES
     } else if (engine == "pg") {
-        run_postgres(argc > 7 ? argv[7] : "host=/var/run/postgresql port=5433 user=postgres dbname=postgres");
+        run_postgres(argc > 8 ? argv[8] : "host=/var/run/postgresql port=5433 user=postgres dbname=postgres");
 #endif
     } else {
         std::printf("unknown engine: %s\n", engine.c_str());

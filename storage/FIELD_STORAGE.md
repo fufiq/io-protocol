@@ -303,11 +303,75 @@ barriers over 204,800 inserts and 9.4 s of iowait.
 **Use both bounds, whichever fires first**: N operations *or* N microseconds.
 The count bounds what a crash can lose; the time bounds how long a writer waits.
 With 1,000 ops or 200 µs, the same workload fired 1,399 barriers and durable
-updates went from 20,569 to 642,689 ops/sec.
+updates went from 20,569 to 642,689 ops/sec. That pair is right *for updates*,
+which dirty tens of bytes each - it is not a default. See below.
 
 ```cpp
 if (++since >= batch || now - last >= interval) { table.sync(); since = 0; last = now; }
 ```
+
+### The interval belongs to the workload, not to the engine
+
+The 1,000-ops-or-200 µs pair above was tuned on the *update* path, where an
+update dirties tens of bytes. On the *fill* path, where every operation dirties
+a full 1 KB record, the same pair collapses: the count never fires, the timer
+always does, and `sync()` itself costs about 150 µs of the 200. Measured at 1 GB
+of 1 KB records:
+
+| interval | ops/sec | barriers | records per barrier |
+|---|---|---|---|
+| 200 µs | 100,903 | 38,129 | 27 |
+| 500 µs | 189,279 / 167,047 | ~8,400 | ~120 |
+| 1 ms | 201,972 / 202,372 | ~4,080 | ~250 |
+| 2 ms | 222,126 / 216,949 / 201,575 | ~2,000 | ~510 |
+| 5 ms | 227,051 / 225,551 / 221,645 | ~800 | ~1,280 |
+| 20 ms | 230,112 / 238,694 / 222,126 | ~207 | ~4,950 |
+| none | 236,231 | 0 | - |
+
+From 1 ms outward the curve is **flat**, and that is the point rather than an
+accident: past 64 KB per barrier the cost is bandwidth, and the bandwidth is the
+same gigabyte however it is sliced. Tightening the window is nearly free down to
+about 250 records; below that `sync()` starts eating its own interval.
+
+Do not carry an interval from one phase to another. Size it so that a barrier's
+dirty tail clears 64 KB - `interval × expected_bytes_per_op` - and let the count
+cap bound the crash window.
+
+### 8a. Against a B+tree, at the same crash window
+
+The comparison that matters is not ops/sec, it is **ops/sec at a stated crash
+window**, since either engine buys throughput by widening it. LMDB opened at its
+default (`flags = 0`, so `mdb_txn_commit` fsyncs the data file and then the meta
+page), its transaction size swept the way our interval is swept above:
+
+| records per durable point | field | LMDB |
+|---|---|---|
+| ~100 | 189,279 / 167,047 | **76,000** |
+| ~500 | 222,126 / 216,949 | **161,260** |
+| ~1,000 | 226,000 | 198,057 |
+| ~5,000 | 230,112 / 238,694 | 235,402 / 244,976 |
+| 10,000 | - | 229,862 |
+| no durability | 236,231 | 237,283 |
+
+Undurable, the two engines are the same speed. They diverge only in how the cost
+of durability scales, and they scale differently because they pay for different
+things:
+
+- **LMDB pays per commit.** A commit copy-on-writes every B+tree page on the
+  path to each modified leaf, writes them, fsyncs, then writes and fsyncs the
+  meta page. That cost barely depends on how many records the transaction held,
+  so halving the window nearly doubles the overhead. There is no way to make
+  half a transaction durable - the transaction *is* the unit.
+- **This engine pays per byte.** `sync()` flushes the dirty tail, and the tail
+  over a whole fill is the same gigabyte at any spacing. The durable unit is a
+  byte offset in the log, not a transaction, so a barrier can be placed anywhere
+  in the append stream.
+
+They cross at roughly 5,000 records per durable point. Wider than that, a
+B+tree is at least as fast and the append log's advantage is elsewhere
+(§14's update row). Narrower, the gap opens: at a 100-record window this engine
+is **2.4x** faster, and that is the regime a tight durability requirement puts
+you in.
 
 ### What a checksum does not prove
 
@@ -676,8 +740,10 @@ An in-place update read 94,969 ops/sec over 5,000 operations and 11,012 over
 
 ## 14. Measured
 
-VPS: 1 core, 960 MB RAM, swap off, QEMU virtio disk. 1 KB records. Barrier: 1,000
-operations or 200 µs. One process per cell, page cache dropped between them.
+VPS: 1 core, 960 MB RAM, swap off, QEMU virtio disk. 1 KB records. One process
+per cell, page cache dropped between them. Update rows use a 1,000-op or 200 µs
+barrier; the fill rows state their own crash window, because at 1 KB per
+operation that barrier is the wrong one (§8a).
 
 | | field | `storage.hpp` | LMDB |
 |---|---|---|---|
@@ -688,8 +754,9 @@ operations or 200 µs. One process per cell, page cache dropped between them.
 | random read, in RAM | 1,541,045 | **6,550,781** | 827,178 |
 | random read, out of RAM | **5,731** | 4,747 | 3,812 |
 | random read, out of RAM, batched with `prefetch_gather` | **7,726** | - | - |
-| fill | 303,751 | 146,760 | **331,151** |
-| durable fill | 151,741 | 92,037 | **315,116** |
+| fill, no durability | 236,231 | 146,760 | 237,283 |
+| durable fill, 500-record crash window | **217,000** | - | 162,000 |
+| durable fill, 5,000-record crash window | 230,000 | - | **240,000** |
 | on disk per 1 GB of data | **1.05 GB** | 2.1 GB | 1.34 GB |
 
 The update row is the design. Read it in the two columns beside it rather than
@@ -704,6 +771,13 @@ The batched row is not comparable to the two beside it - no other engine here
 exposes a batch read - and it is measured against its own cold pass in the same
 process, not against the row above it. See §11 for the pair and the caveat that
 it is a cost when the data is resident.
+
+The two durable fill rows must be read as a pair, because a single one of them
+is meaningless without the crash window it was measured at. An earlier version
+of this table had one `durable fill` row that put us at 151,741 against LMDB's
+315,116, and it was wrong twice over: LMDB was open with
+`MDB_NOSYNC|MDB_NOMETASYNC` and so was not durable at all, and our barrier was
+placed where it degenerated. Both are fixed. See §8a.
 
 ## 15. Out of scope
 

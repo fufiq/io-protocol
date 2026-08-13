@@ -42,6 +42,36 @@ namespace {
     std::size_t records_per_shard = 20'000;
     std::size_t updates_per_shard = 200'000;
 
+    // Durability, swept alongside the shard count, because whether it scales is
+    // a separate question from whether the writers do.
+    //
+    // There are two reasons to expect it might, and one to expect it might not.
+    // For: every shard owns its own log file, so the per-inode commit that §8
+    // warns about does not couple them, and the logs are posix_fallocate'd, so
+    // an append never extends i_size and never needs a metadata journal commit.
+    // Against: there is one device and one filesystem journal underneath all of
+    // them, and that is exactly where concurrent syncs would serialise.
+    //
+    // 2000 operations at 32 bytes each is 64 KB of dirty tail per barrier,
+    // which is the floor §13 asks for.
+    //
+    // THE COUNT IS THE ONLY BOUND HERE, deliberately, and the time bound is
+    // parked out of reach. Production wants both - the count bounds what a
+    // crash loses, the time bounds how long a writer waits - but a time bound
+    // makes this particular measurement meaningless. Run with 2000 ops or 1 ms,
+    // sixteen shards fired 968,907 barriers over 3.2M updates: one per 3.3
+    // operations. That is the §8 degeneration, and it happens because msync
+    // under sixteen concurrent writers takes far longer than 1 ms, so the check
+    // right after a barrier always finds the interval already expired. It
+    // measures the collapse, not the scaling.
+    //
+    // Fixed at 2000 operations, every shard has the same crash window at every
+    // shard count, and the barrier count is 100 per shard by construction. Then
+    // the only thing left moving is the device.
+    bool do_sync = false;
+    std::size_t barrier_ops = 2000;
+    std::chrono::microseconds barrier_us{std::chrono::hours(1)};
+
     struct blob {
         static constexpr storage::tag_t tag = 1;
         uint64_t key, counter, f1, f2;
@@ -68,9 +98,10 @@ namespace {
     // a cost of the mechanism under test.
     struct alignas(64) tally {
         std::size_t updates = 0;
+        std::size_t barriers = 0;
         double update_seconds = 0;
         bool ok = false;
-        char pad[64 - sizeof(std::size_t) - sizeof(double) - sizeof(bool)] = {};
+        char pad[64 - 2 * sizeof(std::size_t) - sizeof(double) - sizeof(bool)] = {};
     };
 
     // Pinning to CPU n for shard n is wrong on any machine with SMT, and wrong
@@ -158,11 +189,23 @@ namespace {
         gate.arrive_and_wait();
 
         const auto t0 = std::chrono::steady_clock::now();
-        for (std::size_t i = 0; i < updates_per_shard; ++i)
+        auto last = t0;
+        std::size_t since = 0, fired = 0;
+        for (std::size_t i = 0; i < updates_per_shard; ++i) {
             t->template update<&blob::counter>(ids[rng.range(records_per_shard)], (uint64_t)i);
+            if (!do_sync) continue;
+            const auto now = std::chrono::steady_clock::now();
+            if (++since < barrier_ops && now - last < barrier_us) continue;
+            t->sync();
+            since = 0;
+            last = now;
+            ++fired;
+        }
+        if (do_sync) { t->sync(); ++fired; }
         out.update_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
         out.updates = updates_per_shard;
+        out.barriers = fired;
         out.ok = true;
     }
 
@@ -186,44 +229,57 @@ namespace {
         }
     }
 
+    // Swept finely around the physical core count, because two different things
+    // bend this curve and a coarse sweep cannot tell them apart: running out of
+    // physical cores, and running out of memory bandwidth.
+    void sweep() {
+        double one = 0;
+        for (std::size_t n : { 1u, 2u, 4u, 6u, 8u, 10u, 12u, 16u }) {
+            if (n > max_shards) break;
+            cleanup();
+            std::vector<tally> out(max_shards);
+            std::barrier gate((std::ptrdiff_t)n);
+
+            spawn(n, out, gate, std::make_index_sequence<max_shards>{});
+
+            // The slowest shard is the parallel duration: they start together
+            // at the barrier, so taking the max is what "how long did this take
+            // with n writers running" means. Averaging would flatter it.
+            std::size_t total = 0, live = 0, barriers = 0;
+            double wall = 0;
+            for (std::size_t i = 0; i < n; ++i) {
+                total += out[i].updates;
+                barriers += out[i].barriers;
+                live += out[i].ok ? 1 : 0;
+                wall = std::max(wall, out[i].update_seconds);
+            }
+            if (live != n) { std::printf("  %zu of %zu shards failed to map\n", n - live, n); break; }
+
+            const double rate = total / wall;
+            if (n == 1) one = rate;
+            std::printf("%7zu %14.0f %12.0f %8.2fx %10zu\n", n, rate, rate / n, rate / one, barriers);
+            std::fflush(stdout);
+        }
+    }
+
 } // namespace
 
 int main(int argc, char** argv) {
     if (argc > 1) updates_per_shard = (std::size_t)std::strtoull(argv[1], nullptr, 10);
     if (argc > 2) records_per_shard = (std::size_t)std::strtoull(argv[2], nullptr, 10);
+    if (argc > 3) barrier_ops = (std::size_t)std::strtoull(argv[3], nullptr, 10);
+    if (argc > 4) barrier_us = std::chrono::microseconds(std::strtoull(argv[4], nullptr, 10));
 
     std::printf("# %u hardware threads, %zu records and %zu updates per shard, %zu-byte records\n",
                 std::thread::hardware_concurrency(), records_per_shard, updates_per_shard, value_bytes);
-    std::printf("%7s %14s %12s %9s\n", "shards", "updates/sec", "per shard", "scaling");
 
-    double one = 0;
-    // Swept finely around the physical core count, because two different
-    // things bend this curve and a coarse sweep cannot tell them apart:
-    // running out of physical cores, and running out of memory bandwidth.
-    for (std::size_t n : { 1u, 2u, 4u, 6u, 8u, 10u, 12u, 16u }) {
-        if (n > max_shards) break;
-        cleanup();
-        std::vector<tally> out(max_shards);
-        std::barrier gate((std::ptrdiff_t)n);
-
-        spawn(n, out, gate, std::make_index_sequence<max_shards>{});
-
-        // The slowest shard is the parallel duration: they start together at
-        // the barrier, so taking the max is what "how long did this take with
-        // n writers running" means. Averaging would flatter the result.
-        std::size_t total = 0, live = 0;
-        double wall = 0;
-        for (std::size_t i = 0; i < n; ++i) {
-            total += out[i].updates;
-            live += out[i].ok ? 1 : 0;
-            wall = std::max(wall, out[i].update_seconds);
-        }
-        if (live != n) { std::printf("  %zu of %zu shards failed to map\n", n - live, n); break; }
-
-        const double rate = total / wall;
-        if (n == 1) one = rate;
-        std::printf("%7zu %14.0f %12.0f %8.2fx\n", n, rate, rate / n, rate / one);
-        std::fflush(stdout);
+    for (int pass = 0; pass < 2; ++pass) {
+        do_sync = pass == 1;
+        std::printf("\n# %s\n", do_sync
+            ? "durable: every shard syncs its own log every 2000 updates (fixed crash window)"
+            : "no durability barrier");
+        std::printf("%7s %14s %12s %9s %10s\n", "shards", "updates/sec", "per shard", "scaling", "barriers");
+        sweep();
     }
 
     cleanup();

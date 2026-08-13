@@ -2313,7 +2313,9 @@ namespace storage {
         ~field_storage() {
             if (head && index_pinned) ::munlock(head, spec::index_bytes);
             if (head) ::munmap(head, spec::index_bytes);
-            if (base) ::munmap(base, spec::capacity);
+            // Only if it IS a mapping. compact() can hand the engine a region
+            // it did not map - see the base_is_mapped comment there.
+            if (base && base_is_mapped) ::munmap(base, spec::capacity);
             if (index_fd >= 0) ::close(index_fd);
             if (fd >= 0) ::close(fd);
         }
@@ -2879,7 +2881,21 @@ namespace storage {
         //
         // -1 keeps the old behaviour, which is right for scratch that is not a
         // file: a vector, or an anonymous mapping, as the tests use.
-        void compact(std::byte* scratch_base, int scratch_fd = -1) {
+        //
+        // scratch_is_mapped is what the destructor needs to know, and getting it
+        // wrong crashed on Android before it crashed anywhere else. compact()
+        // ADOPTS scratch_base as the engine's base, and the destructor used to
+        // munmap that unconditionally - so handing it a std::vector meant
+        // munmap() on the heap. glibc tolerated it well enough that the test
+        // passed for months; bionic on a 16 KB-page device turned it into a
+        // SIGSEGV, which is the honest reaction.
+        //
+        // It defaults to false because a vector is the common case in this
+        // repo's own tests, and because the wrong answer in that direction
+        // leaks a mapping while the wrong answer in the other corrupts the
+        // heap. A caller passing a real mmap should say so; passing a file
+        // descriptor implies it.
+        void compact(std::byte* scratch_base, int scratch_fd = -1, bool scratch_is_mapped = false) {
             std::size_t scratch_offset = 0;
             alignas(8) std::byte scratch[spec::max_record_bytes];
             std::size_t live = 0;
@@ -2894,10 +2910,11 @@ namespace storage {
                 slots[id].base = (std::size_t)(placed - scratch_base);
                 live += len;
             }
-            if (base && base != scratch_base) ::munmap(base, spec::capacity);
+            if (base && base_is_mapped && base != scratch_base) ::munmap(base, spec::capacity);
             if (fd >= 0 && fd != scratch_fd) ::close(fd);
             fd = scratch_fd;
             base = scratch_base;
+            base_is_mapped = scratch_is_mapped || scratch_fd >= 0;
             write_offset = scratch_offset;
             last_synced = 0;
             head->live_byte_count = live;
@@ -3296,6 +3313,9 @@ namespace storage {
         std::vector<std::pair<std::size_t, record_id>> sweep;
         bool from_checkpoint = false;
         bool index_pinned = false;
+        // The constructor maps `base`; compact() may replace it with a region
+        // the caller owns and the engine must not unmap.
+        bool base_is_mapped = true;
         int fd = -1, index_fd = -1;
 
         // Resolved once in the constructor, from storage_paths or from the

@@ -7,7 +7,7 @@ the seam - it is the only component that touches both.
 
 | | what it is | depends on | platforms |
 |---|---|---|---|
-| `storage/` | the field-granular engine | nothing but libstdc++ and POSIX | Linux, Android; macOS/iOS unverified |
+| `storage/` | the field-granular engine | nothing but libstdc++ and POSIX | Linux, Android tested; macOS/iOS unverified |
 | `embedded/` | the four system calls that differ per platform | as above | as above |
 | `replication/` | WAL shipping and snapshot bootstrap | `net/` | Linux |
 | `net/` | the UDP transport, levels 1-7 | `liburing`, `libsodium` | Linux |
@@ -288,18 +288,32 @@ rather than that the calls returned zero.
 | | compiles | tests run |
 |---|---|---|
 | Linux x86-64 | yes | yes - `ctest`, Release and ASan/UBSan |
-| Android arm64 | **yes**, NDK r27 clang, API 24 | no - no device or emulator here |
+| Android x86-64, **16 KB pages** | yes | **yes** - 87 cases, 6,326 assertions, on an emulator |
+| Android arm64 | yes, NDK r27 clang | no device here; both CRC paths checked in the emitted code |
 | macOS / iOS | **no** - no Darwin toolchain here | no |
 
-Android is a real build, not an argument: the amalgamated header compiles clean
-for `aarch64-linux-android24`, and both CRC paths are exercised - the default
-`armv8-a` target selects the software fallback, `-march=armv8-a+crc` emits 74
-`crc32c` instructions. Two things had to be fixed to get there, and neither
-would have been found by reasoning: `crc32c` was x86-only, and `std::atomic_ref`
-does not exist in the NDK's libc++ (LLVM 19 added it; r27 ships 18), so the
-engine now falls back to the compiler's `__atomic_*` builtins - a path `ctest`
-runs here via `STORAGE_FORCE_ATOMIC_BUILTINS`, because a branch that only
-executes on a phone is one nobody has watched work.
+```sh
+tools/android_test.sh          # needs an NDK and a device or emulator on adb
+```
+
+The Android run is the whole engine suite plus `platform_check` and the
+single-header smoke test, on an image with **16 KB pages** - which is the
+configuration that makes the page-size assumption a real bug rather than a
+theoretical one. Four things had to be fixed to get there and not one of them
+would have been found by reasoning:
+
+- `crc32c` used SSE4.2 intrinsics, so nothing ARM compiled at all;
+- `std::atomic_ref` does not exist in the NDK's libc++ (LLVM 19 added it, r27
+  ships 18), so the engine falls back to `__atomic_*` builtins - a path `ctest`
+  runs here via `STORAGE_FORCE_ATOMIC_BUILTINS`, because a branch that only
+  executes on a phone is one nobody has watched work;
+- `compact()` adopts the caller's scratch region as the engine's base, and the
+  destructor unmapped it unconditionally - so passing a `std::vector`, which
+  this repo's own tests do, meant `munmap()` on the heap. glibc tolerated it for
+  months; bionic turned it into a SIGSEGV, which is the honest reaction;
+- a test type named `user` is ambiguous against bionic's `struct user`.
+
+Two of those were engine bugs that Linux was hiding.
 
 **The Darwin paths are unverified**, and that is the honest gap in this release.
 They were written against Apple's documented behaviour and reviewed, never

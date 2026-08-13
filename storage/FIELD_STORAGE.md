@@ -351,18 +351,24 @@ window**, since either engine buys throughput by widening it. LMDB opened at its
 default (`flags = 0`, so `mdb_txn_commit` fsyncs the data file and then the meta
 page), its transaction size swept the way our interval is swept above:
 
-| records per durable point | field | LMDB |
-|---|---|---|
-| ~100 | 189,279 / 167,047 | **76,000** |
-| ~500 | 222,126 / 216,949 | **161,260** |
-| ~1,000 | 226,000 | 198,057 |
-| ~5,000 | 230,112 / 238,694 | 235,402 / 244,976 |
-| 10,000 | - | 229,862 |
-| no durability | 236,231 | 237,283 |
+| records per durable point | field | LMDB | ObjectBox |
+|---|---|---|---|
+| ~100 | 189,279 / 167,047 | 76,000 | **69,707** |
+| ~500 | 222,126 / 216,949 | 161,260 | **116,629** |
+| ~1,000 | 226,000 | 198,057 | **134,207** |
+| ~5,000 | 230,112 / 238,694 | 235,402 / 244,976 | - |
+| 10,000 | - | 229,862 | **171,491** |
+| no durability | 236,231 | 237,283 | *not offered* |
 
-Undurable, the two engines are the same speed. They diverge only in how the cost
-of durability scales, and they scale differently because they pay for different
-things:
+ObjectBox has no undurable cell because it has no undurable mode:
+`OBXWalFlags_NoSyncFile` is the obvious `MDB_NOSYNC` analogue but refuses to
+open - "WAL is not yet supported by disk based DB provider" as of 5.3.2. Every
+commit syncs. That is a defensible default and worth stating plainly rather than
+scoring against it.
+
+Undurable, this engine and LMDB are the same speed. They diverge only in how the
+cost of durability scales, and they scale differently because they pay for
+different things:
 
 - **LMDB pays per commit.** A commit copy-on-writes every B+tree page on the
   path to each modified leaf, writes them, fsyncs, then writes and fsyncs the
@@ -379,6 +385,56 @@ B+tree is at least as fast and the append log's advantage is elsewhere
 (§14's update row). Narrower, the gap opens: at a 100-record window this engine
 is **2.4x** faster, and that is the regime a tight durability requirement puts
 you in.
+
+## 8b. Against ObjectBox, whole-object versus field
+
+ObjectBox is the whole-object design built properly: FlatBuffers objects in one
+mmap'd store, MVCC readers that never block, a B+tree index, ACID commits. It is
+the closest commercial thing to what this engine argues against, so it is the
+sharper test than LMDB.
+
+All three engines below ran at an **identical 10,000-record crash window** - 21
+barriers each at 200 MB, 103 each at 1 GB - on the same VPS, one process per
+cell, page cache dropped between.
+
+**200 MB, fits in RAM:**
+
+| | field | LMDB | ObjectBox |
+|---|---|---|---|
+| fill | 244,108 | **278,683** | 137,935 |
+| random read | **1,226,741** | 684,709 | 321,006 |
+| random update | **1,966,920** | 9,331 | 8,621 |
+| iowait during the update phase | **0.00 s** | 16.98 s | 18.39 s |
+
+**1 GB on 960 MB of RAM, out of RAM:**
+
+| | field | LMDB | ObjectBox |
+|---|---|---|---|
+| fill | 245,035 | **272,346** | 171,491 |
+| random read | **5,073** | 3,759 | 2,525 |
+| random update | **914,689** | 2,572 | 2,033 |
+| major faults over 50,000 updates | **43** | 29,116 | 37,026 |
+| iowait during the update phase | **0.01 s** | 12.89 s | 15.92 s |
+| on disk per 1 GB of data | **1.05 GB** | 1.34 GB | 2.11 GB |
+
+**The update column is 228x in RAM and 450x out of it**, and the row underneath
+says why both times: 43 major faults against 37,026, and no iowait against 16
+seconds of it. FlatBuffers has no partial write, so changing eight bytes of a
+1 KB object carries the whole object back through the builder and lands it on a
+page that has to be found, faulted and written. Appending the eight bytes
+touches no page of the record.
+
+**The read result contradicted the prediction that motivated the measurement.**
+Zero-copy FlatBuffers over mmap was expected to beat a design that copies every
+record out, and instead it lost by 3.8x in RAM. The copy was never the cost: a
+1 KB memcpy is tens of nanoseconds, while finding the object is a B+tree descent
+of several cache misses against one indexed load into a resident slot array.
+Zero-copy optimises the part that was already cheap.
+
+Where ObjectBox is genuinely ahead is not in this table: **MVCC**, so its
+readers never wait for a writer, against this engine's two narrow windows
+(§12). For a workload with readers concurrent with writes, that difference can
+outweigh every number above.
 
 ## 9. Recovery, checkpoint, restart
 

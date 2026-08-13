@@ -105,9 +105,28 @@ if(ENABLE_SANITIZERS)
     endforeach()
 endif()
 
+# --- single-header distribution ------------------------------------------
+# The engine is already header-only; what dist/ removes is the directory
+# layout, since field_storage.hpp reaches ../embedded/platform.hpp by relative
+# path and so cannot be copied alone.
+#
+# Two things keep it honest, and both are ctest cases below rather than a note
+# in a README: amalgam_current regenerates and diffs, so a stale copy fails the
+# build; amalgam_smoke compiles against dist/ ONLY - no -I into storage/ - so a
+# generator that drops a file or mangles a guard stops compiling.
+add_custom_target(amalgamate
+    COMMAND ${CMAKE_SOURCE_DIR}/tools/amalgamate.py
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMENT "Regenerating dist/field_storage.hpp")
+
+add_executable(amalgam_smoke tools/amalgam_smoke.cpp)
+target_include_directories(amalgam_smoke PRIVATE ${CMAKE_SOURCE_DIR}/dist)
+
 enable_testing()
 add_test(NAME unit_tests COMMAND unit_tests)
 add_test(NAME replication_tests COMMAND replication_tests)
+add_test(NAME amalgam_current COMMAND ${CMAKE_SOURCE_DIR}/tools/amalgamate.py --check)
+add_test(NAME amalgam_smoke COMMAND amalgam_smoke)
 
 # runtime/fiber.hpp switches stacks with ucontext, which ASan cannot follow: its
 # stack-use-after-return "fake stack" gets confused when a real stack pointer

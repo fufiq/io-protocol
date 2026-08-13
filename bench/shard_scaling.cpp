@@ -1,30 +1,33 @@
 // shard_scaling.cpp - does one writer per shard actually scale with cores?
 //
-// The claim being tested is narrow and falsifiable: N independent
-// field_storage instances, one thread each, share nothing, and therefore
-// should scale close to linearly until memory bandwidth stops it. If that is
-// wrong - if there is hidden contention, in the allocator, the page cache, or
-// the kernel's mmap handling - the curve will bend and this will show it.
+// SHARDING IS NOT A FEATURE OF THE ENGINE. It is N instances of one spec with N
+// sets of paths, and this file is the whole implementation of it: a vector of
+// field_storage, a thread each, and nothing shared. That is the claim being
+// tested - that nothing is shared - and it is falsifiable: every `static` in
+// field_storage.hpp is a pure function, every scratch buffer is a local, and
+// all mutable state lives behind the instance's own two mappings. If that were
+// wrong, or if there were hidden contention in the allocator, the page cache or
+// the kernel's mmap handling, the curve would bend and this would show it.
 //
-// Every thread owns its shard outright. No routing, no queue, no atomics on
-// the hot path: routing by key belongs in the layer above and would measure
-// the router rather than the engine.
+// No routing and no queue: which key goes to which shard belongs in the layer
+// above, and putting it here would measure the router rather than the engine.
 //
-// Threads are pinned. Without pinning the scheduler migrates writers between
-// cores mid-run and the mappings' pages follow them around, which showed up as
-// a 20-30% run-to-run spread that had nothing to do with the thing being
-// measured.
+// Threads are pinned, and to physical cores rather than to CPU numbers - see
+// cpu_order() for why that distinction cost a wrong result once already.
 
 #include "../storage/field_storage.hpp"
 
 #include <algorithm>
 #include <barrier>
-#include <utility>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <pthread.h>
+#include <string>
+#include <sys/stat.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -79,11 +82,15 @@ namespace {
     };
     static_assert(sizeof(blob) == value_bytes);
 
-    template <std::size_t I>
+    // ONE spec for every shard. What separates them is where their files go,
+    // which is now a run-time argument - so the shard count is an ordinary
+    // number and this loop is an ordinary loop.
     using shard_spec = storage::field_spec<
-        storage::shard_path<"shard.log", I>, shard_capacity,
-        storage::shard_path<"shard.idx", I>, shard_max_ids, shard_overrides,
+        "shard.log", shard_capacity, "shard.idx", shard_max_ids, shard_overrides,
         8, value_bytes>;
+    using shard = storage::field_storage<shard_spec>;
+
+    std::string shard_dir(std::size_t i) { return "shard." + std::to_string(i); }
 
     struct xorshift {
         uint64_t s;
@@ -110,15 +117,12 @@ namespace {
     // and two writers measured 0.90x of one. That reads as contention in the
     // engine and is nothing of the kind.
     //
-    // So the order is built from /sys: one CPU per physical core first, and
-    // only once every core has a writer do the SMT siblings get used. The bend
-    // in the curve then means something.
-    // Cores are also not all the same speed. This i5-14400F has six P-cores at
-    // 4.7 GHz and four E-cores at 3.5 GHz, and since the parallel duration is
-    // the SLOWEST shard's, the first shard placed on an E-core sets the number
-    // for all of them. Sorting by max frequency makes that visible where it
-    // happens instead of smearing it: the curve should rise cleanly across the
-    // fast cores and bend exactly when the slow ones are reached.
+    // Cores are also not all the same speed. This CPU has six P-cores at 4.7
+    // GHz and four E-cores at 3.5, and since the parallel duration is the
+    // SLOWEST shard's, the first shard placed on an E-core sets the number for
+    // all of them. So the order is: one CPU per physical core, fastest first,
+    // and only once every core has a writer do the SMT siblings get used. The
+    // bend in the curve then means something.
     long cpu_max_khz(unsigned c) {
         char path[160];
         std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%u/cpufreq/cpuinfo_max_freq", c);
@@ -169,30 +173,32 @@ namespace {
     // The fill is memory-bandwidth work and would otherwise be counted against
     // a phase that is not it, so every shard fills first and they all wait at
     // the barrier before a single update is timed.
-    template <std::size_t I>
-    void run_shard(tally& out, std::barrier<>& gate) {
-        pin(I);
-        auto t = std::make_unique<storage::field_storage<shard_spec<I>>>();
+    void run_shard(std::size_t i, tally& out, std::barrier<>& gate) {
+        pin(i);
+        const std::string dir = shard_dir(i);
+        ::mkdir(dir.c_str(), 0755);
+
+        auto t = std::make_unique<shard>(storage::storage_paths::under<shard_spec>(dir));
         if (!t->ok()) { gate.arrive_and_drop(); return; }
 
         blob b{};
         std::memset(b.payload, 0xAB, sizeof(b.payload));
         std::vector<storage::record_id> ids;
         ids.reserve(records_per_shard);
-        for (std::size_t i = 0; i < records_per_shard; ++i) {
-            b.key = i + 1;
-            b.counter = i;
+        for (std::size_t k = 0; k < records_per_shard; ++k) {
+            b.key = k + 1;
+            b.counter = k;
             ids.push_back(t->create(b));
         }
 
-        xorshift rng(9 + I);
+        xorshift rng(9 + i);
         gate.arrive_and_wait();
 
         const auto t0 = std::chrono::steady_clock::now();
         auto last = t0;
         std::size_t since = 0, fired = 0;
-        for (std::size_t i = 0; i < updates_per_shard; ++i) {
-            t->template update<&blob::counter>(ids[rng.range(records_per_shard)], (uint64_t)i);
+        for (std::size_t k = 0; k < updates_per_shard; ++k) {
+            t->update<&blob::counter>(ids[rng.range(records_per_shard)], (uint64_t)k);
             if (!do_sync) continue;
             const auto now = std::chrono::steady_clock::now();
             if (++since < barrier_ops && now - last < barrier_us) continue;
@@ -209,38 +215,40 @@ namespace {
         out.ok = true;
     }
 
-    // The shard index has to be a compile-time constant (it is baked into the
-    // paths), while the shard COUNT is a runtime sweep. This bridges the two:
-    // spawn threads for indices 0..N-1, skipping the ones past the count.
-    template <std::size_t... I>
-    void spawn(std::size_t count, std::vector<tally>& out, std::barrier<>& gate, std::index_sequence<I...>) {
-        std::vector<std::thread> threads;
-        (..., (I < count ? (void)threads.emplace_back([&out, &gate] { run_shard<I>(out[I], gate); }) : void()));
-        for (auto& th : threads) th.join();
-    }
-
     void cleanup() {
         for (std::size_t i = 0; i < max_shards; ++i) {
-            char path[64];
-            std::snprintf(path, sizeof(path), "shard.%zu.log", i);
-            std::remove(path);
-            std::snprintf(path, sizeof(path), "shard.%zu.idx", i);
-            std::remove(path);
+            const std::string dir = shard_dir(i);
+            std::remove((dir + "/shard.log").c_str());
+            std::remove((dir + "/shard.idx").c_str());
+            ::rmdir(dir.c_str());
         }
     }
 
     // Swept finely around the physical core count, because two different things
     // bend this curve and a coarse sweep cannot tell them apart: running out of
     // physical cores, and running out of memory bandwidth.
+    void run_at(std::size_t n, std::vector<tally>& out) {
+        cleanup();
+        std::barrier gate((std::ptrdiff_t)n);
+        std::vector<std::thread> threads;
+        for (std::size_t i = 0; i < n; ++i)
+            threads.emplace_back([i, &out, &gate] { run_shard(i, out[i], gate); });
+        for (auto& th : threads) th.join();
+    }
+
     void sweep() {
+        // Thrown away. The first point of a sweep pays for the first mkdir, the
+        // first file creation and a cold cache, and since every scaling figure
+        // is normalised against n=1, a slow first point corrupts the whole
+        // column rather than just its own row. Seen as 17.6M at one shard
+        // against 25.0M, which then reported two shards as 2.72x.
+        { std::vector<tally> warm(max_shards); run_at(1, warm); }
+
         double one = 0;
         for (std::size_t n : { 1u, 2u, 4u, 6u, 8u, 10u, 12u, 16u }) {
             if (n > max_shards) break;
-            cleanup();
             std::vector<tally> out(max_shards);
-            std::barrier gate((std::ptrdiff_t)n);
-
-            spawn(n, out, gate, std::make_index_sequence<max_shards>{});
+            run_at(n, out);
 
             // The slowest shard is the parallel duration: they start together
             // at the barrier, so taking the max is what "how long did this take

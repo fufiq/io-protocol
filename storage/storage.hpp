@@ -193,15 +193,8 @@ namespace storage {
     struct fixed_string {
         char value[N]{};
         consteval fixed_string(const char (&s)[N]) noexcept { std::copy_n(s, N, value); }
-        // From a computed array, so a path can be BUILT at compile time rather
-        // than only spelled as a literal. The other constructor cannot do this:
-        // it binds a reference to an array, and a consteval function has no
-        // array to lend out. This is what lets one spec become N shard specs
-        // (see shard_path in field_storage.hpp).
-        consteval fixed_string(const std::array<char, N>& s) noexcept { std::copy_n(s.data(), N, value); }
     };
     template <std::size_t N> fixed_string(const char (&)[N]) -> fixed_string<N>;
-    template <std::size_t N> fixed_string(const std::array<char, N>&) -> fixed_string<N>;
 
     // "<path>.data" at compile time. The data file's name is DERIVED rather
     // than required, so that every spec written before the log/data split

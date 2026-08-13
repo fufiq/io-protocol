@@ -337,7 +337,14 @@ Do not carry an interval from one phase to another. Size it so that a barrier's
 dirty tail clears 64 KB - `interval × expected_bytes_per_op` - and let the count
 cap bound the crash window.
 
-### 8a. Against a B+tree, at the same crash window
+### What a checksum does not prove
+
+CRC32C over header and payload detects a torn write; it does not prove the
+record was *meant* to be there. A record whose checksum verifies but whose
+append never completed logically is indistinguishable from a good one - that is
+what `flags` and a commit marker in the layer above are for.
+
+## 8a. Against a B+tree, at the same crash window
 
 The comparison that matters is not ops/sec, it is **ops/sec at a stated crash
 window**, since either engine buys throughput by widening it. LMDB opened at its
@@ -372,13 +379,6 @@ B+tree is at least as fast and the append log's advantage is elsewhere
 (§14's update row). Narrower, the gap opens: at a 100-record window this engine
 is **2.4x** faster, and that is the regime a tight durability requirement puts
 you in.
-
-### What a checksum does not prove
-
-CRC32C over header and payload detects a torn write; it does not prove the
-record was *meant* to be there. A record whose checksum verifies but whose
-append never completed logically is indistinguishable from a good one - that is
-what `flags` and a commit marker in the layer above are for.
 
 ## 9. Recovery, checkpoint, restart
 
@@ -652,13 +652,15 @@ the device.
 ## 12. Limits
 
 **One writer, and readers only while it is idle** - or inside a commit, see
-§11c. There is no locking anywhere in this file. The boundary is narrower than "single-threaded", and it was
-checked rather than assumed:
+§11c. There is no locking anywhere in this file. The boundary is narrower than
+"single-threaded", and it was checked rather than assumed:
 
 | | |
 |---|---|
 | several readers, no writer running | **safe** - verified with ThreadSanitizer, 8 threads × 96,000 reads, clean |
-| a reader concurrent with a writer | **data race**, undefined |
+| `try_get` / `try_read_raw` while the writer is inside `sync()` | **safe** - the window of §11c; zero torn reads over ~1 billion attempts, TSan clean |
+| `get` / `read_raw` concurrent with a writer | **data race**, undefined |
+| any read concurrent with a writer outside a window | **data race**, undefined |
 | more than one writer | never |
 
 Concurrent reads work because the whole read path is genuinely `const`:
@@ -673,9 +675,14 @@ reader can follow a head to a node the writer has not finished filling.
 
 Practically: **split the phases.** A writer runs, stops, and then any number of
 threads read in parallel. For analytics over a settled snapshot that is a
-working arrangement today with no new code. For readers *during* writes you need
-MVCC, and the log already holds every version - the missing piece is an index
-per snapshot offset, not a change to this file.
+working arrangement today with no new code.
+
+The one exception is the commit window of §11c, and it is narrow on purpose: it
+covers the interval where the writer is blocked in `msync` and the index is
+therefore not moving, reached only through `try_get`/`try_read_raw`, which
+return false rather than wait. For readers at *any* point during writes you
+still need MVCC, and the log already holds every version - the missing piece is
+an index per snapshot offset, not a change to this file.
 
 **The index must be resident.** 16 bytes per id *ever issued* plus 24 per live
 override. A destroyed record's slot is never reclaimed, so index size tracks
@@ -706,6 +713,12 @@ value rather than a wrong one - but it is silent, so watch
 operations or N microseconds, whichever first*, with the interval comfortably
 above what `sync()` costs there. A barrier spaced tighter than its own cost
 spends all its time being the previous one.
+
+**Size the interval per phase, not once per program.** It has to be read
+together with the bytes an operation dirties, so the pair that is right for
+updates is wrong for a bulk fill of the same records - measured at a 2.3×
+difference on the same workload (§8a). Aim for a dirty tail above 64 KB per
+barrier: `interval × expected_bytes_per_op`.
 
 **Pick `max_depth` from your read/write ratio, not from the default.** Low depth
 buys reads and sells writes and log size, at roughly the rates in §6.
@@ -754,7 +767,7 @@ operation that barrier is the wrong one (§8a).
 | random read, in RAM | 1,541,045 | **6,550,781** | 827,178 |
 | random read, out of RAM | **5,731** | 4,747 | 3,812 |
 | random read, out of RAM, batched with `prefetch_gather` | **7,726** | - | - |
-| fill, no durability | 236,231 | 146,760 | 237,283 |
+| fill, no durability | 236,231 | 143,559 | 237,283 |
 | durable fill, 500-record crash window | **217,000** | - | 162,000 |
 | durable fill, 5,000-record crash window | 230,000 | - | **240,000** |
 | on disk per 1 GB of data | **1.05 GB** | 2.1 GB | 1.34 GB |

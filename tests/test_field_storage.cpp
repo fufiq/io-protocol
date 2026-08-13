@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <string>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
 
@@ -670,4 +672,92 @@ TEST_CASE("a shut window refuses every read") {
     CHECK_FALSE(f.table->try_get(id, q));   // no commit in flight
     CHECK(f.table->get<quad>(id).has_value()); // the exclusive path is unaffected
     wipe();
+}
+
+TEST_CASE("runtime paths relocate every file the spec names") {
+    // A sandboxed process learns its directory at startup, and N instances side
+    // by side need N sets of names a template parameter cannot produce from a
+    // loop. Both are the same feature, and this is it.
+    const std::string dir = "t_rt_dir";
+    ::mkdir(dir.c_str(), 0755);
+    const auto where = storage::storage_paths::under<fspec>(dir);
+
+    CHECK(where.log == "t_rt_dir/t_field.log");
+    CHECK(where.index == "t_rt_dir/t_field.idx");
+    CHECK(where.checkpoint == "t_rt_dir/t_field.ck");
+
+    // The spec's own files must stay untouched - this is a relocation, not a
+    // second name for the same bytes.
+    wipe();
+    record_id id = 0;
+    {
+        storage::field_storage<fspec> t(where);
+        REQUIRE(t.ok());
+        id = t.create(quad{7, 8, 9, 10});
+        t.update<&quad::b>(id, 42);
+        REQUIRE(t.checkpoint());
+    }
+    struct ::stat st {};
+    CHECK(::stat(fspec::path.value, &st) != 0);        // nothing at the compile-time path
+    CHECK(::stat(where.log.c_str(), &st) == 0);
+    CHECK(::stat(where.checkpoint.c_str(), &st) == 0);
+
+    // And it survives a restart, which is the part that would break if any one
+    // of the three paths had quietly fallen back to the spec's.
+    {
+        storage::field_storage<fspec> t(where);
+        REQUIRE(t.ok());
+        t.restart(1u << 22);
+        CHECK(t.started_from_checkpoint());
+        auto got = t.get<quad>(id);
+        REQUIRE(got.has_value());
+        CHECK(got->a == 7);
+        CHECK(got->b == 42);
+        CHECK(got->d == 10);
+    }
+
+    // An empty field means "use the spec's", so the default constructor is
+    // exactly what it always was.
+    {
+        storage::field_storage<fspec> t(storage::storage_paths{});
+        REQUIRE(t.ok());
+        CHECK(::stat(fspec::path.value, &st) == 0);
+    }
+
+    std::remove(where.log.c_str());
+    std::remove(where.index.c_str());
+    std::remove(where.checkpoint.c_str());
+    ::rmdir(dir.c_str());
+    wipe();
+}
+
+TEST_CASE("two instances of one spec under different directories stay separate") {
+    // Sharding lives above the engine: it is N instances with N sets of paths,
+    // and nothing is shared between them. This is that claim, minimally.
+    const char* dirs[2] = { "t_rt_a", "t_rt_b" };
+    for (const char* d : dirs) ::mkdir(d, 0755);
+
+    storage::field_storage<fspec> a(storage::storage_paths::under<fspec>(dirs[0]));
+    storage::field_storage<fspec> b(storage::storage_paths::under<fspec>(dirs[1]));
+    REQUIRE(a.ok());
+    REQUIRE(b.ok());
+
+    const record_id ia = a.create(quad{1, 1, 1, 1});
+    const record_id ib = b.create(quad{2, 2, 2, 2});
+
+    // Both allocate from their own next_id, so the ids collide by design. That
+    // is exactly the footgun a caller sharding by hand has to plan for: an id
+    // is only meaningful together with the instance that issued it.
+    CHECK(ia == ib);
+
+    CHECK(a.get<quad>(ia)->a == 1);
+    CHECK(b.get<quad>(ib)->a == 2);
+    CHECK(a.current_offset() == b.current_offset());   // same work, separate logs
+
+    for (const char* d : dirs) {
+        std::remove((std::string(d) + "/t_field.log").c_str());
+        std::remove((std::string(d) + "/t_field.idx").c_str());
+        std::remove((std::string(d) + "/t_field.ck").c_str());
+        ::rmdir(d);
+    }
 }

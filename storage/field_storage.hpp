@@ -280,20 +280,64 @@ namespace storage {
     template <fixed_string base, std::size_t shard>
     inline constexpr auto shard_path = fixed_string(make_shard_path<base, shard>());
 
+    // WHERE THE FILES GO, decided at run time instead of in the spec.
+    //
+    // A spec names its files as compile-time strings, which is right when the
+    // paths are known when the code is written and wrong in two situations that
+    // both matter: a sandboxed process learns its directory only at startup
+    // (every mobile platform), and running N instances side by side needs N
+    // sets of names that a template parameter cannot produce from a loop.
+    //
+    // An empty field means "use the spec's". So the default constructor is
+    // exactly what it always was, every existing spec keeps working untouched,
+    // and this is opt-in per file.
+    //
+    // What this does NOT do is change whether a checkpoint exists.
+    // spec::fast_restart is still what enables checkpoint()/restart(), because
+    // that decides which members exist. Naming a checkpoint here relocates one;
+    // it cannot bring one into being.
+    struct storage_paths {
+        std::string log;
+        std::string index;
+        std::string checkpoint;
+
+        // Every file the spec names, moved under `directory` and keeping its
+        // own basename. The common case, and the one a sandbox wants.
+        template <typename spec>
+        static storage_paths under(std::string_view directory) {
+            const auto join = [&](const char* name) {
+                std::string_view base = name;
+                if (const auto cut = base.find_last_of('/'); cut != std::string_view::npos)
+                    base.remove_prefix(cut + 1);
+                if (base.empty()) return std::string{};
+                std::string out(directory);
+                if (!out.empty() && out.back() != '/') out += '/';
+                out += base;
+                return out;
+            };
+            return { join(spec::path.value), join(spec::index_path), join(spec::checkpoint_path) };
+        }
+    };
+
     // =====================================================================
     template <typename spec, typename observer = null_observer>
     class field_storage {
     public:
         struct raw_view { record_id id; tag_t tag; std::span<const std::byte> bytes; };
 
-        field_storage() {
-            fd = ::open(spec::path.value, O_RDWR | O_CREAT, 0644);
+        field_storage() : field_storage(storage_paths{}) {}
+
+        explicit field_storage(storage_paths where)
+            : log_path(where.log.empty() ? spec::path.value : std::move(where.log)),
+              index_path(where.index.empty() ? spec::index_path : std::move(where.index)),
+              checkpoint_path(where.checkpoint.empty() ? spec::checkpoint_path : std::move(where.checkpoint)) {
+            fd = ::open(log_path.c_str(), O_RDWR | O_CREAT, 0644);
             if (fd < 0) return;
             if (::posix_fallocate(fd, 0, spec::capacity) != 0) return;
             base = (std::byte*)::mmap(nullptr, spec::capacity, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
             if (base == MAP_FAILED) { base = nullptr; return; }
 
-            index_fd = ::open(spec::index_path, O_RDWR | O_CREAT, 0644);
+            index_fd = ::open(index_path.c_str(), O_RDWR | O_CREAT, 0644);
             if (index_fd < 0) return;
             // Preserved across runs only when a checkpoint can vouch for it;
             // otherwise the previous run's contents are meaningless and
@@ -831,14 +875,14 @@ namespace storage {
             rec.tail_crc = log_tail_crc(write_offset);
             rec.checksum = crc32c(&rec, offsetof(checkpoint_record, checksum)) ^ 0xFFFFFFFFu;
 
-            const std::string tmp = std::string(spec::checkpoint_path) + ".tmp";
+            const std::string tmp = checkpoint_path + ".tmp";
             int cf = ::open(tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
             if (cf < 0) return false;
             const bool written = ::pwrite(cf, &rec, sizeof(rec), 0) == (ssize_t)sizeof(rec) && ::fsync(cf) == 0;
             ::close(cf);
             if (!written) { ::remove(tmp.c_str()); return false; }
-            if (::rename(tmp.c_str(), spec::checkpoint_path) != 0) { ::remove(tmp.c_str()); return false; }
-            sync_parent_directory(spec::checkpoint_path);
+            if (::rename(tmp.c_str(), checkpoint_path.c_str()) != 0) { ::remove(tmp.c_str()); return false; }
+            sync_parent_directory(checkpoint_path.c_str());
             return true;
         }
 
@@ -861,7 +905,7 @@ namespace storage {
         }
 
         bool started_from_checkpoint() const noexcept { return from_checkpoint; }
-        void discard_checkpoint() noexcept requires (spec::fast_restart) { ::remove(spec::checkpoint_path); }
+        void discard_checkpoint() noexcept requires (spec::fast_restart) { ::remove(checkpoint_path.c_str()); }
 
         // ---- compaction --------------------------------------------------
 
@@ -1257,7 +1301,7 @@ namespace storage {
         }
 
         bool read_checkpoint(checkpoint_record& out) const noexcept {
-            int cf = ::open(spec::checkpoint_path, O_RDONLY);
+            int cf = ::open(checkpoint_path.c_str(), O_RDONLY);
             if (cf < 0) return false;
             const bool got = ::pread(cf, &out, sizeof(out), 0) == (ssize_t)sizeof(out);
             ::close(cf);
@@ -1298,6 +1342,13 @@ namespace storage {
         bool from_checkpoint = false;
         bool index_pinned = false;
         int fd = -1, index_fd = -1;
+
+        // Resolved once in the constructor, from storage_paths or from the
+        // spec. Held as strings rather than pointers because a caller building
+        // a sandbox path has nowhere to keep it alive: the obvious call site is
+        // field_storage(storage_paths::under<spec>(app_dir())), whose temporary
+        // is gone before the first append.
+        std::string log_path, index_path, checkpoint_path;
 
         // Odd while a commit is in flight. Even - the steady state - means the
         // writer owns the index and try_read_raw refuses. Bumped twice per

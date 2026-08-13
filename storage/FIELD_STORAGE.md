@@ -81,6 +81,33 @@ Compile-time bounds, all asserted:
 `posix_fallocate`, not `ftruncate`: a sparse file gives **SIGBUS** on ENOSPC in
 the middle of a write, which is not a failure mode you can handle.
 
+### Paths at run time
+
+A spec names its files as compile-time strings, which is right when they are
+known when the code is written and wrong in two cases that both matter: a
+sandboxed process learns its directory only at startup, and N instances side by
+side need N sets of names a template parameter cannot produce from a loop.
+
+```cpp
+storage::field_storage<spec> table(storage::storage_paths::under<spec>(app_dir));
+```
+
+`storage_paths::under<spec>(dir)` moves every file the spec names under `dir`,
+keeping its basename. The three fields can also be set individually, and an
+**empty field means "use the spec's"** - so the default constructor is exactly
+what it always was and every existing spec keeps working untouched.
+
+One thing it deliberately cannot do: **naming a checkpoint here does not create
+one.** `spec::fast_restart` is still what enables `checkpoint()`/`restart()`,
+because that decides which members exist at all. A runtime path relocates a
+checkpoint; it cannot bring one into being.
+
+Two instances of one spec under different directories are fully independent -
+that is what sharding is here, and it lives above the engine. Note the
+consequence: each allocates from its own `next_id`, so **their ids collide by
+design**. An id is only meaningful together with the instance that issued it,
+and a caller storing references across instances has to carry both.
+
 ## 2. The log
 
 One file, `mmap` `MAP_SHARED`. File-backed rather than anonymous on purpose:

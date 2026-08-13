@@ -70,6 +70,7 @@
 // overridden field (24 bytes), against storage.hpp's 8 bytes per id.
 
 #include "storage.hpp"
+#include "../embedded/platform.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -280,7 +281,7 @@ namespace storage {
               checkpoint_path(where.checkpoint.empty() ? spec::checkpoint_path : std::move(where.checkpoint)) {
             fd = ::open(log_path.c_str(), O_RDWR | O_CREAT, 0644);
             if (fd < 0) return;
-            if (::posix_fallocate(fd, 0, spec::capacity) != 0) return;
+            if (platform::preallocate(fd, spec::capacity) != 0) return;
             base = (std::byte*)::mmap(nullptr, spec::capacity, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
             if (base == MAP_FAILED) { base = nullptr; return; }
 
@@ -290,7 +291,7 @@ namespace storage {
             // otherwise the previous run's contents are meaningless and
             // dropping them is what guarantees every slot starts empty.
             if constexpr (!spec::fast_restart) { if (::ftruncate(index_fd, 0) != 0) return; }
-            if (::posix_fallocate(index_fd, 0, spec::index_bytes) != 0) return;
+            if (platform::preallocate(index_fd, spec::index_bytes) != 0) return;
             void* m = ::mmap(nullptr, spec::index_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, index_fd, 0);
             if (m == MAP_FAILED) return;
 
@@ -557,9 +558,9 @@ namespace storage {
 
         void sync() noexcept {
             if (write_offset <= last_synced) return;
-            const std::size_t start = last_synced & ~(page_size - 1);
+            const std::size_t start = last_synced & ~(platform::page_size() - 1);
             open_read_window();
-            ::msync(base + start, write_offset - start, MS_SYNC);
+            platform::flush_mapping(base + start, write_offset - start, fd);
             close_read_window();
             last_synced = write_offset;
         }
@@ -645,11 +646,11 @@ namespace storage {
         // Meant for a bulk load, where the pages behind the write cursor are
         // pure exhaust and are evicting the pages that reads actually want.
         void release_log(std::size_t upto) noexcept {
-            if (!base || upto < page_size) return;
-            const std::size_t end = (upto < write_offset ? upto : write_offset) & ~(page_size - 1);
+            if (!base || upto < platform::page_size()) return;
+            const std::size_t end = (upto < write_offset ? upto : write_offset) & ~(platform::page_size() - 1);
             if (end == 0) return;
             ::madvise(base, end, MADV_DONTNEED);
-            ::posix_fadvise(fd, 0, (off_t)end, POSIX_FADV_DONTNEED);
+            platform::release_prefix(fd, end);
         }
 
         std::size_t current_offset() const noexcept { return write_offset; }
@@ -808,7 +809,7 @@ namespace storage {
             // The index flush is the LONGER of the two windows - it is the whole
             // arena, not the log's tail - and the writer is just as idle in it.
             open_read_window();
-            ::msync(head, spec::index_bytes, MS_SYNC);
+            platform::flush_mapping(head, spec::index_bytes, index_fd);
             close_read_window();
 
             checkpoint_record rec{};
@@ -825,7 +826,7 @@ namespace storage {
             const std::string tmp = checkpoint_path + ".tmp";
             int cf = ::open(tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
             if (cf < 0) return false;
-            const bool written = ::pwrite(cf, &rec, sizeof(rec), 0) == (ssize_t)sizeof(rec) && ::fsync(cf) == 0;
+            const bool written = ::pwrite(cf, &rec, sizeof(rec), 0) == (ssize_t)sizeof(rec) && platform::flush_file(cf) == 0;
             ::close(cf);
             if (!written) { ::remove(tmp.c_str()); return false; }
             if (::rename(tmp.c_str(), checkpoint_path.c_str()) != 0) { ::remove(tmp.c_str()); return false; }
@@ -1276,8 +1277,6 @@ namespace storage {
             std::memset(slots, 0, spec::max_ids * sizeof(field_slot));
             for (std::size_t i = 0; i < spec::max_ids; ++i) slots[i].chain = no_override; // head = none, depth = 0
         }
-
-        static constexpr std::size_t page_size = 4096;
 
         std::byte* base = nullptr;
         std::size_t write_offset = 0;

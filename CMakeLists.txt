@@ -74,6 +74,11 @@ target_link_libraries(replication_demo PRIVATE replication)
 add_executable(shard_scaling bench/shard_scaling.cpp)
 target_link_libraries(shard_scaling PRIVATE storage Threads::Threads)
 
+# Run this on the platform you are porting to. It exercises the shims in
+# embedded/platform.hpp against a real file and checks the properties the engine
+# depends on, not merely that the calls returned zero.
+add_executable(platform_check embedded/platform_check.cpp)
+
 # --- tests -----------------------------------------------------------------
 include(FetchContent)
 FetchContent_Declare(doctest

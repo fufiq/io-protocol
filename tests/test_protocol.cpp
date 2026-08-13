@@ -1,6 +1,7 @@
 #include <doctest/doctest.h>
 
 #include "../net/protocol.hpp"
+#include "../net/uring_io.hpp"
 #include "../embedded/epoll_udp.hpp"
 
 #include <arpa/inet.h>

@@ -396,7 +396,7 @@ namespace replication {
         // consistent snapshot together) - a primary writing from a second
         // thread concurrently needs the same shared-mutex contract
         // background_compact() already documents in storage.hpp.
-        // `ep` is `auto&`, not protocol_endpoint<>&: the endpoint's
+        // `ep` is `auto&`, not a named endpoint type: the endpoint's
         // keepalive/liveness/handshake timeouts are template parameters, so
         // hardcoding the default instantiation here would lock replication
         // to endpoints that happen to use the default timeouts - which is

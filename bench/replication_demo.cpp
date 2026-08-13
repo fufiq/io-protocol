@@ -31,6 +31,7 @@
 // Build: g++ -std=c++26 -O2 -Wall -Wextra -Isrc -luring -lsodium src/replication_demo.cpp -o replication_demo
 
 #include "../replication/replication.hpp"
+#include "../net/uring_io.hpp"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -77,7 +78,7 @@ sockaddr_in loopback_addr(uint16_t port) {
     return a;
 }
 
-void step(protocol::protocol_endpoint<>& ep, auto&& on_event) {
+void step(protocol::protocol_endpoint<protocol::uring_io>& ep, auto&& on_event) {
     ep.poll_io(std::chrono::milliseconds{0});
     for (auto& ev : ep.poll_incoming()) on_event(ev);
 }
@@ -100,15 +101,15 @@ int main() {
     crypto::public_key primary_pub = primary_keys.pub;
 
     protocol::uring_io primary_ep_io(primary_ring, primary_fd);
-    protocol::protocol_endpoint<> primary_ep(primary_ep_io, std::move(primary_keys));
+    protocol::protocol_endpoint<protocol::uring_io> primary_ep(primary_ep_io, std::move(primary_keys));
     protocol::uring_io a_ep_io(a_ring, a_fd);
-    protocol::protocol_endpoint<> a_ep(a_ep_io, crypto::x25519_generate());
+    protocol::protocol_endpoint<protocol::uring_io> a_ep(a_ep_io, crypto::x25519_generate());
     protocol::uring_io b_ep_io(b_ring, b_fd);
-    protocol::protocol_endpoint<> b_ep(b_ep_io, crypto::x25519_generate());
+    protocol::protocol_endpoint<protocol::uring_io> b_ep(b_ep_io, crypto::x25519_generate());
     protocol::uring_io c_ep_io(c_ring, c_fd);
-    protocol::protocol_endpoint<> c_ep(c_ep_io, crypto::x25519_generate());
+    protocol::protocol_endpoint<protocol::uring_io> c_ep(c_ep_io, crypto::x25519_generate());
     protocol::uring_io d_ep_io(d_ring, d_fd);
-    protocol::protocol_endpoint<> d_ep(d_ep_io, crypto::x25519_generate());
+    protocol::protocol_endpoint<protocol::uring_io> d_ep(d_ep_io, crypto::x25519_generate());
     primary_ep.arm(); a_ep.arm(); b_ep.arm(); c_ep.arm(); d_ep.arm();
 
     storage::storage<primary_spec> primary_table;

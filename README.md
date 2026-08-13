@@ -8,16 +8,22 @@ the seam - it is the only component that touches both.
 | | what it is | depends on | platforms |
 |---|---|---|---|
 | `storage/` | the field-granular engine | nothing but libstdc++ and POSIX | Linux, Android tested; macOS/iOS unverified |
-| `embedded/` | the four system calls that differ per platform | as above | as above |
-| `replication/` | WAL shipping and snapshot bootstrap | `net/` | Linux |
-| `net/` | the UDP transport, levels 1-7 | `liburing`, `libsodium` | Linux |
+| `embedded/` | platform shims and the epoll transport | `libsodium` for the transport | as above |
+| `replication/` | WAL shipping and snapshot bootstrap | a transport | Linux, Android tested |
+| `net/` | the protocol, levels 1-7, plus the io_uring transport | `libsodium`; `liburing` for that one transport | Linux |
 | `runtime/` | fibers and a multi-thread queue | POSIX `ucontext` | Linux |
 
 **Support is not uniform, and the table above is the honest version.** The
-storage engine runs anywhere with POSIX; everything else is Linux, either
-because `io_uring` is (`net/`, and therefore `replication/`) or because
-`ucontext` left POSIX in 2008 and is absent from the iOS SDK (`runtime/`). The
-Darwin paths in `embedded/platform.hpp` are **written and reviewed but not
+protocol itself is portable - the handshake, reassembly, AEAD, the replay
+window, anti-DoS and reliability never mention io_uring - and picks its
+transport as a template parameter: `net/uring_io.hpp` where io_uring is
+available, `embedded/epoll_udp.hpp` where it is not. On Android that is not a
+matter of kernel age: **io_uring is blocked for apps by seccomp**, so epoll is
+the permanent answer there rather than a fallback.
+
+What stays Linux-only is `net/uring_io.hpp` itself and `runtime/fiber.hpp`,
+the latter because `ucontext` left POSIX in 2008 and is absent from the iOS SDK.
+The Darwin paths in `embedded/platform.hpp` are **written and reviewed but not
 run** - see below.
 
 ---
@@ -288,9 +294,15 @@ rather than that the calls returned zero.
 | | compiles | tests run |
 |---|---|---|
 | Linux x86-64 | yes | yes - `ctest`, Release and ASan/UBSan |
-| Android x86-64, **16 KB pages** | yes | **yes** - 87 cases, 6,326 assertions, on an emulator |
+| Android x86-64, **16 KB pages** | yes | **yes** - the engine's 87 cases, and a replica of a host primary |
 | Android arm64 | yes, NDK r27 clang | no device here; both CRC paths checked in the emitted code |
 | macOS / iOS | **no** - no Darwin toolchain here | no |
+
+`bench/replica_node.cpp` is the end-to-end one: the same binary is a primary
+here and a replica on the phone, both on the epoll transport, and the replica
+brought over 2,000 records with a matching checksum and offset. That is the
+engine, replication and the transport working at once on hardware that is not
+the development machine.
 
 ```sh
 tools/android_test.sh          # needs an NDK and a device or emulator on adb

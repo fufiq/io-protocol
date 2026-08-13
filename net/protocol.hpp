@@ -62,12 +62,10 @@
 // exists is fine: queued data just waits for handshake_established.
 
 #include "anti_dos.hpp"
-#include "multishot_udp.hpp"
 #include "noise_ik.hpp"
 #include "reliability.hpp"
 #include "transport_connection.hpp"
 #include "io_backend.hpp"
-#include "uring_io.hpp"
 
 #include <algorithm>
 #include <array>
@@ -85,13 +83,12 @@ namespace protocol {
 // 96 entries * 14B + 1B count + 9B header = 1354B, comfortably under the MTU - see the same
 // constant's reasoning in level6_reliability_server.cpp, which this supersedes.
 constexpr size_t max_sack_entries_per_packet = 96;
-constexpr uint64_t multishot_recv_tag = 1;
 
 struct endpoint_config {
     uint32_t load_threshold_per_sec = 2000; // anti_dos::load_gate: handshake attempts/sec before cookies are required
     // No reassembly_window field: reassembler's window size is a compile-time template
     // parameter now (see packet_assembly.hpp), not a runtime-configurable one.
-    unsigned recv_num_bufs = 4096;          // must be a power of two, see multishot_udp.hpp
+    unsigned recv_num_bufs = 4096;          // io_uring backend only: must be a power of two, see multishot_udp.hpp
     unsigned recv_buf_size = 2048;
     unsigned send_pool_size = 1024;
 
@@ -168,7 +165,12 @@ struct event {
 // that make one. It is a template parameter rather than a base class because
 // the alternative is a virtual dispatch on the per-packet path, and because the
 // protocol genuinely does not care: it needs bytes in and bytes out.
-template <typename io_backend = uring_io,
+// No default for io_backend, deliberately. Defaulting it to uring_io meant this
+// header had to include uring_io.hpp, which includes liburing.h - so a protocol
+// that no longer DEPENDS on io_uring still could not be COMPILED without it,
+// which was discovered the first time it was cross-compiled for Android. Say
+// which transport you want and include it; there are two.
+template <typename io_backend,
           size_t keepalive_interval_ms = 20000, size_t liveness_timeout_ms = 60000, size_t handshake_timeout_ms = 5000>
     requires (keepalive_interval_ms > 0 && liveness_timeout_ms > keepalive_interval_ms && handshake_timeout_ms > 0)
 class protocol_endpoint {

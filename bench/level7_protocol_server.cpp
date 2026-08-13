@@ -15,6 +15,7 @@
 // up during development, not just the client hanging.
 
 #include "../net/protocol.hpp"
+#include "../net/uring_io.hpp"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -58,7 +59,7 @@ int main(int argc, char** argv) {
     config.reliable_initial_cwnd = initial_cwnd;
     config.reliable_initial_ssthresh = initial_ssthresh;
     protocol::uring_io io(ring, fd, config.send_pool_size, config.recv_num_bufs, config.recv_buf_size);
-    protocol::protocol_endpoint<> endpoint(io, std::move(server_static), config);
+    protocol::protocol_endpoint<protocol::uring_io> endpoint(io, std::move(server_static), config);
     endpoint.arm();
     ring.submit();
 

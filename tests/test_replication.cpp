@@ -19,6 +19,7 @@
 // Run:   ctest --test-dir build   (runs this and unit_tests, in both configs)
 
 #include "../replication/replication.hpp"
+#include "../net/uring_io.hpp"
 #include "../storage/field_storage.hpp"
 #include "../runtime/fiber.hpp"
 
@@ -328,7 +329,7 @@ sockaddr_in loopback_addr(uint16_t port) {
     return a;
 }
 
-void step(protocol::protocol_endpoint<>& ep, auto&& on_event) {
+void step(protocol::protocol_endpoint<protocol::uring_io>& ep, auto&& on_event) {
     ep.poll_io(std::chrono::milliseconds{0});
     for (auto& ev : ep.poll_incoming()) on_event(ev);
 }
@@ -348,9 +349,9 @@ void test_disconnect_reconnect_resume() {
     auto pkeys = crypto::x25519_generate();
     crypto::public_key ppub = pkeys.pub;
     protocol::uring_io pep_io(pring, pfd);
-    protocol::protocol_endpoint<> pep(pep_io, std::move(pkeys));
+    protocol::protocol_endpoint<protocol::uring_io> pep(pep_io, std::move(pkeys));
     protocol::uring_io rep_io(rring, rfd);
-    protocol::protocol_endpoint<> rep(rep_io, crypto::x25519_generate());
+    protocol::protocol_endpoint<protocol::uring_io> rep(rep_io, crypto::x25519_generate());
     pep.arm(); rep.arm();
 
     storage::storage<file_spec_p> ptable;
@@ -439,9 +440,9 @@ void test_sync_before_ack() {
     auto pkeys = crypto::x25519_generate();
     crypto::public_key ppub = pkeys.pub;
     protocol::uring_io pep_io(pring, pfd);
-    protocol::protocol_endpoint<> pep(pep_io, std::move(pkeys));
+    protocol::protocol_endpoint<protocol::uring_io> pep(pep_io, std::move(pkeys));
     protocol::uring_io rep_io(rring, rfd);
-    protocol::protocol_endpoint<> rep(rep_io, crypto::x25519_generate());
+    protocol::protocol_endpoint<protocol::uring_io> rep(rep_io, crypto::x25519_generate());
     pep.arm(); rep.arm();
 
     storage::storage<file_spec_p> ptable;
@@ -532,7 +533,7 @@ void test_replica_restart_from_own_file() {
     auto pkeys = crypto::x25519_generate();
     crypto::public_key ppub = pkeys.pub;
     protocol::uring_io pep_io(pring, pfd);
-    protocol::protocol_endpoint<> pep(pep_io, std::move(pkeys));
+    protocol::protocol_endpoint<protocol::uring_io> pep(pep_io, std::move(pkeys));
     pep.arm();
 
     storage::storage<file_spec_p> ptable;
@@ -549,7 +550,7 @@ void test_replica_restart_from_own_file() {
         int rfd = make_bound_udp_socket(&rport);
         uring_ring rring(2048);
         protocol::uring_io rep_io(rring, rfd);
-    protocol::protocol_endpoint<> rep(rep_io, crypto::x25519_generate());
+    protocol::protocol_endpoint<protocol::uring_io> rep(rep_io, crypto::x25519_generate());
         rep.arm();
         storage::storage<file_spec_r> rtable;
         replication::replica_applier applier;
@@ -610,7 +611,7 @@ void test_replica_restart_from_own_file() {
     int rfd2 = make_bound_udp_socket(&rport);
     uring_ring rring2(2048);
     protocol::uring_io rep2_io(rring2, rfd2);
-    protocol::protocol_endpoint<> rep2(rep2_io, crypto::x25519_generate());
+    protocol::protocol_endpoint<protocol::uring_io> rep2(rep2_io, crypto::x25519_generate());
     rep2.arm();
     replication::replica_applier applier2;
     crypto::public_key rpub2{};
@@ -673,7 +674,7 @@ struct sync_rig {
     // The backends are members too, and declared BEFORE the endpoints that
     // hold references to them - members initialize in declaration order.
     protocol::uring_io pio{pring, pfd}, r1io{r1ring, r1fd}, r2io{r2ring, r2fd};
-    protocol::protocol_endpoint<> pep, r1ep, r2ep;
+    protocol::protocol_endpoint<protocol::uring_io> pep, r1ep, r2ep;
     storage::storage<file_spec_p> ptable;
     replication::primary_shipper shipper;
     crypto::public_key r1pub{}, r2pub{};

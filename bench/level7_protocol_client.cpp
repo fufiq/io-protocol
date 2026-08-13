@@ -20,6 +20,7 @@
 // regardless of I/O activity.
 
 #include "../net/protocol.hpp"
+#include "../net/uring_io.hpp"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -123,7 +124,7 @@ int main(int argc, char** argv) {
     if (initial_ssthresh != 0) config.reliable_initial_ssthresh = initial_ssthresh;
     auto client_static = crypto::x25519_generate();
     protocol::uring_io io(ring, fd, config.send_pool_size, config.recv_num_bufs, config.recv_buf_size);
-    protocol::protocol_endpoint<> endpoint(io, std::move(client_static), config);
+    protocol::protocol_endpoint<protocol::uring_io> endpoint(io, std::move(client_static), config);
     endpoint.arm();
 
     endpoint.connect(conn_id, server_pub, (sockaddr*)&dst, sizeof(dst));

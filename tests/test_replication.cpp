@@ -1,4 +1,5 @@
-// replication_tests.cpp - failure/reconnect/ordering tests for replication.hpp.
+// test_replication.cpp - failure/reconnect/ordering tests for replication.hpp.
+// The specification these check is replication/REPLICATION.md.
 //
 // Split into two halves deliberately:
 //   - Unit tests drive replica_applier directly with hand-built payloads.
@@ -14,7 +15,8 @@
 // not in replication.hpp - see test_sync_before_ack below for the exact
 // shape and its caveats.
 //
-// Build: g++ -std=c++26 -O2 -Wall -Wextra -Isrc -luring -lsodium src/replication_tests.cpp -o replication_tests
+// Build: cmake --build build --target replication_tests
+// Run:   ctest --test-dir build   (runs this and unit_tests, in both configs)
 
 #include "../replication/replication.hpp"
 #include "../storage/field_storage.hpp"

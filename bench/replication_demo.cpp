@@ -25,9 +25,8 @@
 // went. Route replication traffic from the first poll after connect(), not
 // from "once the handshake loop is done."
 //
-// Not wired into CMake yet - same standalone-demo convention as storage's
-// own business_demo_heap.cpp/stress_heap.cpp, pending the repo-layout
-// decision replication.hpp's own header comment mentions.
+// Built by CMake as `replication_demo`. See replication/REPLICATION.md for the
+// specification these six phases exercise.
 //
 // Build: g++ -std=c++26 -O2 -Wall -Wextra -Isrc -luring -lsodium src/replication_demo.cpp -o replication_demo
 

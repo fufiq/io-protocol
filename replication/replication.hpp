@@ -1,7 +1,15 @@
 #pragma once
-// replication.hpp - ships a storage<spec>'s WAL to a replica over
+// replication.hpp - ships a storage's WAL to a replica over
+//
+// SPECIFICATION: replication/REPLICATION.md. This header carries the
+// reasoning behind each decision; the spec carries the shape of the API,
+// the wire format, the limits and the practices.
+//
+// Engine-agnostic by construction: both classes take the table as `auto&`
+// and never name its type, and the test suite runs every applier scenario
+// against storage.hpp and field_storage.hpp alike.
 // protocol::protocol_endpoint, reusing the WAL's own on-disk record format
-// (record_header + payload, exactly as storage::storage<spec>::apply_wal_range
+// (record_header + payload, exactly as the engine's own apply_wal_range
 // expects) as the wire payload directly. No second schema to keep in sync
 // with the first - the primary reads raw bytes straight out of its own
 // mmap'd region (raw_base()/current_offset()) and the replica applies them
@@ -42,7 +50,7 @@
 //
 //   next_apply_offset (replica_applier's bookkeeping for "which primary
 //   offset do I expect next") is tracked independently of the replica's
-//   own storage<spec>::current_offset() - they only happen to be equal in
+//   own current_offset() - they only happen to be equal in
 //   the pure-incremental case. After a snapshot, the replica's own file is
 //   small (just the compacted live set, starting from its own offset 0)
 //   while next_apply_offset jumps to wherever the primary's absolute WAL
@@ -59,7 +67,7 @@
 // create()/update() stay instant and infallible exactly as they are, and
 // "wait until my write reached a quorum" is a separate, explicit,
 // timeout-able loop the caller writes on top of the counting primitives
-// above (see replication_tests.cpp for both a plain-loop and a
+// above (see tests/test_replication.cpp for both a plain-loop and a
 // fiber-based version). That split is deliberate - it keeps storage's
 // write API free of a failure mode it otherwise doesn't have, and keeps
 // the choice of *when* to pay for durability at the call site instead of

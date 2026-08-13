@@ -1470,3 +1470,47 @@ TEST_CASE("checkpoint and restart round-trip repeatedly") {
         REQUIRE(final_table.get<user>(ids[i]) != nullptr);
     wipe_ckpt();
 }
+
+TEST_CASE("crc32c agrees across every implementation and with the standard vector") {
+    // The engine picks its crc32c by architecture. A log written on x86 is
+    // opened on ARM, and replication ships raw records between hosts, so a
+    // divergence would not corrupt anything - it would make every record look
+    // corrupt, on the other architecture only. That is a far worse bug to be
+    // handed than a crash, and it is invisible on any single machine, so it has
+    // to be pinned here.
+
+    // The standard CRC32C check value: "123456789" -> 0xE3069283, with the
+    // usual 0xFFFFFFFF seed and final complement. This is what proves both
+    // paths implement Castagnoli and not merely the same thing as each other.
+    const char check[] = "123456789";
+    CHECK((storage::crc32c(check, 9) ^ 0xFFFFFFFFu) == 0xE3069283u);
+    CHECK((storage::crc32c_software(check, 9, 0xFFFFFFFFu) ^ 0xFFFFFFFFu) == 0xE3069283u);
+
+    // Lengths 0..300 cover both loops and every way the tail can fall out of
+    // the 8-byte step, which is exactly where a byte-order or leftover-handling
+    // mistake would hide.
+    std::vector<uint8_t> buf(300);
+    uint64_t s = 0x243F6A8885A308D3ull;
+    for (auto& b : buf) { s ^= s << 13; s ^= s >> 7; s ^= s << 17; b = (uint8_t)s; }
+
+    bool all_agree = true;
+    for (std::size_t len = 0; len <= buf.size(); ++len)
+        if (storage::crc32c(buf.data(), len) != storage::crc32c_software(buf.data(), len, 0xFFFFFFFFu))
+            all_agree = false;
+    CHECK(all_agree);
+
+    // Unaligned starts too: apply_wal_range hands it network payloads with no
+    // alignment guarantee at all.
+    bool unaligned_agree = true;
+    for (std::size_t off = 1; off < 8; ++off)
+        for (std::size_t len = 0; len + off <= 64; ++len)
+            if (storage::crc32c(buf.data() + off, len) != storage::crc32c_software(buf.data() + off, len, 0xFFFFFFFFu))
+                unaligned_agree = false;
+    CHECK(unaligned_agree);
+
+    // Seeding must chain: checksum_of() computes the header and the payload in
+    // two calls, so a split must equal the whole.
+    const uint32_t whole = storage::crc32c(buf.data(), 128);
+    const uint32_t split = storage::crc32c(buf.data() + 40, 88, storage::crc32c(buf.data(), 40));
+    CHECK(whole == split);
+}

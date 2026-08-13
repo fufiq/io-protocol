@@ -77,7 +77,11 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <nmmintrin.h> // _mm_crc32_u8/_mm_crc32_u64 - hardware CRC32C (SSE4.2)
+#if defined(__x86_64__) || defined(__i386__)
+#include <nmmintrin.h>   // _mm_crc32_u8/_mm_crc32_u64 - hardware CRC32C (SSE4.2)
+#elif defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+#include <arm_acle.h>    // __crc32cb/__crc32cd - the same function, ARM's spelling
+#endif
 #include <string>
 #include <unordered_map>
 #include <mutex>
@@ -126,6 +130,17 @@ namespace storage {
 
     inline std::size_t pad8(std::size_t n) noexcept { return (n + 7) & ~std::size_t(7); }
 
+    // CRC32C (Castagnoli, reflected, polynomial 0x82F63B78), hardware where the
+    // target has an instruction for it and software where it does not.
+    //
+    // ALL THREE PATHS MUST AGREE BYTE FOR BYTE, and that is not a nicety: a
+    // checksum written by one machine is verified by another. Replication ships
+    // raw records between hosts, and a log written on x86 can be opened on ARM.
+    // A divergence here would not corrupt anything - it would make every record
+    // look corrupt, on the other architecture only, which is a far worse bug to
+    // be handed. tests/test_storage.cpp checks the paths against each other and
+    // against the standard vector.
+    //
     // memcpy for the 8-byte reads, not a direct (const uint64_t*) cast: every
     // existing call site happens to pass a pointer derived from base + a
     // pad8()-aligned offset, so the cast was never actually observed to
@@ -134,7 +149,29 @@ namespace storage {
     // is the first caller that can legitimately pass an arbitrary,
     // non-8-byte-aligned buffer - a network-received payload has no
     // alignment guarantee at all). memcpy compiles down to the identical
-    // single unaligned-load instruction on x86 here, so this costs nothing.
+    // single unaligned-load instruction here, so this costs nothing.
+    //
+    // The byte-at-a-time software loop is deliberately not table-driven. It is
+    // the fallback for architectures with no CRC instruction at all, where the
+    // engine is not going to be fast regardless, and a 1 KB lookup table in a
+    // header that a phone includes is a worse trade than the shifts.
+
+    static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+                  "the record format stores integers by memcpy, so a big-endian host would "
+                  "read another host's log as garbage - and crc32c's 8-byte step assumes it too");
+
+    inline uint32_t crc32c_software(const void* data, std::size_t len, uint32_t seed) noexcept {
+        const uint8_t* p = (const uint8_t*)data;
+        uint32_t crc = seed;
+        while (len--) {
+            crc ^= *p++;
+            for (int k = 0; k < 8; ++k)
+                crc = (crc >> 1) ^ (0x82F63B78u & (uint32_t)-(int32_t)(crc & 1));
+        }
+        return crc;
+    }
+
+#if defined(__x86_64__) || defined(__i386__)
     __attribute__((target("sse4.2")))
     inline uint32_t crc32c(const void* data, std::size_t len, uint32_t seed = 0xFFFFFFFFu) noexcept {
         const uint8_t* p = (const uint8_t*)data;
@@ -148,6 +185,28 @@ namespace storage {
         while (len) { crc = _mm_crc32_u8(crc, *p); ++p; --len; }
         return crc;
     }
+#elif defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+    // Mandatory from ARMv8.1 and present on every Apple silicon and essentially
+    // every 64-bit Android device, but optional in ARMv8.0 - hence the feature
+    // macro rather than the architecture alone. Without it this falls through to
+    // the software path below, which is correct and merely slower.
+    inline uint32_t crc32c(const void* data, std::size_t len, uint32_t seed = 0xFFFFFFFFu) noexcept {
+        const uint8_t* p = (const uint8_t*)data;
+        uint32_t crc = seed;
+        while (len >= 8) {
+            uint64_t chunk;
+            std::memcpy(&chunk, p, sizeof(chunk));
+            crc = __crc32cd(crc, chunk);
+            p += 8; len -= 8;
+        }
+        while (len) { crc = __crc32cb(crc, *p); ++p; --len; }
+        return crc;
+    }
+#else
+    inline uint32_t crc32c(const void* data, std::size_t len, uint32_t seed = 0xFFFFFFFFu) noexcept {
+        return crc32c_software(data, len, seed);
+    }
+#endif
 
     // pointer-to-member -> its class, needed by update<member>(id, v):
     // storage<spec> is not templated on any T, so the field's owning class

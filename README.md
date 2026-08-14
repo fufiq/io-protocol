@@ -270,7 +270,9 @@ with `std::atomic_ref` forced off, which is the path Android takes).
 
 Seven libFuzzer targets live in `tests/fuzz/` behind `-DENABLE_FUZZERS=ON`
 (needs clang), covering the Noise handshake, packet assembly, SACK decoding,
-transport decryption, storage recovery and WAL application.
+transport decryption, storage recovery and WAL application. All seven run clean
+- a minute each reaches 6.7M executions for packet assembly, 1.8M for the
+handshake, and 113k-150k for the five that touch crypto or `mmap`.
 
 **Dependencies** are for the transport, not the engine: `liburing` 2.4+ (needs
 `io_uring_setup_buf_ring`), `libsodium` 1.0.19+ (needs the HKDF-SHA256
@@ -295,7 +297,7 @@ rather than that the calls returned zero.
 |---|---|---|
 | Linux x86-64 | yes | yes - `ctest`, Release and ASan/UBSan |
 | Android x86-64, **16 KB pages** | yes | **yes** - all three suites, on an emulator |
-| Android arm64 | yes, NDK r27 clang | no device here; both CRC paths checked in the emitted code |
+| Android arm64 | yes, NDK r27 clang | **not run anywhere** - see below; both CRC paths checked in the emitted code |
 | macOS / iOS | **no** - no Darwin toolchain here | no |
 
 ```sh
@@ -316,6 +318,19 @@ recovered file, quorum reached, and quorum timing out.
 `bench/replica_node.cpp` adds the cross-machine case the suites cannot: the same
 binary is a primary here and a replica on the phone, and the replica brought over
 2,000 records with a matching checksum and offset.
+
+`SANITIZE=1 tools/android_test.sh` runs all of the above under ASan and UBSan,
+and all of it is clean. `vptr` is excluded deliberately: it needs RTTI across the
+statically-linked libc++ boundary and reports doctest's own reporter as a
+violation, which is noise about the harness rather than anything under test.
+
+**arm64 cannot be run on this machine, and not for want of trying.** The Android
+emulator refuses an arm64 image on an x86-64 host - *"Avd's CPU Architecture
+'arm64' is not supported by the QEMU2 emulator on x86_64 host"* - Google having
+dropped cross-architecture emulation, and there is no `qemu-user` here to run
+the binaries directly. So arm64 is compiled and its emitted code inspected (the
+CRC32C path selection was checked both ways) and nothing more. A physical device
+or a `qemu-aarch64` install would close it.
 
 ```sh
 tools/android_test.sh          # needs an NDK and a device or emulator on adb

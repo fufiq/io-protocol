@@ -11,6 +11,7 @@
 //   storage/storage.hpp
 //   storage/field_storage.hpp
 //   storage/prefetch_gather.hpp
+//   storage/blob.hpp
 //   storage/indexes.hpp
 //
 // Needs the standard library and POSIX, and nothing else. To use it, copy this
@@ -343,6 +344,53 @@ namespace storage {
     concept field = std::is_trivially_copyable_v<T> && std::is_standard_layout_v<T>;
 
     using record_id = uint64_t;
+
+    // =====================================================================
+    // A record id that carries what it points AT.
+    //
+    // record_id is a uint64_t, so nothing distinguishes a reference to an order
+    // from one to a product. bench/app_layer.hpp has both in one struct, told
+    // apart by a comment:
+    //
+    //     record_id order_id;      // FK -> order
+    //     record_id product_id;    // FK -> product
+    //
+    // Swap those at a call site and it compiles. Hand one to get<product>() and
+    // it compiles. ref<T> makes both an error, and makes get() able to work out
+    // the type on its own.
+    //
+    // ON DISK IT IS THE SAME EIGHT BYTES. sizeof and every field offset are
+    // unchanged, so a log written before this reads back after it - the whole
+    // type is a compile-time claim about a number that was already there.
+    //
+    // WHAT IT DOES NOT FIX, and the distinction matters: two instances of one
+    // spec both issue ids from 1, so a ref<customer> from one is
+    // indistinguishable from a ref<customer> from another (see §1 on sharding).
+    // Type safety within an instance is what this buys; across instances the id
+    // space has to carry the instance, which is a different change.
+    // =====================================================================
+    template <typename T>
+    class ref {
+    public:
+        using target = T;
+
+        constexpr ref() noexcept = default;
+        constexpr explicit ref(record_id value) noexcept : id_(value) {}
+
+        constexpr record_id id() const noexcept { return id_; }
+        // 0 is never a live record, so this is "does it point at anything".
+        constexpr explicit operator bool() const noexcept { return id_ != 0; }
+
+        friend constexpr bool operator==(ref, ref) noexcept = default;
+        friend constexpr auto operator<=>(ref, ref) noexcept = default;
+
+    private:
+        record_id id_ = 0;
+    };
+
+    template <typename T> struct is_ref : std::false_type {};
+    template <typename T> struct is_ref<ref<T>> : std::true_type {};
+    template <typename T> inline constexpr bool is_ref_v = is_ref<T>::value;
 
     inline std::size_t pad8(std::size_t n) noexcept { return (n + 7) & ~std::size_t(7); }
 
@@ -2286,6 +2334,11 @@ namespace storage {
     template <typename spec, typename observer = null_observer>
     class field_storage {
     public:
+        // The spec this instance was built from, so a helper written against
+        // `auto& table` can ask about its bounds - blob.hpp needs
+        // max_record_bytes to refuse an over-long payload rather than truncate.
+        using spec_type = spec;
+
         struct raw_view { record_id id; tag_t tag; std::span<const std::byte> bytes; };
 
         field_storage() : field_storage(storage_paths{}) {}
@@ -2438,6 +2491,26 @@ namespace storage {
             assemble(id, (std::byte*)&out, sizeof(T));
             return true;
         }
+
+        // The same reads, told what to return by the reference itself. A
+        // ref<customer> can only produce a customer, so the type stops being
+        // something the call site repeats and can therefore get wrong.
+        template <tagged_aggregate T>
+        [[nodiscard]] std::optional<T> get(ref<T> r) const { return get<T>(r.id()); }
+
+        template <tagged_aggregate T>
+        [[nodiscard]] bool get(ref<T> r, T& out) const { return get<T>(r.id(), out); }
+
+        template <typename T>
+        bool alive(ref<T> r) const noexcept { return alive(r.id()); }
+
+        // A typed id for a record this instance is about to write, so a schema
+        // can hold ref<T> fields without ever converting by hand.
+        template <typename T>
+        [[nodiscard]] ref<T> reserve_ref() noexcept { return ref<T>(reserve_id()); }
+
+        template <tagged_aggregate T>
+        ref<T> create_ref(const T& value) { return ref<T>(create(value)); }
 
         [[nodiscard]] bool read_raw(record_id id, std::span<std::byte> out) const {
             if (!alive(id)) return false;
@@ -3496,6 +3569,155 @@ namespace storage {
 } // namespace storage
 // ---- end storage/prefetch_gather.hpp
 
+// ---- begin storage/blob.hpp --------------------------------------------
+// blob.hpp - text and binary of a length you do not know in advance.
+//
+// A record here is a POD aggregate with no padding, so a string inside one can
+// only be `char name[40]`: too small for some rows, wasted on most, and a hard
+// ceiling either way. That is a real limitation of the TYPED api, and it is
+// easy to mistake for a limitation of the engine.
+//
+// It is not. The engine stores a length per record - field_slot::len, 16 bits -
+// and create_raw() takes arbitrary bytes, so records of different sizes already
+// coexist under one tag. Verified before this file was written: 0, 1, 5, 300
+// and 4000 bytes round-trip, and patch() works on them by offset.
+//
+// So what was missing was never a capability. It was a convention and a type:
+// the text lives as its OWN record, and the record that owns it holds a
+// reference instead of an array.
+//
+//     struct article {
+//         static constexpr storage::tag_t tag = 1;
+//         storage::blob_ref<2> title;    // tag 2: where the text lives
+//         storage::blob_ref<2> body;
+//         uint64_t published_ms;
+//     };
+//
+//     article a{};
+//     a.title = storage::put_text<2>(table, "A very long title, no ceiling");
+//     const auto id = table.create(a);
+//     ...
+//     std::string title = storage::load_text(table, table.get<article>(id)->title);
+//
+// WHAT THIS COSTS, stated rather than buried:
+//
+//   A second record per string. Each carries a 24-byte header, so short strings
+//   are worse off than a char[40] would have been - under about 30 bytes, put
+//   it in the struct. The win starts where the ceiling used to bite.
+//
+//   A second lookup to read one. The reference resolves through the slot array,
+//   which is one indexed load, and then the bytes are assembled like any
+//   record. Reading a row and its text is two gathers, not one.
+//
+//   No mutation in place. Text is replaced by writing a new blob and pointing
+//   the owner at it, which leaves the old one for compaction to reclaim. That
+//   is the same trade the whole engine makes and it is not a special case here.
+//
+// WHAT IS DELIBERATELY ABSENT. Interning - sharing one record between equal
+// strings - is not here, because it needs a hash function chosen for the data
+// and a decision about collisions, and both are the application's. It is four
+// lines over a unique_index on a hash field you already control.
+
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <span>
+#include <string>
+#include <string_view>
+
+namespace storage {
+
+    // A reference to a variable-length record stored under `tag_v`.
+    //
+    // Separate from ref<T> because ref<T> names a TYPE and a blob has none -
+    // its payload is the bytes, so there is nothing to get<>() into. The tag is
+    // what distinguishes one kind of blob from another, and putting it in the
+    // type means a title reference cannot be handed to something expecting a
+    // body reference.
+    //
+    // Eight bytes, trivially copyable, no padding: it satisfies the same
+    // aggregate rules a record field must, which is the point of it being a
+    // class rather than a typedef.
+    template <tag_t tag_v>
+    class blob_ref {
+    public:
+        static constexpr tag_t tag = tag_v;
+
+        constexpr blob_ref() noexcept = default;
+        constexpr explicit blob_ref(record_id value) noexcept : id_(value) {}
+
+        constexpr record_id id() const noexcept { return id_; }
+        constexpr explicit operator bool() const noexcept { return id_ != 0; }
+
+        friend constexpr bool operator==(blob_ref, blob_ref) noexcept = default;
+        friend constexpr auto operator<=>(blob_ref, blob_ref) noexcept = default;
+
+    private:
+        record_id id_ = 0;
+    };
+
+    // Writes `bytes` as a record of its own and returns a reference to it.
+    // A default-constructed reference comes back when the payload is longer
+    // than the spec allows, rather than a truncated record that would read as
+    // valid - max_record_bytes is a compile-time bound on this engine and
+    // silently honouring half of a string is worse than refusing it.
+    template <tag_t tag_v>
+    [[nodiscard]] blob_ref<tag_v> put_blob(auto& table, std::span<const std::byte> bytes) {
+        using spec = typename std::remove_reference_t<decltype(table)>::spec_type;
+        if (bytes.size() > spec::max_record_bytes) return blob_ref<tag_v>{};
+        const record_id id = table.reserve_id();
+        table.create_raw(id, tag_v, bytes);
+        return blob_ref<tag_v>(id);
+    }
+
+    template <tag_t tag_v>
+    [[nodiscard]] blob_ref<tag_v> put_text(auto& table, std::string_view text) {
+        return put_blob<tag_v>(table, std::span<const std::byte>{ (const std::byte*)text.data(), text.size() });
+    }
+
+    // How many bytes are behind a reference, without reading them - useful for
+    // sizing a buffer, and for deciding whether to read at all.
+    template <tag_t tag_v>
+    [[nodiscard]] std::size_t blob_size(const auto& table, blob_ref<tag_v> r) noexcept {
+        return r ? table.length_of(r.id()) : 0;
+    }
+
+    // Into the caller's buffer, for a reader that has one already. Returns the
+    // bytes written, 0 if the reference is empty or the buffer is too small -
+    // a partial copy is never reported as success.
+    template <tag_t tag_v>
+    [[nodiscard]] std::size_t load_blob_into(const auto& table, blob_ref<tag_v> r, std::span<std::byte> out) {
+        const std::size_t len = blob_size(table, r);
+        if (!len || len > out.size()) return 0;
+        return table.read_raw(r.id(), out.subspan(0, len)) ? len : 0;
+    }
+
+    template <tag_t tag_v>
+    [[nodiscard]] std::string load_text(const auto& table, blob_ref<tag_v> r) {
+        std::string out(blob_size(table, r), '\0');
+        if (out.empty()) return out;
+        if (!table.read_raw(r.id(), std::span<std::byte>{ (std::byte*)out.data(), out.size() })) out.clear();
+        return out;
+    }
+
+    // Replaces the text behind a field: writes a new blob and hands back the
+    // reference to store. The old record stays until compaction, exactly as an
+    // overwritten field's old bytes do - this is an append-only log, and a blob
+    // is not an exception to that.
+    template <tag_t tag_v>
+    [[nodiscard]] blob_ref<tag_v> replace_text(auto& table, blob_ref<tag_v> previous, std::string_view text) {
+        (void)previous;   // named to make the caller's intent readable at the call site
+        return put_text<tag_v>(table, text);
+    }
+
+    template <typename T> struct is_blob_ref : std::false_type {};
+    template <tag_t tag_v> struct is_blob_ref<blob_ref<tag_v>> : std::true_type {};
+    template <typename T> inline constexpr bool is_blob_ref_v = is_blob_ref<T>::value;
+
+} // namespace storage
+// ---- end storage/blob.hpp
+
 // ---- begin storage/indexes.hpp -----------------------------------------
 // indexes.hpp - secondary indexes you declare instead of write.
 //
@@ -3602,12 +3824,20 @@ namespace storage {
             return value;
         }
 
-        // Index keys are integers. A hash, an id, a timestamp, a price, a
-        // status - that is what a secondary index is nearly always over, and
-        // making it general would mean choosing a hash function on the
-        // application's behalf. Hash the field yourself and index the hash.
+        // Index keys are integers, enums, or a ref - which is an id, so an
+        // integer wearing a type. Anything else would mean choosing a hash
+        // function on the application's behalf; hash the field yourself and
+        // index the hash.
         template <typename K>
-        concept index_key = std::is_integral_v<K> || std::is_enum_v<K>;
+        concept index_key = std::is_integral_v<K> || std::is_enum_v<K> || is_ref_v<K>;
+
+        // One spelling for "the number under this key", so the index kinds do
+        // not each have to know that a ref is an id.
+        template <typename K>
+        constexpr uint64_t key_bits(K key) noexcept {
+            if constexpr (is_ref_v<K>) return key.id();
+            else return (uint64_t)key;
+        }
 
         inline constexpr std::size_t round_pow2(std::size_t n) noexcept {
             std::size_t p = 1;
@@ -3844,15 +4074,15 @@ namespace storage {
         static constexpr tag_t owner_tag = owner::tag;
 
         void reserve(std::size_t records) { map.reserve(records); }
-        bool add(record_id id, const owner& value) { return map.insert((uint64_t)(value.*member), id); }
-        void remove(record_id, const owner& value) { map.erase((uint64_t)(value.*member)); }
+        bool add(record_id id, const owner& value) { return map.insert(detail::key_bits(value.*member), id); }
+        void remove(record_id, const owner& value) { map.erase(detail::key_bits(value.*member)); }
 
         // 0 when absent, since an id is issued from 1.
         record_id find(key_type key) const noexcept {
-            const uint64_t* found = map.find((uint64_t)key);
+            const uint64_t* found = map.find(detail::key_bits(key));
             return found ? (record_id)*found : 0;
         }
-        bool contains(key_type key) const noexcept { return map.find((uint64_t)key) != nullptr; }
+        bool contains(key_type key) const noexcept { return map.find(detail::key_bits(key)) != nullptr; }
         std::size_t size() const noexcept { return map.size(); }
 
     private:
@@ -3870,12 +4100,12 @@ namespace storage {
         static constexpr tag_t owner_tag = owner::tag;
 
         void reserve(std::size_t records) { map.reserve(records, records); }
-        bool add(record_id id, const owner& value) { return map.insert((uint64_t)(value.*member), id); }
-        void remove(record_id id, const owner& value) { map.erase((uint64_t)(value.*member), id); }
+        bool add(record_id id, const owner& value) { return map.insert(detail::key_bits(value.*member), id); }
+        void remove(record_id id, const owner& value) { map.erase(detail::key_bits(value.*member), id); }
 
-        void each(key_type key, auto&& fn) const { map.each((uint64_t)key, [&](uint64_t id) { fn((record_id)id); }); }
-        std::size_t count(key_type key) const noexcept { return map.count((uint64_t)key); }
-        bool empty(key_type key) const noexcept { return map.empty((uint64_t)key); }
+        void each(key_type key, auto&& fn) const { map.each(detail::key_bits(key), [&](uint64_t id) { fn((record_id)id); }); }
+        std::size_t count(key_type key) const noexcept { return map.count(detail::key_bits(key)); }
+        bool empty(key_type key) const noexcept { return map.empty(detail::key_bits(key)); }
 
     private:
         flat_multi_map map;

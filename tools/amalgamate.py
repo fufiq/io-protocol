@@ -31,6 +31,7 @@ SOURCES = [
     "storage/storage.hpp",
     "storage/field_storage.hpp",
     "storage/prefetch_gather.hpp",
+    "storage/blob.hpp",
     "storage/indexes.hpp",
 ]
 

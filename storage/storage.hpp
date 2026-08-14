@@ -128,6 +128,53 @@ namespace storage {
 
     using record_id = uint64_t;
 
+    // =====================================================================
+    // A record id that carries what it points AT.
+    //
+    // record_id is a uint64_t, so nothing distinguishes a reference to an order
+    // from one to a product. bench/app_layer.hpp has both in one struct, told
+    // apart by a comment:
+    //
+    //     record_id order_id;      // FK -> order
+    //     record_id product_id;    // FK -> product
+    //
+    // Swap those at a call site and it compiles. Hand one to get<product>() and
+    // it compiles. ref<T> makes both an error, and makes get() able to work out
+    // the type on its own.
+    //
+    // ON DISK IT IS THE SAME EIGHT BYTES. sizeof and every field offset are
+    // unchanged, so a log written before this reads back after it - the whole
+    // type is a compile-time claim about a number that was already there.
+    //
+    // WHAT IT DOES NOT FIX, and the distinction matters: two instances of one
+    // spec both issue ids from 1, so a ref<customer> from one is
+    // indistinguishable from a ref<customer> from another (see §1 on sharding).
+    // Type safety within an instance is what this buys; across instances the id
+    // space has to carry the instance, which is a different change.
+    // =====================================================================
+    template <typename T>
+    class ref {
+    public:
+        using target = T;
+
+        constexpr ref() noexcept = default;
+        constexpr explicit ref(record_id value) noexcept : id_(value) {}
+
+        constexpr record_id id() const noexcept { return id_; }
+        // 0 is never a live record, so this is "does it point at anything".
+        constexpr explicit operator bool() const noexcept { return id_ != 0; }
+
+        friend constexpr bool operator==(ref, ref) noexcept = default;
+        friend constexpr auto operator<=>(ref, ref) noexcept = default;
+
+    private:
+        record_id id_ = 0;
+    };
+
+    template <typename T> struct is_ref : std::false_type {};
+    template <typename T> struct is_ref<ref<T>> : std::true_type {};
+    template <typename T> inline constexpr bool is_ref_v = is_ref<T>::value;
+
     inline std::size_t pad8(std::size_t n) noexcept { return (n + 7) & ~std::size_t(7); }
 
     // CRC32C (Castagnoli, reflected, polynomial 0x82F63B78), hardware where the

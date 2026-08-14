@@ -105,12 +105,20 @@ namespace storage {
             return value;
         }
 
-        // Index keys are integers. A hash, an id, a timestamp, a price, a
-        // status - that is what a secondary index is nearly always over, and
-        // making it general would mean choosing a hash function on the
-        // application's behalf. Hash the field yourself and index the hash.
+        // Index keys are integers, enums, or a ref - which is an id, so an
+        // integer wearing a type. Anything else would mean choosing a hash
+        // function on the application's behalf; hash the field yourself and
+        // index the hash.
         template <typename K>
-        concept index_key = std::is_integral_v<K> || std::is_enum_v<K>;
+        concept index_key = std::is_integral_v<K> || std::is_enum_v<K> || is_ref_v<K>;
+
+        // One spelling for "the number under this key", so the index kinds do
+        // not each have to know that a ref is an id.
+        template <typename K>
+        constexpr uint64_t key_bits(K key) noexcept {
+            if constexpr (is_ref_v<K>) return key.id();
+            else return (uint64_t)key;
+        }
 
         inline constexpr std::size_t round_pow2(std::size_t n) noexcept {
             std::size_t p = 1;
@@ -347,15 +355,15 @@ namespace storage {
         static constexpr tag_t owner_tag = owner::tag;
 
         void reserve(std::size_t records) { map.reserve(records); }
-        bool add(record_id id, const owner& value) { return map.insert((uint64_t)(value.*member), id); }
-        void remove(record_id, const owner& value) { map.erase((uint64_t)(value.*member)); }
+        bool add(record_id id, const owner& value) { return map.insert(detail::key_bits(value.*member), id); }
+        void remove(record_id, const owner& value) { map.erase(detail::key_bits(value.*member)); }
 
         // 0 when absent, since an id is issued from 1.
         record_id find(key_type key) const noexcept {
-            const uint64_t* found = map.find((uint64_t)key);
+            const uint64_t* found = map.find(detail::key_bits(key));
             return found ? (record_id)*found : 0;
         }
-        bool contains(key_type key) const noexcept { return map.find((uint64_t)key) != nullptr; }
+        bool contains(key_type key) const noexcept { return map.find(detail::key_bits(key)) != nullptr; }
         std::size_t size() const noexcept { return map.size(); }
 
     private:
@@ -373,12 +381,12 @@ namespace storage {
         static constexpr tag_t owner_tag = owner::tag;
 
         void reserve(std::size_t records) { map.reserve(records, records); }
-        bool add(record_id id, const owner& value) { return map.insert((uint64_t)(value.*member), id); }
-        void remove(record_id id, const owner& value) { map.erase((uint64_t)(value.*member), id); }
+        bool add(record_id id, const owner& value) { return map.insert(detail::key_bits(value.*member), id); }
+        void remove(record_id id, const owner& value) { map.erase(detail::key_bits(value.*member), id); }
 
-        void each(key_type key, auto&& fn) const { map.each((uint64_t)key, [&](uint64_t id) { fn((record_id)id); }); }
-        std::size_t count(key_type key) const noexcept { return map.count((uint64_t)key); }
-        bool empty(key_type key) const noexcept { return map.empty((uint64_t)key); }
+        void each(key_type key, auto&& fn) const { map.each(detail::key_bits(key), [&](uint64_t id) { fn((record_id)id); }); }
+        std::size_t count(key_type key) const noexcept { return map.count(detail::key_bits(key)); }
+        bool empty(key_type key) const noexcept { return map.empty(detail::key_bits(key)); }
 
     private:
         flat_multi_map map;

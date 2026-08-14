@@ -297,6 +297,11 @@ namespace storage {
     template <typename spec, typename observer = null_observer>
     class field_storage {
     public:
+        // The spec this instance was built from, so a helper written against
+        // `auto& table` can ask about its bounds - blob.hpp needs
+        // max_record_bytes to refuse an over-long payload rather than truncate.
+        using spec_type = spec;
+
         struct raw_view { record_id id; tag_t tag; std::span<const std::byte> bytes; };
 
         field_storage() : field_storage(storage_paths{}) {}
@@ -449,6 +454,26 @@ namespace storage {
             assemble(id, (std::byte*)&out, sizeof(T));
             return true;
         }
+
+        // The same reads, told what to return by the reference itself. A
+        // ref<customer> can only produce a customer, so the type stops being
+        // something the call site repeats and can therefore get wrong.
+        template <tagged_aggregate T>
+        [[nodiscard]] std::optional<T> get(ref<T> r) const { return get<T>(r.id()); }
+
+        template <tagged_aggregate T>
+        [[nodiscard]] bool get(ref<T> r, T& out) const { return get<T>(r.id(), out); }
+
+        template <typename T>
+        bool alive(ref<T> r) const noexcept { return alive(r.id()); }
+
+        // A typed id for a record this instance is about to write, so a schema
+        // can hold ref<T> fields without ever converting by hand.
+        template <typename T>
+        [[nodiscard]] ref<T> reserve_ref() noexcept { return ref<T>(reserve_id()); }
+
+        template <tagged_aggregate T>
+        ref<T> create_ref(const T& value) { return ref<T>(create(value)); }
 
         [[nodiscard]] bool read_raw(record_id id, std::span<std::byte> out) const {
             if (!alive(id)) return false;

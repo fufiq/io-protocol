@@ -217,3 +217,141 @@ TEST_CASE("running out of capacity is counted, never silent") {
     CHECK(t.observer_state().failed_inserts() > 0);
     wipe();
 }
+
+TEST_CASE("a checkpoint restart rebuilds the indexes instead of leaving them empty") {
+    // The one path where on_record never fires: restart() from a checkpoint
+    // skips the replay, which is the whole point of it. Without the engine
+    // telling the observer, every index came back empty and answered "no" to
+    // every lookup - a result rather than a failure, indistinguishable from
+    // downstream.
+    using ck_spec = storage::field_spec<"t_ixck.log", 1u << 22, "t_ixck.idx", 8192, 8192, 8, 64, "t_ixck.ck">;
+    using ck_table = storage::field_storage<ck_spec, indexes>;
+    const auto ck_wipe = [] {
+        std::remove(ck_spec::path.value);
+        std::remove(ck_spec::index_path);
+        std::remove(ck_spec::checkpoint_path);
+    };
+
+    ck_wipe();
+    record_id id = 0;
+    {
+        ck_table t;
+        REQUIRE(t.ok());
+        id = t.create(customer{ 1111, 500, 0 });
+        t.create(customer{ 2222, 700, 0 });
+        t.create(order{ (uint64_t)id, 50, 0 });
+        t.update<&customer::balance>(id, 900);
+        REQUIRE(t.checkpoint());
+    }
+    {
+        ck_table t;
+        REQUIRE(t.ok());
+        t.restart(1u << 22);
+        REQUIRE(t.started_from_checkpoint());   // the replay really was skipped
+
+        CHECK(t.observer_state().find<&customer::email_hash>(1111) == id);
+        CHECK(t.observer_state().of<&customer::email_hash>().size() == 2);
+        CHECK(t.observer_state().count<&order::customer_id>((uint64_t)id) == 1);
+        // Rebuilt from the LIVE record, so the update is in it - not from the
+        // create alone.
+        CHECK(t.observer_state().count_range<&customer::balance>(900, 900) == 1);
+        CHECK(t.observer_state().count_range<&customer::balance>(500, 500) == 0);
+    }
+    ck_wipe();
+}
+
+TEST_CASE("an ordered index stays exact across the merges it does behind your back") {
+    // Inserts do not go straight into the sorted array - they land in a pending
+    // tail that is merged in batches, because inserting into the middle of a
+    // sorted vector moves the tail and a bulk load of 200k rows cost 320 GB of
+    // memmove before this existed (bench/app_schema_bench.cpp, +1115% on the
+    // write path; it is +83% now).
+    //
+    // The batching is invisible unless it is wrong, so this walks a population
+    // large enough to cross the merge threshold several times, deletes entries
+    // on BOTH sides of it - one still pending, one long since merged - and
+    // compares every answer against a reference built independently.
+    wipe();
+    table_t t;
+    REQUIRE(t.ok());
+    t.observer_state() = indexes{ 8000 };
+
+    std::vector<int64_t> reference;
+    std::vector<record_id> ids;
+    uint64_t seed = 99;
+    const auto next = [&] { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; return seed; };
+
+    for (int i = 0; i < 6000; ++i) {
+        const int64_t balance = (int64_t)(next() % 2000);
+        ids.push_back(t.create(customer{ (uint64_t)(500000 + i), balance, 0 }));
+        reference.push_back(balance);
+    }
+    REQUIRE(t.observer_state().failed_inserts() == 0);
+
+    const auto expect_range = [&](int64_t lo, int64_t hi) {
+        std::size_t n = 0;
+        for (int64_t b : reference) if (b >= lo && b <= hi) ++n;
+        return n;
+    };
+
+    CHECK(t.observer_state().count_range<&customer::balance>(0, 1999) == 6000);
+    CHECK(t.observer_state().count_range<&customer::balance>(700, 900) == expect_range(700, 900));
+    CHECK(t.observer_state().count_range<&customer::balance>(0, 0) == expect_range(0, 0));
+
+    // A query settles the pending tail, so what follows exercises inserts that
+    // arrive on top of an already-merged array - the other half of the state
+    // machine, and the half a single-shot test would never reach.
+    for (int i = 0; i < 1500; ++i) {
+        const int64_t balance = (int64_t)(next() % 2000);
+        ids.push_back(t.create(customer{ (uint64_t)(600000 + i), balance, 0 }));
+        reference.push_back(balance);
+    }
+    CHECK(t.observer_state().count_range<&customer::balance>(700, 900) == expect_range(700, 900));
+
+    // Now remove one entry that is certainly merged (the very first) and one
+    // that is certainly still pending (the very last), and check both took.
+    const auto drop = [&](std::size_t at) {
+        t.destroy(ids[at]);
+        reference[at] = -1;   // outside every range asked about below
+    };
+    drop(0);
+    drop(reference.size() - 1);
+    CHECK(t.observer_state().count_range<&customer::balance>(0, 1999) == expect_range(0, 1999));
+    CHECK(t.observer_state().count_range<&customer::balance>(700, 900) == expect_range(700, 900));
+
+    // And the walk agrees with the count, in order.
+    int64_t previous = -1;
+    std::size_t walked = 0;
+    t.observer_state().each_range<&customer::balance>(700, 900, [&](record_id, int64_t balance) {
+        CHECK(balance >= previous);   // the whole reason it is an ordered index
+        previous = balance;
+        ++walked;
+    });
+    CHECK(walked == expect_range(700, 900));
+    wipe();
+}
+
+TEST_CASE("rebuilding an index twice does not double it") {
+    // index_set::on_restart re-reserves every index and rebuilds from the live
+    // records. The hash maps assign() and so start empty; the ordered map only
+    // reserved, kept its pairs, and appended a second copy of everything - so a
+    // second restart on a live index_set returned every product twice and every
+    // range count was exactly double. Nothing crashed, which is the problem.
+    wipe();
+    table_t t;
+    REQUIRE(t.ok());
+    t.observer_state() = indexes{ 1024 };
+
+    for (int i = 0; i < 50; ++i) t.create(customer{ (uint64_t)(9000 + i), i * 10, 0 });
+    const auto once = t.observer_state().count_range<&customer::balance>(0, 1000);
+    CHECK(once == 50);
+
+    t.observer_state().on_restart(t);
+    CHECK(t.observer_state().count_range<&customer::balance>(0, 1000) == once);
+    CHECK(t.observer_state().find<&customer::email_hash>(9000) != 0);
+
+    t.observer_state().on_restart(t);
+    CHECK(t.observer_state().count_range<&customer::balance>(0, 1000) == once);
+    CHECK(t.observer_state().failed_inserts() == 0);
+    wipe();
+}

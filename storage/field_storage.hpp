@@ -902,6 +902,21 @@ namespace storage {
             write_offset = (std::size_t)rec.write_offset;
             last_synced = write_offset;
             from_checkpoint = true;
+
+            // THE OBSERVER HAS TO BE TOLD, because this is the one path where
+            // it does not see the records. A checkpoint restore skips the
+            // replay - that is the whole point of it - so on_record fires zero
+            // times and anything the observer was maintaining comes back empty.
+            //
+            // Silently. A secondary index that lost everything answers "no" to
+            // every lookup, which reads as a result rather than as a failure,
+            // and nothing downstream can tell the difference. bench/app_layer.hpp
+            // avoided it by keeping its index in a mapping too; an observer that
+            // does not can rebuild here instead.
+            //
+            // Opt-in by having the member: an observer without on_restart is
+            // unaffected and pays nothing.
+            if constexpr (requires { obs.on_restart(*this); }) obs.on_restart(*this);
             return write_offset;
         }
 

@@ -2939,6 +2939,21 @@ namespace storage {
             write_offset = (std::size_t)rec.write_offset;
             last_synced = write_offset;
             from_checkpoint = true;
+
+            // THE OBSERVER HAS TO BE TOLD, because this is the one path where
+            // it does not see the records. A checkpoint restore skips the
+            // replay - that is the whole point of it - so on_record fires zero
+            // times and anything the observer was maintaining comes back empty.
+            //
+            // Silently. A secondary index that lost everything answers "no" to
+            // every lookup, which reads as a result rather than as a failure,
+            // and nothing downstream can tell the difference. bench/app_layer.hpp
+            // avoided it by keeping its index in a mapping too; an observer that
+            // does not can rebuild here instead.
+            //
+            // Opt-in by having the member: an observer without on_restart is
+            // unaffected and pays nothing.
+            if constexpr (requires { obs.on_restart(*this); }) obs.on_restart(*this);
             return write_offset;
         }
 
@@ -3776,6 +3791,7 @@ namespace storage {
 // database that is correct until the first crash).
 
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -4000,23 +4016,54 @@ namespace storage {
     // (key, id) pairs kept sorted, so a range is two binary searches and a
     // subtraction.
     //
-    // A sorted array rather than a tree, and the cost is stated rather than
-    // hidden: an insert into the middle moves the tail. A B-tree would make
-    // that O(log n) at the price of a great deal of code that has to be right,
-    // and the trade only pays when writes are frequent - an ordered index over
-    // something like a price is queried far more often than it is written.
+    // A sorted array rather than a tree. The obvious way to write that is to
+    // memmove the tail on every insert, and this class did - until the number
+    // was measured. Filling 200,000 products cost 3.3 seconds against 0.3 for
+    // the same fill with the other five indexes: n²/2 elements moved, 320 GB of
+    // memmove for one bulk load. "An insert into the middle moves the tail" was
+    // an honest sentence that nobody would have turned into that number.
+    //
+    // So inserts land in an unsorted PENDING tail and are merged in batches:
+    // one sort of the tail plus one inplace_merge, amortised to O(n log n) for
+    // a bulk load, with the sorted array - and therefore the two binary
+    // searches a range costs - unchanged. A B-tree would beat this on a write
+    // stream that never stops, at the price of a great deal of code that has to
+    // be right; this is thirty lines and the same data structure underneath.
+    //
+    // The catch, stated because it is easy to trip on: a QUERY may settle the
+    // pending tail, so the const query methods mutate. This class was never
+    // shareable between threads and is not shareable now; nothing about the
+    // const on those methods should be read as a promise that it is.
     // =====================================================================
     class flat_ordered_map {
     public:
-        void reserve(std::size_t entries) { pairs.reserve(entries); limit = entries; }
+        // Clears rather than merely reserving: index_set::on_restart re-reserves
+        // every index and then rebuilds, so a reserve that kept the old pairs
+        // would double every entry instead of replacing it. The hash maps here
+        // assign() and so were always right; this one was not.
+        void reserve(std::size_t entries) {
+            pairs.clear();
+            pending.clear();
+            pairs.reserve(entries);
+            limit = entries;
+        }
 
         bool insert(int64_t key, uint64_t id) {
-            if (pairs.size() >= limit) return false;
-            pairs.insert(pairs.begin() + (std::ptrdiff_t)lower_bound(key), entry{ key, id });
+            if (pairs.size() + pending.size() >= limit) return false;
+            pending.push_back(entry{ key, id });
+            if (pending.size() >= merge_threshold()) settle();
             return true;
         }
 
         bool erase(int64_t key, uint64_t id) {
+            // The pending tail is unsorted and bounded, so it is scanned; an
+            // entry removed before it is merged never costs a memmove at all.
+            for (std::size_t i = 0; i < pending.size(); ++i) {
+                if (pending[i].key != key || pending[i].id != id) continue;
+                pending[i] = pending.back();
+                pending.pop_back();
+                return true;
+            }
             for (std::size_t i = lower_bound(key); i < pairs.size() && pairs[i].key == key; ++i) {
                 if (pairs[i].id != id) continue;
                 pairs.erase(pairs.begin() + (std::ptrdiff_t)i);
@@ -4025,19 +4072,42 @@ namespace storage {
             return false;
         }
 
-        std::size_t count_range(int64_t lo, int64_t hi) const noexcept {
+        // Not noexcept: settling the pending tail sorts and merges, and both
+        // are allowed to allocate. Nothing else here can throw.
+        std::size_t count_range(int64_t lo, int64_t hi) const {
+            settle();
             return upper_bound(hi) - lower_bound(lo);
         }
 
         void each_range(int64_t lo, int64_t hi, auto&& fn) const {
+            settle();
             for (std::size_t i = lower_bound(lo), end = upper_bound(hi); i < end; ++i)
                 fn(pairs[i].id, pairs[i].key);
         }
 
-        std::size_t size() const noexcept { return pairs.size(); }
+        std::size_t size() const noexcept { return pairs.size() + pending.size(); }
 
     private:
         struct entry { int64_t key; uint64_t id; };
+
+        static bool by_key(const entry& a, const entry& b) noexcept { return a.key < b.key; }
+
+        // Merge when the tail is an eighth of what is already sorted, so the
+        // number of merges over a bulk load is logarithmic rather than linear.
+        // The floor keeps a small index from merging on nearly every insert.
+        std::size_t merge_threshold() const noexcept {
+            const std::size_t proportional = pairs.size() / 8;
+            return proportional < 1024 ? 1024 : proportional;
+        }
+
+        void settle() const {
+            if (pending.empty()) return;
+            std::sort(pending.begin(), pending.end(), by_key);
+            const std::size_t sorted_end = pairs.size();
+            pairs.insert(pairs.end(), pending.begin(), pending.end());
+            std::inplace_merge(pairs.begin(), pairs.begin() + (std::ptrdiff_t)sorted_end, pairs.end(), by_key);
+            pending.clear();
+        }
 
         std::size_t lower_bound(int64_t key) const noexcept {
             std::size_t lo = 0, hi = pairs.size();
@@ -4050,7 +4120,8 @@ namespace storage {
             return lo;
         }
 
-        std::vector<entry> pairs;
+        mutable std::vector<entry> pairs;
+        mutable std::vector<entry> pending;
         std::size_t limit = 0;
     };
 
@@ -4125,7 +4196,7 @@ namespace storage {
         bool add(record_id id, const owner& value) { return map.insert((int64_t)(value.*member), id); }
         void remove(record_id id, const owner& value) { map.erase((int64_t)(value.*member), id); }
 
-        std::size_t count_range(key_type lo, key_type hi) const noexcept {
+        std::size_t count_range(key_type lo, key_type hi) const {
             return map.count_range((int64_t)lo, (int64_t)hi);
         }
         void each_range(key_type lo, key_type hi, auto&& fn) const {
@@ -4152,7 +4223,7 @@ namespace storage {
         // unpredictable exactly when it matters, and the engine's own index
         // makes the same trade. Sized in records, since that is the number an
         // application actually knows.
-        explicit index_set(std::size_t expected_records = 1024) {
+        explicit index_set(std::size_t expected_records = 1024) : expected(expected_records) {
             std::apply([&](auto&... ix) { (ix.reserve(expected_records), ...); }, indexes);
         }
 
@@ -4175,11 +4246,24 @@ namespace storage {
         }
 
         // Puts an already-stored record into the indexes, for rebuilding from
-        // live records rather than by replaying the log - what a restart from
-        // a checkpoint needs, since the checkpoint skipped the replay that
-        // would otherwise have called on_record for everything.
+        // live records rather than by replaying the log.
         void index_existing(record_id id, tag_t what, const std::byte* bytes) {
             std::apply([&](auto&... ix) { (add_if_matching(ix, id, what, bytes), ...); }, indexes);
+        }
+
+        // Called by the engine after a checkpoint restore, which is the one
+        // path where on_record never fires - the replay is skipped, so without
+        // this every index comes back empty and answers "no" to everything.
+        //
+        // The cost is one pass over the LIVE RECORDS rather than over the log,
+        // which is the trade a checkpoint was bought for in the first place:
+        // the engine's own state came back for free and this is what is left
+        // to pay. bench/app_layer.hpp pays nothing instead by keeping its index
+        // in a mapping; that is a further step, not a different answer.
+        void on_restart(auto& table) {
+            std::apply([&](auto&... ix) { (ix.reserve(expected), ...); }, indexes);
+            failures = 0;
+            table.for_each_raw([&](auto view) { index_existing(view.id, view.tag, view.bytes.data()); });
         }
 
         // ---- queries, addressed by the field they index ----
@@ -4270,6 +4354,7 @@ namespace storage {
         }
 
         std::tuple<index_types...> indexes;
+        std::size_t expected = 1024;
         std::size_t failures = 0;
     };
 

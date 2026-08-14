@@ -65,6 +65,10 @@ target_link_libraries(stress_heap PRIVATE Threads::Threads)
 add_executable(app_layer_bench bench/app_layer_bench.cpp)
 target_link_libraries(app_layer_bench PRIVATE storage)
 
+# The same schema on the declared index layer, and what that costs.
+add_executable(app_schema_bench bench/app_schema_bench.cpp)
+target_link_libraries(app_schema_bench PRIVATE storage)
+
 add_executable(business_demo_heap bench/business_demo_heap.cpp)
 target_link_libraries(business_demo_heap PRIVATE storage runtime Threads::Threads)
 

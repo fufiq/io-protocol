@@ -340,6 +340,62 @@ TEST_CASE_TEMPLATE("a tampered data packet is rejected by the full stack, not de
     CHECK(find_message(server.events, conn_id) == nullptr);
 }
 
+// A raw socket standing in for the responder - connect() sends synchronously
+// from inside the call, so this captures exactly what left the wire, with no
+// protocol_endpoint on the other end to have already stripped the disguise
+// off. This is the black-box check for net/DPI_RESISTANCE.md's item 1: not
+// that the fields decode back correctly (the 11 other handshake tests already
+// prove that, since a real server has to deobfuscate to complete a real
+// handshake) but that what a passive observer sees is not the old signature.
+TEST_CASE_TEMPLATE("a handshake init's header and mac2 do not look like message1 on the wire", tr, BC_TRANSPORTS) {
+    peer<tr> client;
+    uint16_t sniff_port;
+    int sniff_fd = make_bound_udp_socket(&sniff_port);
+    timeval rcv_timeout{2, 0};   // a bug here must fail loudly, not hang the suite
+    REQUIRE(setsockopt(sniff_fd, SOL_SOCKET, SO_RCVTIMEO, &rcv_timeout, sizeof(rcv_timeout)) == 0);
+    sockaddr_in sniff_addr = loopback_addr(sniff_port);
+
+    // connect() only QUEUES the send under the io_uring backend - the actual
+    // sendmsg happens when something submits the ring, which poll_io() does
+    // even with nothing to receive (epoll's send() is synchronous inside
+    // connect() already, so this is a harmless no-op there).
+    auto fake_remote = crypto::x25519_generate();
+    client.endpoint.connect(1, fake_remote.pub, (sockaddr*)&sniff_addr, sizeof(sniff_addr));
+    client.endpoint.poll_io(std::chrono::milliseconds{0});
+
+    std::vector<uint8_t> wire(256);
+    ssize_t n = recv(sniff_fd, wire.data(), wire.size(), 0);
+    close(sniff_fd);
+    REQUIRE(n == 137);   // the exact, fixed length a message1 always is
+
+    // The old signature: 16 zero bytes at offset 121, every first attempt,
+    // because a cookie hasn't been issued yet. This is that exact byte range,
+    // on that exact packet shape, and it must not be all zero - the odds of a
+    // 16-byte keystream slice landing on all-zero by chance are 2^-128, so
+    // this is not a test that could pass by luck.
+    bool mac2_all_zero = std::all_of(wire.begin() + 121, wire.begin() + 137, [](uint8_t b) { return b == 0; });
+    CHECK_FALSE(mac2_all_zero);
+
+    // And the type byte a plaintext classifier would key on is not literally
+    // 1 - checked over several independent attempts (different conn_id, fresh
+    // ephemeral each time) since any SINGLE byte has a 1/256 chance of landing
+    // on 1 by coincidence even when correctly obfuscated.
+    int plain_one_count = 0;
+    for (uint64_t id = 2; id < 22; ++id) {
+        int fd2 = make_bound_udp_socket(&sniff_port);
+        REQUIRE(setsockopt(fd2, SOL_SOCKET, SO_RCVTIMEO, &rcv_timeout, sizeof(rcv_timeout)) == 0);
+        sockaddr_in addr2 = loopback_addr(sniff_port);
+        client.endpoint.connect(id, fake_remote.pub, (sockaddr*)&addr2, sizeof(addr2));
+        client.endpoint.poll_io(std::chrono::milliseconds{0});
+        uint8_t first_byte = 0xFF;   // fails visibly (not 1) if recv times out rather than reporting a false pass
+        ssize_t got = recv(fd2, &first_byte, 1, 0);   // fills what fits and drops the rest; one byte is all this needs
+        close(fd2);
+        CHECK(got == 1);
+        if (first_byte == 1) ++plain_one_count;
+    }
+    CHECK(plain_one_count == 0);
+}
+
 TEST_CASE_TEMPLATE("the reliable congestion window grows on acks and is not exceeded under sustained sends", tr, BC_TRANSPORTS) {
     peer<tr> server;
     peer<tr> client;

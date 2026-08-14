@@ -222,4 +222,23 @@ inline bool constant_time_eq(const uint8_t* a, const uint8_t* b, size_t len) {
     return sodium_memcmp(a, b, len) == 0;
 }
 
+// --- Bare stream cipher, for disguise rather than confidentiality ----------
+//
+// Pure ChaCha20 keystream (IETF variant), with no MAC and no associated data.
+// This is deliberately weaker than everything else in this file: it exists
+// for exactly one job - XORing a few fixed-offset plaintext bytes into
+// something a passive observer cannot pattern-match - over bytes that are
+// already covered by a real authenticator further into the same packet (see
+// protocol.hpp's header obfuscation). It must never be the only thing
+// protecting a byte range: unlike aead_encrypt, nothing here proves the
+// bytes weren't tampered with, only that they don't look like what they are.
+constexpr size_t stream_nonce_len = crypto_stream_chacha20_ietf_NONCEBYTES; // 12
+using stream_nonce = std::array<uint8_t, stream_nonce_len>;
+static_assert(hash_len == crypto_stream_chacha20_ietf_KEYBYTES, "chacha20-ietf wants a 32-byte key, same width as our hash type");
+
+inline void stream_keystream(uint8_t* out, size_t len, const stream_nonce& nonce, const hash& key) {
+    detail::ensure_init();
+    crypto_stream_chacha20_ietf(out, len, nonce.data(), key.data());
+}
+
 } // namespace crypto

@@ -21,6 +21,15 @@
 //   5 = SACK batch:         type(1) | conn_id(8) | count(1) | count * 14-byte entries
 //   6 = keepalive:          type(1) | conn_id(8) | <connection keepalive wire packet: nonce(8) | AEAD tag(16), no payload>
 //
+// Packet 1's type+conn_id+mac2 are disguised on the wire (see "handshake
+// header obfuscation" below): what a passive observer sees at offsets 0-8 and
+// 121-136 of a fresh connection's first packet is not the values above but a
+// keystream, indistinguishable from the AEAD ciphertext next to it. This is
+// against DPI fingerprinting, not against a peer who already knows this
+// project's key material - see net/DPI_RESISTANCE.md for the threat model,
+// what this closes, and what it deliberately does not (packet types 2-6 are
+// unaffected, for reasons specific to each and stated there).
+//
 // Cleanup of hanging connections (two distinct cases, both handled in
 // tick()): an established session whose peer has gone quiet past
 // liveness_timeout is torn down and reported via peer_unreachable - this
@@ -224,9 +233,16 @@ public:
         std::memcpy(&pending.addr, addr, addr_len);
         pending_initiators.insert_or_assign(conn_id, std::move(pending));
 
-        std::vector<uint8_t> wire(msg1.size() + anti_dos::cookie_len, 0); // zero mac2: no cookie yet on the first try
+        std::vector<uint8_t> wire(msg1.size() + anti_dos::cookie_len, 0); // real mac2: zero, no cookie yet on the first try
         std::memcpy(wire.data(), msg1.data(), msg1.size());
-        send_wire(1, wire.data(), wire.size(), conn_id, addr, addr_len);
+
+        uint8_t obf_type = 1;
+        uint64_t obf_conn_id = conn_id;
+        crypto::public_key ephemeral;
+        std::memcpy(ephemeral.data(), msg1.data(), crypto::key_len);
+        xor_msg1_header(obf_type, obf_conn_id, wire.data() + wire.size() - anti_dos::cookie_len, remote_static, ephemeral.data());
+
+        send_wire(obf_type, wire.data(), wire.size(), obf_conn_id, addr, addr_len);
     }
 
     // Queues `data` for conn_id. Does not touch the network here - actual
@@ -249,6 +265,31 @@ public:
     // the backend delivers; results land in the queue poll_incoming() drains.
     void on_datagram(const datagram& frag) {
         if (frag.payload_len <= hdr_len) return;
+
+        // Every genuine message1 is exactly msg1_wire_len bytes with its
+        // header and mac2 obfuscated (xor_msg1_header, above), so a packet
+        // shaped like one is tried that way first. The length match is not
+        // proof - it only gates the cost of trying - so a wrong guess falls
+        // straight through to the plaintext interpretation below. The real
+        // decision is mac1, inside handle_message1: unrelated bytes that
+        // happen to be 137 long produce a type byte that, on the roughly
+        // 0.8% chance it lands on 1 anyway, cost one wasted HMAC and nothing
+        // more, since mac1 rejects everything that isn't a real handshake
+        // attempt from someone who knows this responder's static key.
+        if (frag.payload_len == msg1_wire_len) {
+            uint8_t trial_type = frag.payload[0];
+            uint64_t trial_conn_id;
+            std::memcpy(&trial_conn_id, frag.payload + 1, 8);
+            std::array<uint8_t, msg1_wire_len - hdr_len> trial_body;
+            std::memcpy(trial_body.data(), frag.payload + hdr_len, trial_body.size());
+
+            xor_msg1_header(trial_type, trial_conn_id, trial_body.data() + trial_body.size() - anti_dos::cookie_len,
+                            local_static.pub, trial_body.data());
+            if (trial_type == 1) {
+                handle_message1(trial_conn_id, trial_body.data(), trial_body.size(), frag.peer_addr, frag.peer_addr_len);
+                return;
+            }
+        }
 
         uint8_t type = frag.payload[0];
         uint64_t conn_id;
@@ -471,6 +512,110 @@ private:
     static_assert(max_data_wire_packet_len <= 2048 && max_sack_wire_packet_len <= 2048 && max_keepalive_wire_packet_len <= 2048,
                   "a backend send buffer must hold the biggest data, SACK or keepalive packet the wire format can produce");
 
+    // ---- handshake header obfuscation (packet type 1 only) ---------------
+    //
+    // net/DPI_RESISTANCE.md, item 1: the worst of the four fingerprintable
+    // artefacts in this wire format was 16 zero bytes at a fixed offset in
+    // the first packet of every flow - mac2, all-zero until a cookie has
+    // been issued. This is what removes it, plus the plaintext type byte and
+    // conn_id alongside it, without adding a single byte to the wire.
+    //
+    // SCOPE, stated rather than implied by silence. This covers packet type
+    // 1 and nothing else, and each exclusion is a reason, not an oversight:
+    //
+    //   Type 2 (handshake response) is not covered. The receiver - the
+    //   original initiator - would need to try every pending connection's
+    //   remote_static to find the one key that deobfuscates correctly, since
+    //   conn_id (which key to try) is exactly what obfuscation would hide.
+    //   Type 1 has no such problem: a responder has exactly one static key,
+    //   so trying "is this an obfuscated msg1" costs one fixed lookup
+    //   regardless of how many connections exist.
+    //
+    //   Types 3 and 6 (data, keepalive) are not covered. Their own AEAD nonce
+    //   is a natural, free, per-packet-unique value to drive a keystream
+    //   from - but it is unique only within ONE connection's send direction,
+    //   restarting at 0 for every new one. Reusing it as a keystream nonce
+    //   under a key shared by every connection this endpoint holds (the only
+    //   kind of key a receiver could derive without already knowing which
+    //   connection a packet belongs to) would let two different connections'
+    //   headers be XORed together by anyone who captured both - solvable
+    //   with a per-connection key, which reintroduces the exact demux problem
+    //   above. Left as a documented gap rather than a rushed fix.
+    //
+    //   Types 4 and 5 (cookie reply, SACK) are not covered. Neither carries a
+    //   nonce of its own, and SACKs are sent unauthenticated by design (see
+    //   handle_sack's comment) - inventing one for either would be new
+    //   machinery bolted onto packets deliberately kept cheap and stateless.
+    //
+    // KEY DERIVATION, deliberately not a secret shared only by the two
+    // parties in one connection. Both sides derive it from nothing but the
+    // RESPONDER's static public key - the responder from its own, the
+    // initiator from what Noise_IK already required it to know out-of-band
+    // - same construction as mac1_key in noise_ik.hpp, different label. That
+    // means anyone with this project's client config can compute it, exactly
+    // as anyone with it can already compute mac1. The goal is a passive DPI
+    // box seeing a keystream it cannot distinguish from AEAD ciphertext, not
+    // confidentiality against an adversary who already has the server's
+    // public key - that adversary breaks nothing worse than they already
+    // could (mac1 offers the same non-guarantee today).
+    static crypto::hash hdr_obfs_key(const crypto::public_key& responder_static_pub) {
+        static constexpr char label[] = "hdrobfs-"; // 8 bytes, mac1_label's convention
+        std::array<uint8_t, 8 + crypto::key_len> buf;
+        std::memcpy(buf.data(), label, 8);
+        std::memcpy(buf.data() + 8, responder_static_pub.data(), crypto::key_len);
+        return crypto::sha256(buf.data(), buf.size());
+    }
+
+    // A stream cipher's nonce must be unique under its key, never secret -
+    // and message1's own ephemeral public key already is exactly that: drawn
+    // fresh from the CSPRNG on every write_message1() call and never reused.
+    // Free: it is sent in the clear either way, obfuscation or not.
+    //
+    // ONE KNOWN REPEAT, stated rather than buried: a cookie retry
+    // (handle_cookie_reply below) resends the SAME msg1 bytes with a freshly
+    // computed mac2, so it reuses this SAME nonce - the two packets' obfuscated
+    // headers come out byte-identical. That links a retry to its original
+    // attempt, which source address and timing already do for free, so it
+    // adds nothing an observer did not already have. What must never repeat -
+    // the same nonce across TWO DIFFERENT connections - cannot: every
+    // connect() call draws its own ephemeral key.
+    static crypto::stream_nonce hdr_obfs_nonce(const uint8_t* ephemeral_pub_bytes) {
+        auto h = crypto::sha256(ephemeral_pub_bytes, crypto::key_len);
+        crypto::stream_nonce n{};
+        std::memcpy(n.data(), h.data(), n.size());
+        return n;
+    }
+
+    // Applies or removes the disguise - the same operation either way, since
+    // XOR with a keystream is its own inverse. `type` and `conn_id` are
+    // exchanged by value (real in, obfuscated out, or the reverse); `mac2_field`
+    // is 16 bytes XORed in place. `ephemeral_pub_bytes` points at the first 32
+    // bytes of the packet's own noise message, which is always where message1
+    // puts its ephemeral key regardless of which direction this call is going.
+    static void xor_msg1_header(uint8_t& type, uint64_t& conn_id, uint8_t* mac2_field,
+                                const crypto::public_key& responder_static_pub,
+                                const uint8_t* ephemeral_pub_bytes) {
+        auto key = hdr_obfs_key(responder_static_pub);
+        auto nonce = hdr_obfs_nonce(ephemeral_pub_bytes);
+        uint8_t keystream[hdr_len + anti_dos::cookie_len];
+        crypto::stream_keystream(keystream, sizeof(keystream), nonce, key);
+
+        type = (uint8_t)(type ^ keystream[0]);
+        uint64_t conn_id_mask;
+        std::memcpy(&conn_id_mask, keystream + 1, 8);
+        conn_id ^= conn_id_mask;
+        for (size_t i = 0; i < anti_dos::cookie_len; ++i) mac2_field[i] = (uint8_t)(mac2_field[i] ^ keystream[hdr_len + i]);
+    }
+
+    // ephemeral(32) + enc_static(32+16) + enc_payload(0+16) + mac1(16) + mac2(16),
+    // plus this layer's own 9-byte header. A genuine message1 is always
+    // exactly this long - on_datagram() uses that as a cheap pre-filter
+    // before even attempting the deobfuscation trial below.
+    static constexpr size_t msg1_noise_len =
+        crypto::key_len + (crypto::key_len + crypto::aead_tag_len) + crypto::aead_tag_len + crypto::mac_len;
+    static constexpr size_t msg1_wire_len = hdr_len + msg1_noise_len + anti_dos::cookie_len;
+    static_assert(msg1_wire_len == 137, "DPI_RESISTANCE.md cites this exact number; if it moves, that doc needs updating too");
+
     struct queued_send {
         std::vector<uint8_t> data;
         bool reliable;
@@ -571,7 +716,14 @@ private:
         std::memcpy(wire.data(), it->second.msg1.data(), it->second.msg1.size());
         std::memcpy(wire.data() + it->second.msg1.size(), mac2.data(), mac2.size());
 
-        send_wire(1, wire.data(), wire.size(), conn_id, (sockaddr*)&it->second.addr, it->second.addr_len);
+        uint8_t obf_type = 1;
+        uint64_t obf_conn_id = conn_id;
+        crypto::public_key ephemeral;
+        std::memcpy(ephemeral.data(), it->second.msg1.data(), crypto::key_len);
+        xor_msg1_header(obf_type, obf_conn_id, wire.data() + wire.size() - anti_dos::cookie_len,
+                        it->second.remote_static, ephemeral.data());
+
+        send_wire(obf_type, wire.data(), wire.size(), obf_conn_id, (sockaddr*)&it->second.addr, it->second.addr_len);
     }
 
     void handle_data(uint64_t conn_id, const uint8_t* payload, size_t payload_len) {

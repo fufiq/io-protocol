@@ -18,6 +18,13 @@
 # io_uring is absent from all of it on purpose: Android blocks it for apps with
 # seccomp, so epoll is the transport there permanently rather than a fallback.
 #
+#   SANITIZE=1 tools/android_test.sh
+#
+# builds everything with ASan and UBSan and pushes the NDK's runtime alongside.
+# vptr is excluded: it needs RTTI across the statically-linked libc++ boundary
+# and reports doctest's own reporter and libc++'s filebuf as violations, which
+# is noise about the harness rather than anything under test.
+#
 # Two flags here are not decoration, and both were found the hard way on a
 # 16 KB-page image:
 #
@@ -74,7 +81,16 @@ EOF
 DOCTEST="$(find "$REPO/build/_deps/doctest-src" -maxdepth 1 -type d -name doctest -print -quit 2>/dev/null || true)"
 [ -n "$DOCTEST" ] || { echo "configure the host build first so doctest is fetched" >&2; exit 1; }
 
-FLAGS=(-std=c++23 -O2 -Wall -Wextra -static-libstdc++ -Wl,-z,max-page-size=16384)
+FLAGS=(-std=c++23 -Wall -Wextra -static-libstdc++ -Wl,-z,max-page-size=16384)
+ASAN_LIB=""
+if [ -n "${SANITIZE:-}" ]; then
+    FLAGS+=(-O1 -g -fsanitize=address,undefined -fno-sanitize=vptr -fno-omit-frame-pointer)
+    ASAN_LIB="$(find "$TOOLCHAIN/.." -name "libclang_rt.asan-${TRIPLE%%-*}-android.so" -print -quit)"
+    [ -n "$ASAN_LIB" ] || { echo "no ASan runtime for $TRIPLE in the NDK" >&2; exit 1; }
+    echo "sanitizers on; runtime $ASAN_LIB"
+else
+    FLAGS+=(-O2)
+fi
 
 "$CXX" "${FLAGS[@]}" -I"$REPO/build/_deps/doctest-src" \
     "$STAGE/main.cpp" "$REPO/tests/test_storage.cpp" "$REPO/tests/test_field_storage.cpp" \
@@ -101,6 +117,7 @@ else
     echo "libsodium built for this ABI (see the header of this script)."
 fi
 
+[ -n "$ASAN_LIB" ] && "$ADB" push "$ASAN_LIB" /data/local/tmp/ >/dev/null
 "$ADB" push "${BINARIES[@]/#/$STAGE/}" /data/local/tmp/ >/dev/null
 "$ADB" shell "cd /data/local/tmp && chmod +x ${BINARIES[*]}"
 
@@ -108,7 +125,8 @@ status=0
 for t in "${BINARIES[@]}"; do
     echo
     echo "=== $t ==="
-    "$ADB" shell "cd /data/local/tmp && ./$t; echo EXIT=\$?" | tee "$STAGE/$t.out"
+    "$ADB" shell "cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp \
+        ASAN_OPTIONS=detect_stack_use_after_return=0 ./$t; echo EXIT=\$?" | tee "$STAGE/$t.out"
     grep -q "EXIT=0" "$STAGE/$t.out" || status=1
 done
 

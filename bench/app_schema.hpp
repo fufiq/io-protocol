@@ -18,12 +18,14 @@
 // site and it compiles. Here they are ref<order> and ref<product>, and the swap
 // is an error.
 //
-// WHAT IS GIVEN UP, and it is real. app_layer keeps its index in a mapping, so
-// a restart from a checkpoint costs nothing: the index comes back with the
-// engine. Here it is on the heap and a checkpoint restart rebuilds it by
-// scanning the live records - which the engine now triggers automatically
-// (index_set::on_restart), so it is a cost rather than a bug, but it is still a
-// cost. bench/app_schema_bench.cpp measures it, because "some" is not a number.
+// WHAT IT COSTS. Nothing that app_layer.hpp did not also cost. The one thing
+// this layer gave up at first was the restart: app_layer keeps its index in a
+// mapping, so a checkpoint brings it back with the engine, while this one was on
+// the heap and had to be rebuilt by scanning every live record. That gap was
+// measured (0.108 s on 3.7M records) and then closed - the indexes live in a
+// mapped arena now, stamped by the same checkpoint that stamps the engine's own
+// slots, and a restart costs an mmap. bench/app_schema_bench.cpp is where both
+// numbers come from, because "some" is not a number.
 //
 // The transaction layer above is unchanged and unaffected: constraints and
 // triggers still live there (app_txn.hpp), and nothing here moved them.
@@ -99,13 +101,29 @@ namespace app2 {
     //   lines_of_order     -> multi on order_line::of        (ON DELETE CASCADE)
     //   lines_per_product  -> multi on order_line::item      (ON DELETE RESTRICT)
     // =====================================================================
-    using schema_indexes = storage::index_set<
-        storage::unique_index<&customer::email_hash>,
-        storage::unique_index<&product::sku_hash>,
-        storage::ordered_index<&product::price>,
-        storage::multi_index<&order::buyer>,
-        storage::multi_index<&order_line::of>,
-        storage::multi_index<&order_line::item>>;
+    // THE NUMBERS ON EACH LINE ARE THE POINT, and leaving them off costs 3x.
+    // Every index shares the set's capacity unless it declares its own, so
+    // sizing the set for the largest - the two on order_line, one entry per
+    // line - gave the index over 500,000 customers room for 4,000,000 of them
+    // too. The arena came to 884 MB against a 215 MB log.
+    //
+    // A multi index takes two numbers because it has two capacities: entries,
+    // and the distinct keys they fall under. 4,000,000 lines belong to
+    // 1,200,000 orders and to 250,000 products, and a key table sized for the
+    // entries rather than the keys is most of what was left. 884 MB -> 288 MB,
+    // and now the declaration says what each table actually holds.
+    inline constexpr std::size_t max_customers = 600'000;
+    inline constexpr std::size_t max_products = 250'000;
+    inline constexpr std::size_t max_orders = 1'200'000;
+    inline constexpr std::size_t max_lines = 4'000'000;
+
+    using schema_indexes = storage::index_set<max_lines,
+        storage::unique_index<&customer::email_hash, max_customers>,
+        storage::unique_index<&product::sku_hash, max_products>,
+        storage::ordered_index<&product::price, max_products>,
+        storage::multi_index<&order::buyer, max_orders, max_customers>,
+        storage::multi_index<&order_line::of, max_lines, max_orders>,
+        storage::multi_index<&order_line::item, max_lines, max_products>>;
 
     // ---- the same queries, over the declared indexes --------------------
     //

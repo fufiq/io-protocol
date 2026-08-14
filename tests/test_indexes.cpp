@@ -38,7 +38,7 @@ namespace {
     };
     static_assert(storage::tagged_aggregate<order>);
 
-    using indexes = storage::index_set<
+    using indexes = storage::index_set<8192,
         storage::unique_index<&customer::email_hash>,
         storage::multi_index<&order::customer_id>,
         storage::ordered_index<&customer::balance>>;
@@ -48,9 +48,19 @@ namespace {
 
     static_assert(storage::observes<indexes, table_t>);
 
+    // The same declarations at a capacity nothing fits into, for the test that
+    // an overflowing index says so rather than answering half a question.
+    using tiny_indexes = storage::index_set<8,
+        storage::unique_index<&customer::email_hash>,
+        storage::multi_index<&order::customer_id>,
+        storage::ordered_index<&customer::balance>>;
+    using tiny_spec = storage::field_spec<"t_ixs.log", 1u << 22, "t_ixs.idx", 8192, 8192, 8, 64>;
+    using tiny_table = storage::field_storage<tiny_spec, tiny_indexes>;
+
     void wipe() {
         std::remove(spec::path.value);
         std::remove(spec::index_path);
+        std::remove("t_ix.idx.sx");   // the index arena is a file too, and a stale one is a trap
     }
 
     struct fixture {
@@ -206,16 +216,15 @@ TEST_CASE("the indexes survive a replay, because the observer is what builds the
 
 TEST_CASE("running out of capacity is counted, never silent") {
     // A partial index is worse than an empty one: it looks like an answer.
-    wipe();
-    table_t t;
+    // Deliberately far too small - the capacity is part of the type now, so
+    // "what an application that guessed low gets" is a different type.
+    std::remove("t_ixs.log"); std::remove("t_ixs.idx"); std::remove("t_ixs.idx.sx");
+    tiny_table t;
     REQUIRE(t.ok());
-    // Deliberately far too small. The fixture's default is generous; this is
-    // what an application that guessed low gets.
-    t.observer_state() = indexes{ 8 };
 
     for (int i = 0; i < 400; ++i) t.create(customer{ (uint64_t)(1000 + i), i, 0 });
     CHECK(t.observer_state().failed_inserts() > 0);
-    wipe();
+    std::remove("t_ixs.log"); std::remove("t_ixs.idx"); std::remove("t_ixs.idx.sx");
 }
 
 TEST_CASE("a checkpoint restart rebuilds the indexes instead of leaving them empty") {
@@ -230,6 +239,7 @@ TEST_CASE("a checkpoint restart rebuilds the indexes instead of leaving them emp
         std::remove(ck_spec::path.value);
         std::remove(ck_spec::index_path);
         std::remove(ck_spec::checkpoint_path);
+        std::remove("t_ixck.idx.sx");
     };
 
     ck_wipe();
@@ -243,11 +253,16 @@ TEST_CASE("a checkpoint restart rebuilds the indexes instead of leaving them emp
         t.update<&customer::balance>(id, 900);
         REQUIRE(t.checkpoint());
     }
+    // Deleting the arena is what forces the REBUILD path this case is about.
+    // With the arena present the indexes come back from their own file and
+    // on_restart never runs, which is the next case down.
+    std::remove("t_ixck.idx.sx");
     {
         ck_table t;
         REQUIRE(t.ok());
         t.restart(1u << 22);
         REQUIRE(t.started_from_checkpoint());   // the replay really was skipped
+        REQUIRE(!t.index_arena_inherited());    // and the indexes were rebuilt, not inherited
 
         CHECK(t.observer_state().find<&customer::email_hash>(1111) == id);
         CHECK(t.observer_state().of<&customer::email_hash>().size() == 2);
@@ -274,7 +289,6 @@ TEST_CASE("an ordered index stays exact across the merges it does behind your ba
     wipe();
     table_t t;
     REQUIRE(t.ok());
-    t.observer_state() = indexes{ 8000 };
 
     std::vector<int64_t> reference;
     std::vector<record_id> ids;
@@ -340,7 +354,6 @@ TEST_CASE("rebuilding an index twice does not double it") {
     wipe();
     table_t t;
     REQUIRE(t.ok());
-    t.observer_state() = indexes{ 1024 };
 
     for (int i = 0; i < 50; ++i) t.create(customer{ (uint64_t)(9000 + i), i * 10, 0 });
     const auto once = t.observer_state().count_range<&customer::balance>(0, 1000);
@@ -354,4 +367,135 @@ TEST_CASE("rebuilding an index twice does not double it") {
     CHECK(t.observer_state().count_range<&customer::balance>(0, 1000) == once);
     CHECK(t.observer_state().failed_inserts() == 0);
     wipe();
+}
+
+// =====================================================================
+// The arena: the indexes in a file of their own, vouched for by the same
+// checkpoint that vouches for the engine's slots.
+//
+// Everything here is about ONE claim - "these bytes are a correct index for the
+// log up to offset X" - and about the two ways it can be false: the file was
+// written by a different schema, or the log moved on after the claim was made.
+// Both have to end in a rebuild rather than in an answer.
+// =====================================================================
+namespace {
+    using ar_spec = storage::field_spec<"t_ixar.log", 1u << 22, "t_ixar.idx", 8192, 8192, 8, 64, "t_ixar.ck">;
+    using ar_table = storage::field_storage<ar_spec, indexes>;
+    constexpr const char* ar_arena = "t_ixar.idx.sx";
+
+    void ar_wipe() {
+        std::remove(ar_spec::path.value);
+        std::remove(ar_spec::index_path);
+        std::remove(ar_spec::checkpoint_path);
+        std::remove(ar_arena);
+    }
+
+    // The population every case below starts from, checkpointed.
+    record_id ar_seed() {
+        ar_table t;
+        REQUIRE(t.ok());
+        const record_id id = t.create(customer{ 1111, 500, 0 });
+        t.create(customer{ 2222, 700, 0 });
+        t.create(order{ (uint64_t)id, 50, 0 });
+        t.update<&customer::balance>(id, 900);
+        REQUIRE(t.checkpoint());
+        return id;
+    }
+} // namespace
+
+TEST_CASE("a restart inherits the indexes from their file instead of rebuilding them") {
+    ar_wipe();
+    const record_id id = ar_seed();
+    {
+        ar_table t;
+        REQUIRE(t.ok());
+        REQUIRE(t.index_arena_mapped());
+        t.restart(1u << 22);
+        REQUIRE(t.started_from_checkpoint());
+        REQUIRE(t.index_arena_inherited());     // the whole point: no pass over the records
+
+        // And it is the POST-UPDATE state, so what came back is the index as it
+        // stood when the checkpoint was taken rather than as the creates left it.
+        CHECK(t.observer_state().find<&customer::email_hash>(1111) == id);
+        CHECK(t.observer_state().of<&customer::email_hash>().size() == 2);
+        CHECK(t.observer_state().count<&order::customer_id>((uint64_t)id) == 1);
+        CHECK(t.observer_state().count_range<&customer::balance>(900, 900) == 1);
+        CHECK(t.observer_state().count_range<&customer::balance>(500, 500) == 0);
+    }
+    ar_wipe();
+}
+
+TEST_CASE("a write after a checkpoint takes the stamp away, durably") {
+    // The arena is only correct as of the offset it was stamped at. One more
+    // record and it is ahead of that offset, so a restart must not use it -
+    // it would answer with entries for records the engine just discarded.
+    ar_wipe();
+    ar_seed();
+    {
+        ar_table t;
+        REQUIRE(t.ok());
+        t.restart(1u << 22);
+        REQUIRE(t.index_arena_inherited());
+        t.create(customer{ 3333, 100, 0 });     // past the stamp; this is what clears it
+        t.sync();
+    }
+    {
+        ar_table t;
+        REQUIRE(t.ok());
+        t.restart(1u << 22);
+        CHECK(!t.index_arena_inherited());      // refused, and rebuilt instead
+
+        // And the engine refused its OWN checkpoint for the same reason: there
+        // is a record sitting at the offset the checkpoint claims is the end,
+        // so restart() falls through to a full replay rather than discarding
+        // it. Both stamps describe the same moment and both stopped being true
+        // at the same write.
+        CHECK(!t.started_from_checkpoint());
+        CHECK(t.observer_state().find<&customer::email_hash>(1111) != 0);
+        CHECK(t.observer_state().find<&customer::email_hash>(3333) != 0);
+        CHECK(t.observer_state().of<&customer::email_hash>().size() == 3);
+    }
+    ar_wipe();
+}
+
+TEST_CASE("an arena written by a different index set is not believed") {
+    // The file is a flat block whose meaning is entirely in the layout that
+    // produced it. Reading one layout as another does not fail - it succeeds and
+    // returns nonsense, which is why the layout is stamped and checked.
+    ar_wipe();
+    ar_seed();
+
+    using other_indexes = storage::index_set<8192,
+        storage::unique_index<&customer::email_hash>,
+        storage::multi_index<&order::customer_id>>;     // one index fewer
+    using other_table = storage::field_storage<ar_spec, other_indexes>;
+    CHECK(indexes::layout_id() != other_indexes::layout_id());   // not constexpr: it hashes a member offset
+
+    {
+        other_table t;
+        REQUIRE(t.ok());
+        t.restart(1u << 22);
+        CHECK(!t.index_arena_inherited());      // the layout disagreed
+        // and it still works, because refusing the file means rebuilding
+        CHECK(t.observer_state().find<&customer::email_hash>(1111) != 0);
+    }
+    ar_wipe();
+}
+
+TEST_CASE("a replay clears the arena rather than adding a second copy to it") {
+    // recover() builds the indexes from the log through on_record. If the arena
+    // came back populated, every record would be indexed twice.
+    ar_wipe();
+    ar_seed();
+    {
+        ar_table t;
+        REQUIRE(t.ok());
+        t.recover(1u << 22);                    // not restart(): the whole log, replayed
+        CHECK(!t.index_arena_inherited());
+        CHECK(t.observer_state().of<&customer::email_hash>().size() == 2);
+        CHECK(t.observer_state().count<&order::customer_id>(
+                  (uint64_t)t.observer_state().find<&customer::email_hash>(1111)) == 1);
+        CHECK(t.observer_state().count_range<&customer::balance>(0, 10000) == 2);
+    }
+    ar_wipe();
 }

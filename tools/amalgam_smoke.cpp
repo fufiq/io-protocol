@@ -36,7 +36,7 @@ namespace {
 
     // A declared index, so the amalgamation is checked to carry indexes.hpp
     // and not merely to compile without it.
-    using points_by_x = storage::index_set<storage::unique_index<&point::x>>;
+    using points_by_x = storage::index_set<4096, storage::unique_index<&point::x>>;
 
     // An observer, because index maintenance below apply() is half of what the
     // engine is for and it would be easy for an amalgamation to lose.
@@ -56,6 +56,7 @@ namespace {
         std::remove((prefix + "amalgam.log").c_str());
         std::remove((prefix + "amalgam.idx").c_str());
         std::remove((prefix + "amalgam.ckp").c_str());
+        std::remove((prefix + "amalgam.idx.sx").c_str());
         if (!dir.empty()) ::rmdir(dir.c_str());
     }
 
@@ -125,14 +126,30 @@ int main() {
     {
         const std::string dir = "amalgam_ix";
         ::mkdir(dir.c_str(), 0755);
-        indexed_t t(storage::storage_paths::under<spec>(dir));
-        check(t.ok(), "open with a declared index");
-        const auto a = t.create(point{ 1, 4242, 0, 0 });
-        t.create(point{ 2, 7, 0, 0 });
-        check(t.observer_state().find<&point::x>(4242) == a, "unique index finds by field");
-        t.update<&point::x>(a, 99);
-        check(t.observer_state().find<&point::x>(99) == a && t.observer_state().find<&point::x>(4242) == 0,
-              "the index follows an update and leaves no ghost");
+        storage::record_id a = 0;
+        {
+            indexed_t t(storage::storage_paths::under<spec>(dir));
+            check(t.ok(), "open with a declared index");
+            a = t.create(point{ 1, 4242, 0, 0 });
+            t.create(point{ 2, 7, 0, 0 });
+            check(t.observer_state().find<&point::x>(4242) == a, "unique index finds by field");
+            t.update<&point::x>(a, 99);
+            check(t.observer_state().find<&point::x>(99) == a && t.observer_state().find<&point::x>(4242) == 0,
+                  "the index follows an update and leaves no ghost");
+
+            // The arena: the index in a file of its own, stamped by the
+            // checkpoint. This is the part an amalgamation is most likely to
+            // lose, because it is the only part that spans two headers.
+            check(t.index_arena_mapped(), "the declared index got an arena file");
+            check(t.checkpoint(), "checkpoint with an arena");
+        }
+        {
+            indexed_t t(storage::storage_paths::under<spec>(dir));
+            check(t.ok(), "reopen with a declared index");
+            t.restart(32ull << 20);
+            check(t.index_arena_inherited(), "the arena came back stamped, so nothing was rebuilt");
+            check(t.observer_state().find<&point::x>(99) == a, "and it still answers");
+        }
         remove_files(dir);
     }
 

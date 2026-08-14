@@ -209,6 +209,34 @@ namespace storage {
     inline constexpr uint32_t field_index_version = 3; // 3: 16-byte slot, head+depth packed
 
     // =====================================================================
+    // The header of the SECONDARY index arena - the file an observer's indexes
+    // live in, when the observer has one (storage/indexes.hpp).
+    //
+    // The engine does not know what is in the arena and never looks: it maps
+    // the file, hands the bytes over, and stamps them. `write_offset` is the
+    // whole protocol. It says "these bytes are a correct index for the log up
+    // to here", and it is the same claim field_index_header makes about the
+    // engine's own slot array, checked the same way and against the same
+    // checkpoint record.
+    //
+    // Zero means "vouched for by nothing", which is the state the file is left
+    // in from the first mutation after a checkpoint until the next one. That is
+    // what makes a crash safe rather than subtle: a torn arena is never
+    // reachable, because reaching it requires a stamp that was cleared before
+    // the tearing could begin.
+    // =====================================================================
+    struct index_arena_header {
+        uint64_t magic;
+        uint32_t version;
+        uint32_t reserved;
+        uint64_t layout;         // which index set this is; a changed schema must not be reinterpreted
+        uint64_t bytes;          // total file size, layout included
+        uint64_t write_offset;   // the log position these indexes describe; 0 = not vouched for
+    };
+    inline constexpr uint64_t index_arena_magic = 0x414e455241584449ull; // "IDXARENA"
+    inline constexpr uint32_t index_arena_version = 1;
+
+    // =====================================================================
     // level is always local_sync here: a field storage owns its files by
     // construction - there is nowhere for a caller-provided region to fit,
     // because the index is not a simple array the caller could supply.
@@ -330,9 +358,13 @@ namespace storage {
             slots = (field_slot*)((std::byte*)m + sizeof(field_index_header));
             nodes = (override_node*)((std::byte*)slots + spec::max_ids * sizeof(field_slot));
             if (head->magic != field_index_magic || head->version != field_index_version) reset_header();
+
+            map_index_arena();
         }
 
         ~field_storage() {
+            if (arena_map) ::munmap(arena_map, arena_bytes);
+            if (arena_fd >= 0) ::close(arena_fd);
             if (head && index_pinned) ::munlock(head, spec::index_bytes);
             if (head) ::munmap(head, spec::index_bytes);
             // Only if it IS a mapping. compact() can hand the engine a region
@@ -349,6 +381,19 @@ namespace storage {
 
         observer& observer_state() noexcept { return obs; }
         const observer& observer_state() const noexcept { return obs; }
+
+        // True when the observer's indexes are living in a file rather than on
+        // the heap, so a restart can inherit them instead of rebuilding. False
+        // is not an error - it is what every observer without an arena gets,
+        // and what one with an arena gets if its file could not be mapped.
+        bool index_arena_mapped() const noexcept { return arena_map != nullptr; }
+
+        // True when this instance started with its secondary indexes already
+        // populated from that file - the thing the arena exists to make
+        // possible. Distinct from started_from_checkpoint(), which says the
+        // ENGINE skipped its replay: the two are stamped separately and can
+        // disagree, and when they do it is the arena that gets rebuilt.
+        bool index_arena_inherited() const noexcept { return arena_inherited; }
 
         // ---- writes -----------------------------------------------------
 
@@ -743,6 +788,12 @@ namespace storage {
         // an observer maintained above cannot drift from the data.
         std::size_t recover(std::size_t file_size) {
             reset_header();
+            // A replay builds the indexes from the log through on_record. If
+            // the arena came back populated, every one of those records is
+            // already in it and the replay would add a second copy - so the
+            // file goes back to empty first, exactly as reset_header() does for
+            // the engine's own slots.
+            reset_arena_for_replay();
             last_record_offset = no_record_yet;
             const std::size_t pos = scan(base, 0, file_size, [this](record_header hdr, const std::byte* payload) {
                 apply(hdr, payload);
@@ -884,6 +935,12 @@ namespace storage {
             if (!written) { ::remove(tmp.c_str()); return false; }
             if (::rename(tmp.c_str(), checkpoint_path.c_str()) != 0) { ::remove(tmp.c_str()); return false; }
             sync_parent_directory(checkpoint_path.c_str());
+
+            // The secondary indexes get the same treatment and the same
+            // offset, but a stamp of their own: the two are independently
+            // valid, and an arena that fails to come back only costs a rebuild
+            // rather than the checkpoint.
+            stamp_arena(write_offset);
             return true;
         }
 
@@ -916,6 +973,16 @@ namespace storage {
             //
             // Opt-in by having the member: an observer without on_restart is
             // unaffected and pays nothing.
+            //
+            // Unless its indexes came back with it. An arena stamped at exactly
+            // this offset is a correct index for exactly this log, and rebuilding
+            // it would be recomputing something already on disk - that is the
+            // whole point of the arena, and it is the difference between a
+            // restart that costs one pass over every live record and one that
+            // costs an mmap.
+            if (arena_inherited && arena_stamp == write_offset) return write_offset;
+
+            reset_arena_for_replay();
             if constexpr (requires { obs.on_restart(*this); }) obs.on_restart(*this);
             return write_offset;
         }
@@ -1104,7 +1171,7 @@ namespace storage {
             if (head->next_id <= hdr.id) head->next_id = hdr.id + 1;
             field_slot& s = slots[hdr.id];
             if (s.base) head->live_byte_count -= s.len;
-            obs.on_record(*this, hdr, data);
+            notify(hdr, data);
             free_chain(hdr.id);
             store_relaxed(s.len, (uint16_t)hdr.len);
             s.tag = hdr.tag;
@@ -1121,17 +1188,119 @@ namespace storage {
             if constexpr (from == provenance::external) {
                 if ((std::size_t)hdr.offset + hdr.len > record_len(hdr.id)) return;
             }
-            obs.on_record(*this, hdr, data);
+            notify(hdr, data);
             set_override(hdr.id, hdr.offset, hdr.len, (std::size_t)(data - base));
             maybe_collapse(hdr.id);
         }
 
         void apply_destroy(const record_header& hdr) {
             if (!alive(hdr.id)) return;
-            obs.on_record(*this, hdr, nullptr);
+            notify(hdr, nullptr);
             head->live_byte_count -= record_len(hdr.id);
             free_chain(hdr.id);
             store_relaxed(slots[hdr.id].base, (uint64_t)0);
+        }
+
+        // ---- the secondary index arena -----------------------------------
+        //
+        // Present only when the observer advertises one. An observer that does
+        // not have arena_bytes() compiles none of this and pays for none of it,
+        // which is what keeps the engine from growing an opinion about indexes.
+        static constexpr bool has_index_arena = requires { observer::arena_bytes(); };
+
+        index_arena_header* arena_head() const noexcept { return (index_arena_header*)arena_map; }
+
+        void map_index_arena() {
+            if constexpr (!has_index_arena) return;
+            else {
+                arena_path = index_path + ".sx";
+                arena_bytes = sizeof(index_arena_header) + observer::arena_bytes();
+
+                arena_fd = ::open(arena_path.c_str(), O_RDWR | O_CREAT, 0644);
+                if (arena_fd < 0) return;
+                if (platform::preallocate(arena_fd, arena_bytes) != 0) return;
+                void* m = ::mmap(nullptr, arena_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, arena_fd, 0);
+                if (m == MAP_FAILED) return;
+                arena_map = (std::byte*)m;
+
+                // Three things have to agree before a byte of it is believed:
+                // that it is one of these files at all, that it was written by
+                // the same index set (a changed schema reinterprets the same
+                // bytes as something else entirely), and that something stamped
+                // it. Any disagreement and it becomes a fresh file.
+                index_arena_header* h = arena_head();
+                const bool recognised = h->magic == index_arena_magic &&
+                                        h->version == index_arena_version &&
+                                        h->layout == observer::layout_id() &&
+                                        h->bytes == arena_bytes;
+                if (!recognised) {
+                    *h = index_arena_header{ index_arena_magic, index_arena_version, 0,
+                                             observer::layout_id(), arena_bytes, 0 };
+                }
+                // Without a checkpoint there is nothing that could ever vouch
+                // for it, so a leftover file from a previous run is not an
+                // index - it is whatever that run happened to end with, over a
+                // log this one is about to rewrite. The engine's own index file
+                // is truncated in exactly this case and for exactly this
+                // reason; this is the same rule.
+                arena_stamp = (recognised && spec::fast_restart) ? h->write_offset : 0;
+                arena_inherited = arena_stamp != 0;
+
+                obs.adopt(std::span<std::byte>(arena_map + sizeof(index_arena_header),
+                                               arena_bytes - sizeof(index_arena_header)),
+                          /*fresh=*/!arena_inherited);
+            }
+        }
+
+        // Clears the stamp, durably, before the first mutation that would
+        // invalidate it.
+        //
+        // This is the ordering the whole scheme rests on. Between a checkpoint
+        // and the next write the file on disk is a valid index for a known log
+        // offset. The moment a write lands it is not, and a machine that loses
+        // power an instant later must not come back and believe it - so the
+        // zero goes to disk BEFORE the write that contradicts it, not merely
+        // into the mapping. One msync of one page, once per checkpoint
+        // interval, and never on the writes in between.
+        void unstamp_arena() noexcept {
+            if constexpr (has_index_arena) {
+                if (!arena_map || !arena_stamp) return;
+                arena_head()->write_offset = 0;
+                arena_stamp = 0;
+                platform::flush_mapping(arena_map, sizeof(index_arena_header), arena_fd);
+            }
+        }
+
+        void notify(const record_header& hdr, const std::byte* data) {
+            unstamp_arena();
+            obs.on_record(*this, hdr, data);
+        }
+
+        // The arena's half of checkpoint(): settle whatever the indexes keep
+        // off the file, flush it, and only then say what it describes.
+        void stamp_arena(std::size_t at) noexcept {
+            if constexpr (has_index_arena) {
+                if (!arena_map) return;
+                if constexpr (requires { obs.before_flush(); }) obs.before_flush();
+                platform::flush_mapping(arena_map, arena_bytes, arena_fd);
+                arena_head()->write_offset = at;
+                arena_stamp = at;
+                platform::flush_mapping(arena_map, sizeof(index_arena_header), arena_fd);
+            }
+        }
+
+        // A replay rebuilds the indexes from the log, so whatever the file held
+        // has to go first or every entry is counted twice.
+        void reset_arena_for_replay() noexcept {
+            if constexpr (has_index_arena) {
+                unstamp_arena();
+                arena_inherited = false;
+                if constexpr (requires { obs.adopt(std::span<std::byte>{}, true); }) {
+                    if (arena_map)
+                        obs.adopt(std::span<std::byte>(arena_map + sizeof(index_arena_header),
+                                                       arena_bytes - sizeof(index_arena_header)), true);
+                }
+            }
         }
 
         static record_header* header_of(std::byte* data) noexcept { return (record_header*)(data - sizeof(record_header)); }
@@ -1374,6 +1543,15 @@ namespace storage {
         // the caller owns and the engine must not unmap.
         bool base_is_mapped = true;
         int fd = -1, index_fd = -1;
+
+        // The secondary index arena. All of it is inert unless the observer
+        // asked for one - see has_index_arena.
+        std::byte* arena_map = nullptr;
+        std::size_t arena_bytes = 0;
+        std::size_t arena_stamp = 0;      // what the file's header currently claims; 0 = nothing
+        bool arena_inherited = false;
+        int arena_fd = -1;
+        std::string arena_path;
 
         // Resolved once in the constructor, from storage_paths or from the
         // spec. Held as strings rather than pointers because a caller building

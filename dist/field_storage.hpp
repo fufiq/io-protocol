@@ -2246,6 +2246,34 @@ namespace storage {
     inline constexpr uint32_t field_index_version = 3; // 3: 16-byte slot, head+depth packed
 
     // =====================================================================
+    // The header of the SECONDARY index arena - the file an observer's indexes
+    // live in, when the observer has one (storage/indexes.hpp).
+    //
+    // The engine does not know what is in the arena and never looks: it maps
+    // the file, hands the bytes over, and stamps them. `write_offset` is the
+    // whole protocol. It says "these bytes are a correct index for the log up
+    // to here", and it is the same claim field_index_header makes about the
+    // engine's own slot array, checked the same way and against the same
+    // checkpoint record.
+    //
+    // Zero means "vouched for by nothing", which is the state the file is left
+    // in from the first mutation after a checkpoint until the next one. That is
+    // what makes a crash safe rather than subtle: a torn arena is never
+    // reachable, because reaching it requires a stamp that was cleared before
+    // the tearing could begin.
+    // =====================================================================
+    struct index_arena_header {
+        uint64_t magic;
+        uint32_t version;
+        uint32_t reserved;
+        uint64_t layout;         // which index set this is; a changed schema must not be reinterpreted
+        uint64_t bytes;          // total file size, layout included
+        uint64_t write_offset;   // the log position these indexes describe; 0 = not vouched for
+    };
+    inline constexpr uint64_t index_arena_magic = 0x414e455241584449ull; // "IDXARENA"
+    inline constexpr uint32_t index_arena_version = 1;
+
+    // =====================================================================
     // level is always local_sync here: a field storage owns its files by
     // construction - there is nowhere for a caller-provided region to fit,
     // because the index is not a simple array the caller could supply.
@@ -2367,9 +2395,13 @@ namespace storage {
             slots = (field_slot*)((std::byte*)m + sizeof(field_index_header));
             nodes = (override_node*)((std::byte*)slots + spec::max_ids * sizeof(field_slot));
             if (head->magic != field_index_magic || head->version != field_index_version) reset_header();
+
+            map_index_arena();
         }
 
         ~field_storage() {
+            if (arena_map) ::munmap(arena_map, arena_bytes);
+            if (arena_fd >= 0) ::close(arena_fd);
             if (head && index_pinned) ::munlock(head, spec::index_bytes);
             if (head) ::munmap(head, spec::index_bytes);
             // Only if it IS a mapping. compact() can hand the engine a region
@@ -2386,6 +2418,19 @@ namespace storage {
 
         observer& observer_state() noexcept { return obs; }
         const observer& observer_state() const noexcept { return obs; }
+
+        // True when the observer's indexes are living in a file rather than on
+        // the heap, so a restart can inherit them instead of rebuilding. False
+        // is not an error - it is what every observer without an arena gets,
+        // and what one with an arena gets if its file could not be mapped.
+        bool index_arena_mapped() const noexcept { return arena_map != nullptr; }
+
+        // True when this instance started with its secondary indexes already
+        // populated from that file - the thing the arena exists to make
+        // possible. Distinct from started_from_checkpoint(), which says the
+        // ENGINE skipped its replay: the two are stamped separately and can
+        // disagree, and when they do it is the arena that gets rebuilt.
+        bool index_arena_inherited() const noexcept { return arena_inherited; }
 
         // ---- writes -----------------------------------------------------
 
@@ -2780,6 +2825,12 @@ namespace storage {
         // an observer maintained above cannot drift from the data.
         std::size_t recover(std::size_t file_size) {
             reset_header();
+            // A replay builds the indexes from the log through on_record. If
+            // the arena came back populated, every one of those records is
+            // already in it and the replay would add a second copy - so the
+            // file goes back to empty first, exactly as reset_header() does for
+            // the engine's own slots.
+            reset_arena_for_replay();
             last_record_offset = no_record_yet;
             const std::size_t pos = scan(base, 0, file_size, [this](record_header hdr, const std::byte* payload) {
                 apply(hdr, payload);
@@ -2921,6 +2972,12 @@ namespace storage {
             if (!written) { ::remove(tmp.c_str()); return false; }
             if (::rename(tmp.c_str(), checkpoint_path.c_str()) != 0) { ::remove(tmp.c_str()); return false; }
             sync_parent_directory(checkpoint_path.c_str());
+
+            // The secondary indexes get the same treatment and the same
+            // offset, but a stamp of their own: the two are independently
+            // valid, and an arena that fails to come back only costs a rebuild
+            // rather than the checkpoint.
+            stamp_arena(write_offset);
             return true;
         }
 
@@ -2953,6 +3010,16 @@ namespace storage {
             //
             // Opt-in by having the member: an observer without on_restart is
             // unaffected and pays nothing.
+            //
+            // Unless its indexes came back with it. An arena stamped at exactly
+            // this offset is a correct index for exactly this log, and rebuilding
+            // it would be recomputing something already on disk - that is the
+            // whole point of the arena, and it is the difference between a
+            // restart that costs one pass over every live record and one that
+            // costs an mmap.
+            if (arena_inherited && arena_stamp == write_offset) return write_offset;
+
+            reset_arena_for_replay();
             if constexpr (requires { obs.on_restart(*this); }) obs.on_restart(*this);
             return write_offset;
         }
@@ -3141,7 +3208,7 @@ namespace storage {
             if (head->next_id <= hdr.id) head->next_id = hdr.id + 1;
             field_slot& s = slots[hdr.id];
             if (s.base) head->live_byte_count -= s.len;
-            obs.on_record(*this, hdr, data);
+            notify(hdr, data);
             free_chain(hdr.id);
             store_relaxed(s.len, (uint16_t)hdr.len);
             s.tag = hdr.tag;
@@ -3158,17 +3225,119 @@ namespace storage {
             if constexpr (from == provenance::external) {
                 if ((std::size_t)hdr.offset + hdr.len > record_len(hdr.id)) return;
             }
-            obs.on_record(*this, hdr, data);
+            notify(hdr, data);
             set_override(hdr.id, hdr.offset, hdr.len, (std::size_t)(data - base));
             maybe_collapse(hdr.id);
         }
 
         void apply_destroy(const record_header& hdr) {
             if (!alive(hdr.id)) return;
-            obs.on_record(*this, hdr, nullptr);
+            notify(hdr, nullptr);
             head->live_byte_count -= record_len(hdr.id);
             free_chain(hdr.id);
             store_relaxed(slots[hdr.id].base, (uint64_t)0);
+        }
+
+        // ---- the secondary index arena -----------------------------------
+        //
+        // Present only when the observer advertises one. An observer that does
+        // not have arena_bytes() compiles none of this and pays for none of it,
+        // which is what keeps the engine from growing an opinion about indexes.
+        static constexpr bool has_index_arena = requires { observer::arena_bytes(); };
+
+        index_arena_header* arena_head() const noexcept { return (index_arena_header*)arena_map; }
+
+        void map_index_arena() {
+            if constexpr (!has_index_arena) return;
+            else {
+                arena_path = index_path + ".sx";
+                arena_bytes = sizeof(index_arena_header) + observer::arena_bytes();
+
+                arena_fd = ::open(arena_path.c_str(), O_RDWR | O_CREAT, 0644);
+                if (arena_fd < 0) return;
+                if (platform::preallocate(arena_fd, arena_bytes) != 0) return;
+                void* m = ::mmap(nullptr, arena_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, arena_fd, 0);
+                if (m == MAP_FAILED) return;
+                arena_map = (std::byte*)m;
+
+                // Three things have to agree before a byte of it is believed:
+                // that it is one of these files at all, that it was written by
+                // the same index set (a changed schema reinterprets the same
+                // bytes as something else entirely), and that something stamped
+                // it. Any disagreement and it becomes a fresh file.
+                index_arena_header* h = arena_head();
+                const bool recognised = h->magic == index_arena_magic &&
+                                        h->version == index_arena_version &&
+                                        h->layout == observer::layout_id() &&
+                                        h->bytes == arena_bytes;
+                if (!recognised) {
+                    *h = index_arena_header{ index_arena_magic, index_arena_version, 0,
+                                             observer::layout_id(), arena_bytes, 0 };
+                }
+                // Without a checkpoint there is nothing that could ever vouch
+                // for it, so a leftover file from a previous run is not an
+                // index - it is whatever that run happened to end with, over a
+                // log this one is about to rewrite. The engine's own index file
+                // is truncated in exactly this case and for exactly this
+                // reason; this is the same rule.
+                arena_stamp = (recognised && spec::fast_restart) ? h->write_offset : 0;
+                arena_inherited = arena_stamp != 0;
+
+                obs.adopt(std::span<std::byte>(arena_map + sizeof(index_arena_header),
+                                               arena_bytes - sizeof(index_arena_header)),
+                          /*fresh=*/!arena_inherited);
+            }
+        }
+
+        // Clears the stamp, durably, before the first mutation that would
+        // invalidate it.
+        //
+        // This is the ordering the whole scheme rests on. Between a checkpoint
+        // and the next write the file on disk is a valid index for a known log
+        // offset. The moment a write lands it is not, and a machine that loses
+        // power an instant later must not come back and believe it - so the
+        // zero goes to disk BEFORE the write that contradicts it, not merely
+        // into the mapping. One msync of one page, once per checkpoint
+        // interval, and never on the writes in between.
+        void unstamp_arena() noexcept {
+            if constexpr (has_index_arena) {
+                if (!arena_map || !arena_stamp) return;
+                arena_head()->write_offset = 0;
+                arena_stamp = 0;
+                platform::flush_mapping(arena_map, sizeof(index_arena_header), arena_fd);
+            }
+        }
+
+        void notify(const record_header& hdr, const std::byte* data) {
+            unstamp_arena();
+            obs.on_record(*this, hdr, data);
+        }
+
+        // The arena's half of checkpoint(): settle whatever the indexes keep
+        // off the file, flush it, and only then say what it describes.
+        void stamp_arena(std::size_t at) noexcept {
+            if constexpr (has_index_arena) {
+                if (!arena_map) return;
+                if constexpr (requires { obs.before_flush(); }) obs.before_flush();
+                platform::flush_mapping(arena_map, arena_bytes, arena_fd);
+                arena_head()->write_offset = at;
+                arena_stamp = at;
+                platform::flush_mapping(arena_map, sizeof(index_arena_header), arena_fd);
+            }
+        }
+
+        // A replay rebuilds the indexes from the log, so whatever the file held
+        // has to go first or every entry is counted twice.
+        void reset_arena_for_replay() noexcept {
+            if constexpr (has_index_arena) {
+                unstamp_arena();
+                arena_inherited = false;
+                if constexpr (requires { obs.adopt(std::span<std::byte>{}, true); }) {
+                    if (arena_map)
+                        obs.adopt(std::span<std::byte>(arena_map + sizeof(index_arena_header),
+                                                       arena_bytes - sizeof(index_arena_header)), true);
+                }
+            }
         }
 
         static record_header* header_of(std::byte* data) noexcept { return (record_header*)(data - sizeof(record_header)); }
@@ -3411,6 +3580,15 @@ namespace storage {
         // the caller owns and the engine must not unmap.
         bool base_is_mapped = true;
         int fd = -1, index_fd = -1;
+
+        // The secondary index arena. All of it is inert unless the observer
+        // asked for one - see has_index_arena.
+        std::byte* arena_map = nullptr;
+        std::size_t arena_bytes = 0;
+        std::size_t arena_stamp = 0;      // what the file's header currently claims; 0 = nothing
+        bool arena_inherited = false;
+        int arena_fd = -1;
+        std::string arena_path;
 
         // Resolved once in the constructor, from storage_paths or from the
         // spec. Held as strings rather than pointers because a caller building
@@ -3795,6 +3973,7 @@ namespace storage {
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <span>
 #include <tuple>
 #include <type_traits>
 #include <vector>
@@ -3814,10 +3993,15 @@ namespace storage {
     namespace detail {
 
         // The byte offset of a data member, without dereferencing a null
-        // object: the same trick update<member> uses, and the reason a
-        // pointer-to-member is enough to name a field at compile time.
+        // object: the same trick storage.hpp's member_offset uses, and the
+        // reason a pointer-to-member is enough to name a field.
+        //
+        // Not consteval, and it cannot be: the expression is a reinterpret_cast
+        // under the covers, which is exactly what a constant expression may not
+        // contain. It was declared consteval here and nothing had called it, so
+        // the first caller is what found out.
         template <auto member>
-        consteval std::size_t offset_of() {
+        std::size_t offset_of() noexcept {
             using owner = member_class_t<member>;
             return (std::size_t)&(((owner const volatile*)nullptr)->*member);
         }
@@ -3855,6 +4039,21 @@ namespace storage {
             else return (uint64_t)key;
         }
 
+        // What an index IS, as a number: its kind, the record type it belongs
+        // to, where in that record its field sits, and how wide the key is.
+        // Every one of those changes the meaning of the bytes on disk, so every
+        // one of them has to change the number that decides whether those bytes
+        // are still readable.
+        inline uint64_t index_signature(uint64_t kind, uint64_t owner_tag,
+                                           uint64_t field_offset, uint64_t key_size) noexcept {
+            uint64_t h = 0xcbf29ce484222325ull;
+            for (uint64_t part : { kind, owner_tag, field_offset, key_size }) {
+                h ^= part;
+                h *= 0x100000001b3ull;
+            }
+            return h;
+        }
+
         inline constexpr std::size_t round_pow2(std::size_t n) noexcept {
             std::size_t p = 1;
             while (p < n) p <<= 1;
@@ -3864,8 +4063,58 @@ namespace storage {
     } // namespace detail
 
     // =====================================================================
-    // Open-addressed hash map with linear probing, over an array this class
-    // owns. Key 0 means "empty", which costs nothing for the keys an index
+    // Where every index in a set lives: one contiguous block of bytes, carved
+    // up by a bump pointer.
+    //
+    // The block is a file mapping when the engine gives it one, and a heap
+    // buffer otherwise, and NOTHING below this class knows which - that is the
+    // entire reason it exists. An index made of std::vectors is a web of
+    // allocator-owned regions that means nothing to the next run; the same index
+    // made of spans over one block is a file, and a file the engine can stamp
+    // with a log offset is an index that survives a restart for free.
+    //
+    // Sizes are carved once and never grow, which is the rule the whole engine
+    // already follows. That is what makes the two passes below safe.
+    //
+    // TWO PASSES, ONE CODE PATH. The engine has to size the file before it can
+    // map it, and only the index set knows how big it should be. So place() is
+    // run first against a MEASURING arena - no memory, same arithmetic, every
+    // take() returning an empty span - and used() is the answer. Then the file
+    // is mapped and the identical place() runs against a real one. Writing the
+    // size calculation separately from the layout is how these things drift;
+    // here there is only one of them, so they cannot.
+    // =====================================================================
+    class index_arena {
+    public:
+        constexpr index_arena() noexcept = default;
+        constexpr index_arena(std::byte* bytes, std::size_t size) noexcept : base(bytes), limit(size) {}
+
+        static constexpr index_arena measuring() noexcept { return index_arena(nullptr, (std::size_t)-1); }
+
+        template <typename T>
+        std::span<T> take(std::size_t count) noexcept {
+            offset = (offset + alignof(T) - 1) & ~(alignof(T) - 1);
+            const std::size_t bytes = count * sizeof(T);
+            if (offset + bytes > limit) { overflowed = true; return {}; }
+            std::byte* at = base + offset;
+            offset += bytes;
+            return base ? std::span<T>((T*)at, count) : std::span<T>{};
+        }
+
+        std::size_t used() const noexcept { return offset; }
+        bool ok() const noexcept { return !overflowed; }
+        bool measuring_only() const noexcept { return base == nullptr; }
+
+    private:
+        std::byte* base = nullptr;
+        std::size_t limit = 0;
+        std::size_t offset = 0;
+        bool overflowed = false;
+    };
+
+    // =====================================================================
+    // Open-addressed hash map with linear probing, over an array carved from an
+    // arena. Key 0 means "empty", which costs nothing for the keys an index
     // actually holds - a record id is issued from 1, and a hash colliding with
     // exactly zero is a case worth losing to keep the probe branch-free.
     //
@@ -3875,20 +4124,32 @@ namespace storage {
     // =====================================================================
     class flat_hash_map {
     public:
-        void reserve(std::size_t entries) {
+        // Only `used` lives in the arena. Everything else about the layout -
+        // the capacity, and therefore the mask - is derived from the same
+        // compile-time record count on every run, so storing it would be
+        // storing a second copy of something that cannot disagree.
+        struct header { uint64_t used; };
+
+        void place(index_arena& arena, std::size_t entries) {
             const std::size_t capacity = detail::round_pow2(entries < 8 ? 8 : entries * 2);
-            slots.assign(capacity, slot{});
             mask = capacity - 1;
-            used = 0;
+            meta = arena.take<header>(1).data();
+            slots = arena.take<slot>(capacity);
+        }
+
+        void clear() noexcept {
+            if (!meta) return;
+            meta->used = 0;
+            std::memset(slots.data(), 0, slots.size() * sizeof(slot));
         }
 
         bool insert(uint64_t key, uint64_t value) noexcept {
-            if (used * 4 >= slots.size() * 3) return false;   // 75% and no growth
+            if (meta->used * 4 >= slots.size() * 3) return false;   // 75% and no growth
             std::size_t i = key & mask;
             for (; slots[i].key; i = (i + 1) & mask)
                 if (slots[i].key == key) { slots[i].value = value; return true; }
             slots[i] = { key, value };
-            ++used;
+            ++meta->used;
             return true;
         }
 
@@ -3905,7 +4166,7 @@ namespace storage {
             if (!slots[i].key) return;
 
             slots[i] = slot{};
-            --used;
+            --meta->used;
             // Backward shift: everything after the hole that probed past its
             // own home slot has to move up, or it becomes unreachable.
             for (std::size_t j = (i + 1) & mask; slots[j].key; j = (j + 1) & mask) {
@@ -3919,14 +4180,14 @@ namespace storage {
             }
         }
 
-        std::size_t size() const noexcept { return used; }
+        std::size_t size() const noexcept { return meta ? meta->used : 0; }
         std::size_t capacity() const noexcept { return slots.size(); }
 
     private:
-        struct slot { uint64_t key = 0; uint64_t value = 0; };
-        std::vector<slot> slots;
+        struct slot { uint64_t key; uint64_t value; };
+        header* meta = nullptr;
+        std::span<slot> slots;
         std::size_t mask = 0;
-        std::size_t used = 0;
     };
 
     // =====================================================================
@@ -3942,11 +4203,19 @@ namespace storage {
     // =====================================================================
     class flat_multi_map {
     public:
-        void reserve(std::size_t keys, std::size_t total_entries) {
-            heads.reserve(keys);
-            nodes.assign(total_entries + 1, node{});   // index 0 is the end sentinel
-            high_water = 1;
-            free_head = 0;
+        struct header { uint64_t high_water; uint32_t free_head; uint32_t padding; };
+
+        void place(index_arena& arena, std::size_t keys, std::size_t total_entries) {
+            heads.place(arena, keys);
+            meta = arena.take<header>(1).data();
+            nodes = arena.take<node>(total_entries + 1);   // index 0 is the end sentinel
+        }
+
+        void clear() noexcept {
+            heads.clear();
+            if (!meta) return;
+            *meta = header{ 1, 0, 0 };
+            std::memset(nodes.data(), 0, nodes.size() * sizeof(node));
         }
 
         bool insert(uint64_t key, uint64_t value) noexcept {
@@ -3968,8 +4237,8 @@ namespace storage {
                     if (previous) nodes[previous].next = next;
                     else if (next) heads.insert(key, next);
                     else heads.erase(key);
-                    nodes[current].next = free_head;
-                    free_head = current;
+                    nodes[current].next = meta->free_head;
+                    meta->free_head = current;
                     return true;
                 }
                 previous = current;
@@ -3994,22 +4263,21 @@ namespace storage {
         std::size_t distinct_keys() const noexcept { return heads.size(); }
 
     private:
-        struct node { uint64_t value = 0; uint32_t next = 0; uint32_t reserved = 0; };
+        struct node { uint64_t value; uint32_t next; uint32_t reserved; };
 
         uint32_t alloc() noexcept {
-            if (free_head) {
-                const uint32_t n = free_head;
-                free_head = nodes[n].next;
+            if (meta->free_head) {
+                const uint32_t n = meta->free_head;
+                meta->free_head = nodes[n].next;
                 return n;
             }
-            if (high_water >= nodes.size()) return 0;
-            return (uint32_t)high_water++;
+            if (meta->high_water >= nodes.size()) return 0;
+            return (uint32_t)meta->high_water++;
         }
 
         flat_hash_map heads;
-        std::vector<node> nodes;
-        std::size_t high_water = 1;
-        uint32_t free_head = 0;
+        header* meta = nullptr;
+        std::span<node> nodes;
     };
 
     // =====================================================================
@@ -4037,19 +4305,25 @@ namespace storage {
     // =====================================================================
     class flat_ordered_map {
     public:
-        // Clears rather than merely reserving: index_set::on_restart re-reserves
-        // every index and then rebuilds, so a reserve that kept the old pairs
-        // would double every entry instead of replacing it. The hash maps here
-        // assign() and so were always right; this one was not.
-        void reserve(std::size_t entries) {
-            pairs.clear();
-            pending.clear();
-            pairs.reserve(entries);
+        struct header { uint64_t count; };
+
+        void place(index_arena& arena, std::size_t entries) {
             limit = entries;
+            meta = arena.take<header>(1).data();
+            pairs = arena.take<entry>(entries);
+        }
+
+        // Clears rather than merely re-placing: index_set::on_restart re-places
+        // every index and then rebuilds, so keeping the old count would double
+        // every entry instead of replacing it. The hash maps zero their arrays
+        // and so were always right; this one was not.
+        void clear() noexcept {
+            pending.clear();
+            if (meta) meta->count = 0;
         }
 
         bool insert(int64_t key, uint64_t id) {
-            if (pairs.size() + pending.size() >= limit) return false;
+            if (count() + pending.size() >= limit) return false;
             pending.push_back(entry{ key, id });
             if (pending.size() >= merge_threshold()) settle();
             return true;
@@ -4064,9 +4338,10 @@ namespace storage {
                 pending.pop_back();
                 return true;
             }
-            for (std::size_t i = lower_bound(key); i < pairs.size() && pairs[i].key == key; ++i) {
+            for (std::size_t i = lower_bound(key); i < count() && pairs[i].key == key; ++i) {
                 if (pairs[i].id != id) continue;
-                pairs.erase(pairs.begin() + (std::ptrdiff_t)i);
+                std::memmove(&pairs[i], &pairs[i + 1], (count() - i - 1) * sizeof(entry));
+                --meta->count;
                 return true;
             }
             return false;
@@ -4085,42 +4360,56 @@ namespace storage {
                 fn(pairs[i].id, pairs[i].key);
         }
 
-        std::size_t size() const noexcept { return pairs.size() + pending.size(); }
+        std::size_t size() const noexcept { return count() + pending.size(); }
+
+        // Everything pending, merged into the array. The engine calls this
+        // before it flushes the arena to disk: the pending tail is the one part
+        // of this index that lives on the heap, so a flush that did not settle
+        // first would write a file missing every insert since the last query.
+        void flush_pending() const { settle(); }
 
     private:
         struct entry { int64_t key; uint64_t id; };
 
         static bool by_key(const entry& a, const entry& b) noexcept { return a.key < b.key; }
 
+        std::size_t count() const noexcept { return meta ? (std::size_t)meta->count : 0; }
+
         // Merge when the tail is an eighth of what is already sorted, so the
         // number of merges over a bulk load is logarithmic rather than linear.
         // The floor keeps a small index from merging on nearly every insert.
         std::size_t merge_threshold() const noexcept {
-            const std::size_t proportional = pairs.size() / 8;
+            const std::size_t proportional = count() / 8;
             return proportional < 1024 ? 1024 : proportional;
         }
 
         void settle() const {
             if (pending.empty()) return;
             std::sort(pending.begin(), pending.end(), by_key);
-            const std::size_t sorted_end = pairs.size();
-            pairs.insert(pairs.end(), pending.begin(), pending.end());
-            std::inplace_merge(pairs.begin(), pairs.begin() + (std::ptrdiff_t)sorted_end, pairs.end(), by_key);
+            const std::size_t sorted_end = count();
+            std::memcpy(&pairs[sorted_end], pending.data(), pending.size() * sizeof(entry));
+            meta->count = sorted_end + pending.size();
+            std::inplace_merge(pairs.data(), pairs.data() + sorted_end, pairs.data() + meta->count, by_key);
             pending.clear();
         }
 
         std::size_t lower_bound(int64_t key) const noexcept {
-            std::size_t lo = 0, hi = pairs.size();
+            std::size_t lo = 0, hi = count();
             while (lo < hi) { const auto mid = lo + (hi - lo) / 2; if (pairs[mid].key < key) lo = mid + 1; else hi = mid; }
             return lo;
         }
         std::size_t upper_bound(int64_t key) const noexcept {
-            std::size_t lo = 0, hi = pairs.size();
+            std::size_t lo = 0, hi = count();
             while (lo < hi) { const auto mid = lo + (hi - lo) / 2; if (pairs[mid].key <= key) lo = mid + 1; else hi = mid; }
             return lo;
         }
 
-        mutable std::vector<entry> pairs;
+        header* meta = nullptr;
+        std::span<entry> pairs;
+        // The one thing here that is NOT in the arena. It does not need to be:
+        // it is settled before every flush, so a file never contains a pending
+        // tail, and a crash that loses it also invalidates the stamp that would
+        // have let the file be reused.
         mutable std::vector<entry> pending;
         std::size_t limit = 0;
     };
@@ -4134,7 +4423,7 @@ namespace storage {
     // knows every type at compile time and a dispatch per record would be paid
     // on the write path.
     // =====================================================================
-    template <auto member>
+    template <auto member, std::size_t capacity_v = 0>
     class unique_index {
     public:
         using owner = member_class_t<member>;
@@ -4143,8 +4432,11 @@ namespace storage {
                       "an index key must be an integer or an enum - hash the field yourself and index the hash");
         static constexpr auto field = member;
         static constexpr tag_t owner_tag = owner::tag;
+        static constexpr std::size_t declared_capacity = capacity_v;
+        static uint64_t signature() { return detail::index_signature(1, owner_tag, detail::offset_of<member>(), sizeof(key_type)) ^ (capacity_v * 0x9e3779b97f4a7c15ull); }
 
-        void reserve(std::size_t records) { map.reserve(records); }
+        void place(index_arena& arena, std::size_t records) { map.place(arena, capacity_v ? capacity_v : records); }
+        void clear() noexcept { map.clear(); }
         bool add(record_id id, const owner& value) { return map.insert(detail::key_bits(value.*member), id); }
         void remove(record_id, const owner& value) { map.erase(detail::key_bits(value.*member)); }
 
@@ -4160,7 +4452,7 @@ namespace storage {
         flat_hash_map map;
     };
 
-    template <auto member>
+    template <auto member, std::size_t capacity_v = 0, std::size_t keys_v = 0>
     class multi_index {
     public:
         using owner = member_class_t<member>;
@@ -4169,8 +4461,21 @@ namespace storage {
                       "an index key must be an integer or an enum - hash the field yourself and index the hash");
         static constexpr auto field = member;
         static constexpr tag_t owner_tag = owner::tag;
+        static constexpr std::size_t declared_capacity = capacity_v;
+        static uint64_t signature() { return detail::index_signature(2, owner_tag, detail::offset_of<member>(), sizeof(key_type)) ^ (capacity_v * 0x9e3779b97f4a7c15ull) ^ (keys_v * 0xff51afd7ed558ccdull); }
 
-        void reserve(std::size_t records) { map.reserve(records, records); }
+        // Two capacities, because a multi index has two: how many ENTRIES it
+        // can hold, and how many distinct KEYS those fall under. Sizing the key
+        // table to the entry count is the easy mistake and it is expensive -
+        // 4,000,000 order lines belong to 1,200,000 orders, and a head table
+        // sized for the former is three times the one sized for the latter,
+        // holding nothing.
+        void place(index_arena& arena, std::size_t records) {
+            const std::size_t entries = capacity_v ? capacity_v : records;
+            const std::size_t keys = keys_v ? keys_v : entries;
+            map.place(arena, keys, entries);
+        }
+        void clear() noexcept { map.clear(); }
         bool add(record_id id, const owner& value) { return map.insert(detail::key_bits(value.*member), id); }
         void remove(record_id id, const owner& value) { map.erase(detail::key_bits(value.*member), id); }
 
@@ -4182,7 +4487,7 @@ namespace storage {
         flat_multi_map map;
     };
 
-    template <auto member>
+    template <auto member, std::size_t capacity_v = 0>
     class ordered_index {
     public:
         using owner = member_class_t<member>;
@@ -4191,8 +4496,12 @@ namespace storage {
                       "an ordered index key must be an integer or an enum");
         static constexpr auto field = member;
         static constexpr tag_t owner_tag = owner::tag;
+        static constexpr std::size_t declared_capacity = capacity_v;
+        static uint64_t signature() { return detail::index_signature(3, owner_tag, detail::offset_of<member>(), sizeof(key_type)) ^ (capacity_v * 0x9e3779b97f4a7c15ull); }
 
-        void reserve(std::size_t records) { map.reserve(records); }
+        void place(index_arena& arena, std::size_t records) { map.place(arena, capacity_v ? capacity_v : records); }
+        void clear() noexcept { map.clear(); }
+        void flush_pending() const { map.flush_pending(); }
         bool add(record_id id, const owner& value) { return map.insert((int64_t)(value.*member), id); }
         void remove(record_id id, const owner& value) { map.erase((int64_t)(value.*member), id); }
 
@@ -4215,17 +4524,99 @@ namespace storage {
     // is easy to get wrong: retract before add, resolve the post-update value,
     // and take the type from the record rather than from the header.
     // =====================================================================
-    template <typename... index_types>
+    template <std::size_t records, typename... index_types>
     class index_set {
     public:
-        // Capacity is fixed here rather than grown later, deliberately: an
-        // index that reallocates under a write is an index whose cost is
+        // Capacity is fixed here rather than grown later, deliberately: an index
+        // that reallocates under a write is an index whose cost is
         // unpredictable exactly when it matters, and the engine's own index
         // makes the same trade. Sized in records, since that is the number an
         // application actually knows.
-        explicit index_set(std::size_t expected_records = 1024) : expected(expected_records) {
-            std::apply([&](auto&... ix) { (ix.reserve(expected_records), ...); }, indexes);
+        //
+        // It is a TEMPLATE parameter rather than a constructor argument, and
+        // that is load-bearing rather than a matter of taste: the engine has to
+        // map the arena file while it is constructing itself, which is before
+        // any caller could have handed it a number. Making the size part of the
+        // type means there is no window in which the set exists unsized, and no
+        // "did you remember to size it before the first write" to get wrong.
+        static constexpr std::size_t expected_records = records;
+
+        index_set() { adopt({}, true); }
+
+        // Spans into an arena are not copyable state - a copy would leave the
+        // second object pointing into the first one's buffer, which works right
+        // up until the first one dies. The engine holds this by value and never
+        // copies it; anything that wanted to would have wanted a second arena.
+        index_set(const index_set&) = delete;
+        index_set& operator=(const index_set&) = delete;
+
+        // ---- the arena ---------------------------------------------------
+        //
+        // How many bytes this set needs, computed by laying it out against an
+        // arena that has no memory. The engine calls this to size the file.
+        //
+        // Lays out a bare tuple rather than a whole index_set, because
+        // constructing one of those is what calls this.
+        // Which index set wrote a file. The arena is a flat block whose
+        // meaning is entirely in the layout that produced it: reorder two
+        // indexes, change a field's offset, or resize the set, and the same
+        // bytes are a different structure that would be read as garbage rather
+        // than refused. The engine stamps this alongside the data and declines
+        // to believe a file that disagrees.
+        static uint64_t layout_id() {
+            uint64_t h = 0xcbf29ce484222325ull;
+            const auto mix = [&h](uint64_t v) { h ^= v; h *= 0x100000001b3ull; };
+            mix(records);
+            mix(sizeof...(index_types));
+            (mix(index_types::signature()), ...);
+            return h;
         }
+
+        static std::size_t arena_bytes() {
+            index_arena measuring = index_arena::measuring();
+            std::tuple<index_types...> probe;
+            std::apply([&](auto&... ix) { (ix.place(measuring, records), ...); }, probe);
+            return measuring.used();
+        }
+
+        // Point every index at `bytes`. An empty span means the heap buffer
+        // this object owns, which is what happens when the engine has no arena
+        // file for it - the structures cannot tell the difference.
+        //
+        // `fresh` is the whole contract with the engine: false says the bytes
+        // are a valid index for the log as it stands and must be used as they
+        // are, true says they are scratch and must be zeroed. Getting that
+        // backwards is either a rebuild that was not needed or an index full of
+        // whatever the file used to be, so the engine decides it from a stamp
+        // rather than from a guess.
+        void adopt(std::span<std::byte> bytes, bool fresh) {
+            if (bytes.size() < arena_bytes()) {
+                // No arena, or one too small to hold the layout. Either way the
+                // answer is the same and it is not "carve what fits": a
+                // half-placed index is a set of null pointers waiting for the
+                // first lookup. Fall back to a buffer that is the right size by
+                // construction, and say so through placed().
+                heap.assign(arena_bytes(), std::byte{});
+                bytes = heap;
+                fresh = true;
+                mapped = false;
+            } else {
+                mapped = true;
+            }
+            index_arena arena(bytes.data(), bytes.size());
+            place_all(arena);
+            if (fresh) { std::apply([](auto&... ix) { (ix.clear(), ...); }, indexes); failures = 0; }
+        }
+
+        // Everything the indexes keep off the arena, put back on it. Called by
+        // the engine before it flushes the mapping - see flat_ordered_map.
+        void before_flush() const {
+            std::apply([](const auto&... ix) { (flush_one(ix), ...); }, indexes);
+        }
+
+        // False when the arena it was handed was too small for the layout,
+        // which the engine turns into a refusal to use the file at all.
+        bool placed() const noexcept { return mapped; }
 
         void on_record(auto& table, const record_header& hdr, const std::byte* payload) {
             // The type of an UPDATE or a DESTROY is not in the header - those
@@ -4261,7 +4652,7 @@ namespace storage {
         // to pay. bench/app_layer.hpp pays nothing instead by keeping its index
         // in a mapping; that is a further step, not a different answer.
         void on_restart(auto& table) {
-            std::apply([&](auto&... ix) { (ix.reserve(expected), ...); }, indexes);
+            std::apply([](auto&... ix) { (ix.clear(), ...); }, indexes);
             failures = 0;
             table.for_each_raw([&](auto view) { index_existing(view.id, view.tag, view.bytes.data()); });
         }
@@ -4353,8 +4744,21 @@ namespace storage {
             if (!ix.add(id, value)) ++failures;
         }
 
+        // The layout, in one place and run twice: once against a measuring
+        // arena to size the file, once against the real one to carve it.
+        void place_all(index_arena& arena) {
+            std::apply([&](auto&... ix) { (ix.place(arena, records), ...); }, indexes);
+        }
+
+        // Only an ordered index keeps anything off the arena, so only it has
+        // the member - the others pay nothing for a call that does not exist.
+        static void flush_one(const auto& ix) {
+            if constexpr (requires { ix.flush_pending(); }) ix.flush_pending();
+        }
+
         std::tuple<index_types...> indexes;
-        std::size_t expected = 1024;
+        std::vector<std::byte> heap;   // used only when the engine has no arena file
+        bool mapped = false;
         std::size_t failures = 0;
     };
 

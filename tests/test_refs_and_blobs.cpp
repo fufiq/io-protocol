@@ -56,7 +56,7 @@ namespace {
     static_assert(sizeof(order_line) == 4 * sizeof(uint64_t));
 
     using spec = storage::field_spec<"t_ref.log", 1u << 22, "t_ref.idx", 8192, 8192, 8, 4096>;
-    using indexes = storage::index_set<storage::multi_index<&order_line::buyer>>;
+    using indexes = storage::index_set<8192, storage::multi_index<&order_line::buyer>>;
     using table_t = storage::field_storage<spec, indexes>;
 
     // Named concepts rather than a bare `!requires(...)` in the test body: with
@@ -70,7 +70,7 @@ namespace {
     template <typename table, typename target, typename R>
     concept readable_as = requires(table& t, R r) { t.template get<target>(r); };
 
-    void wipe() { std::remove(spec::path.value); std::remove(spec::index_path); }
+    void wipe() { std::remove(spec::path.value); std::remove(spec::index_path); std::remove("t_ref.idx.sx"); }
 
     struct fixture {
         fixture() { wipe(); table = new table_t(); REQUIRE(table->ok()); }

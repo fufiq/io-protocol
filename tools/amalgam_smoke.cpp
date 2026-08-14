@@ -34,6 +34,10 @@ namespace {
         uint64_t id, x, y, z;
     };
 
+    // A declared index, so the amalgamation is checked to carry indexes.hpp
+    // and not merely to compile without it.
+    using points_by_x = storage::index_set<storage::unique_index<&point::x>>;
+
     // An observer, because index maintenance below apply() is half of what the
     // engine is for and it would be easy for an amalgamation to lose.
     struct counting_observer {
@@ -45,6 +49,7 @@ namespace {
                                      "amalgam.idx", 100'000, 50'000,
                                      8, sizeof(point), "amalgam.ckp">;
     using table_t = storage::field_storage<spec, counting_observer>;
+    using indexed_t = storage::field_storage<spec, points_by_x>;
 
     void remove_files(const std::string& dir) {
         const std::string prefix = dir.empty() ? std::string{} : dir + "/";
@@ -89,6 +94,7 @@ int main() {
         check(t.checkpoint(), "checkpoint");
     }
 
+
     {
         table_t t;
         check(t.ok(), "reopen");
@@ -110,6 +116,23 @@ int main() {
         check(got && got->z == 4, "read back from the relocated files");
         struct ::stat st {};
         check(::stat("amalgam.log", &st) != 0, "nothing was created at the compile-time path");
+        remove_files(dir);
+    }
+
+    // The index layer, last and in a directory of its own - an earlier version
+    // put it in the middle, where its cleanup deleted the checkpoint the
+    // restart check above still needed.
+    {
+        const std::string dir = "amalgam_ix";
+        ::mkdir(dir.c_str(), 0755);
+        indexed_t t(storage::storage_paths::under<spec>(dir));
+        check(t.ok(), "open with a declared index");
+        const auto a = t.create(point{ 1, 4242, 0, 0 });
+        t.create(point{ 2, 7, 0, 0 });
+        check(t.observer_state().find<&point::x>(4242) == a, "unique index finds by field");
+        t.update<&point::x>(a, 99);
+        check(t.observer_state().find<&point::x>(99) == a && t.observer_state().find<&point::x>(4242) == 0,
+              "the index follows an update and leaves no ghost");
         remove_files(dir);
     }
 

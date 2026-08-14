@@ -14,8 +14,8 @@
 // field. bench/app_layer.hpp is one worked instance. This file is that code,
 // generated from a declaration:
 //
-//     using indexes = storage::index_set<
-//         storage::unique_index<&customer::email_hash>,
+//     using indexes = storage::index_set<1'000'000,        // shared capacity
+//         storage::unique_index<&customer::email_hash, 200'000>,   // own capacity
 //         storage::multi_index<&order::customer_id>,
 //         storage::ordered_index<&product::price>>;
 //
@@ -41,13 +41,18 @@
 //   tag - only an id and a byte range - so the type has to come from
 //   tag_of(id). A switch on hdr.tag silently does nothing for updates.
 //
-// WHERE THE MEMORY LIVES. On the heap, in flat arrays this file owns. Flat
-// rather than std::unordered_map because the structures are meant to become
-// mappable later - a map is a web of pointers into an allocator and means
-// nothing to the next run - and because capacity should be a number you chose
-// rather than whatever the allocator does under memory pressure. An insert past
-// capacity FAILS rather than growing, the same rule the engine's own index
-// follows, and failed_inserts() counts it so a silent half-index is impossible.
+// WHERE THE MEMORY LIVES. In one mapped file per index_set - the arena,
+// index_arena below - carved by a bump pointer rather than owned as separate
+// heap allocations, which is what lets it be mapped at all: a
+// std::unordered_map is a web of pointers into an allocator and means nothing
+// to the next run, but a span into a flat block is a file, and a file the
+// engine can stamp with a log offset is an index that survives a restart for
+// free (§7a). Falls back to a heap buffer of the identical layout when the
+// engine gave no arena file - adopt() below - so the structures never know
+// which they got. Capacity is a number you chose, not whatever the allocator
+// does under memory pressure: an insert past it FAILS rather than growing, the
+// same rule the engine's own index follows, and failed_inserts() counts it so
+// a silent half-index is impossible.
 //
 // WHAT IT DOES NOT DO. Uniqueness is not enforced here - a unique_index is a
 // lookup structure, and rejecting a duplicate is a constraint, which belongs

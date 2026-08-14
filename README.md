@@ -132,6 +132,57 @@ Two things worth knowing before you build on it, both expanded in the spec:
   Size the interval against the bytes an operation dirties, per phase, not once
   per program.
 
+## Secondary indexes
+
+The engine has none - it does not know what a "field" means to your schema -
+but the observer it calls before every slot changes is where one can be built
+without ever drifting from the data. `storage/indexes.hpp` is that observer,
+declared instead of hand-written:
+
+```cpp
+#include "indexes.hpp"
+
+struct customer {
+    static constexpr storage::tag_t tag = 1;
+    uint64_t email_hash;
+    int64_t  balance;
+};
+
+struct order {
+    static constexpr storage::tag_t tag = 2;
+    storage::ref<customer> buyer;    // a record_id wearing a type; get<T>() needs no <T>
+    int64_t                total;
+};
+
+using indexes = storage::index_set<1'000'000,                          // shared capacity
+    storage::unique_index<&customer::email_hash, 200'000>,             // own capacity, this one
+    storage::ordered_index<&customer::balance>,                        // range queries
+    storage::multi_index<&order::buyer, /*entries*/1'000'000, /*keys*/200'000>>;
+
+storage::field_storage<spec, indexes> table;
+auto id = table.observer_state().find<&customer::email_hash>(hash);
+table.observer_state().each<&order::buyer>(who, [&](storage::record_id id) { ... });
+auto n = table.observer_state().count_range<&product::price>(100, 500);
+```
+
+Three rules it enforces that a hand-written observer has to get right on its
+own every time - retract an old key before adding the new one, resolve an
+UPDATE's post-change value rather than indexing the changed bytes alone, and
+take the type from the record rather than from the header, since UPDATE and
+DESTROY carry no tag. `storage/blob.hpp` pairs with it for text or binary of a
+length the type system does not fix in advance (`blob_ref<tag>` + `put_text` /
+`load_text`).
+
+**The indexes live in a mapped file of their own, stamped by the same
+checkpoint that stamps the engine's own slots** - `checkpoint()` and
+`restart()` cover both without a separate call. A restart with a stamp that
+still agrees is an mmap; one that does not (schema changed, or a write landed
+after the last checkpoint) rebuilds from the live records instead of using
+stale ones, automatically and without silently answering wrong.
+
+Full specification, the cost of maintaining an index and of each restart path,
+measured: **[`storage/FIELD_STORAGE.md` §7a](storage/FIELD_STORAGE.md#7a-secondary-indexes)**.
+
 ## Replication
 
 WAL shipping to N replicas, snapshot bootstrap, desync detection from both
@@ -261,7 +312,7 @@ cmake --build build-asan -j$(nproc)
 ctest --test-dir build-asan --output-on-failure
 ```
 
-`ctest` runs five cases: `unit_tests` (**197 doctest cases, 12,906
+`ctest` runs five cases: `unit_tests` (**234 doctest cases, 13,924
 assertions**), `replication_tests` (**71 checks**, every applier scenario
 against both engines, over real loopback endpoint pairs for the networked
 half), `amalgam_current` (the single-header build is not stale), `amalgam_smoke`
@@ -306,9 +357,21 @@ tools/android_test.sh          # engine; set SODIUM_ANDROID for the other two
 
 | suite | Linux | Android |
 |---|---|---|
-| storage engine | 209 cases, 13,028 assertions | **87 cases, 6,326 assertions** |
+| storage engine | 234 cases, 13,924 assertions | **112 cases, 7,222 assertions** |
 | protocol | 12 cases × 2 transports | **12 cases, 122 assertions** (epoll) |
 | replication | 71 checks | **68 checks** - the three missing are the one fiber scenario |
+
+The engine suite on Android is picked up by what a test file includes rather
+than a name in the script, on purpose: an earlier version of
+`tools/android_test.sh` named two files, so `storage/indexes.hpp`'s tests were
+added to the host build and never once ran here - clean Linux, unrun Android,
+same "all Android checks passed" either way. Discovery by include is what
+caught it, four commits after the fact, and it caught something with it:
+`SANITIZE=1` (NDK clang) found a pointer-overflow past a null base in the
+index arena's measuring pass, undefined regardless of whether the pointer is
+ever used - a check `-fsanitize=undefined` runs under clang and does not exist
+under GCC, so the Linux ASan/UBSan build had been clean the whole time. Fixed;
+see `storage/indexes.hpp`'s `index_arena::take()`.
 
 The Android replication run is not a smoke test: it includes the networked
 scenarios over real UDP sockets - disconnect with writes accumulating then
@@ -364,9 +427,11 @@ and expect to fix something.
 
 # What is not here
 
-- **No query language, planner or joins.** Secondary indexes live in user code
-  over the observer; `bench/app_layer.hpp` is a worked example with unique
-  constraints, foreign keys, triggers and staged transactions.
+- **No query language, planner or joins.** Secondary indexes are declared
+  (`storage/indexes.hpp`, above), but a join is still a loop you write:
+  `bench/app_layer.hpp` and its port to declared indexes, `bench/app_schema.hpp`,
+  are worked examples with unique constraints, foreign keys, triggers and staged
+  transactions on top.
 - **No MVCC and no concurrent writers.** Readers are safe in two narrow forms
   and no others: freely while no writer runs, and inside a commit via a
   seqlock. Everything else is a data race.

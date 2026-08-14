@@ -288,12 +288,121 @@ pointer-to-member and is checked by the type system.
 An observer sees `on_record(table, header, payload)` for every applied record.
 Two rules follow from the fact that recovery replays it:
 
-- **Index maintenance belongs in the observer.** It lives only in memory and
-  must be rebuilt identically every time.
+- **Index maintenance belongs in the observer.** It must be rebuildable from a
+  replay of this same log every time, because that is the fallback when nothing
+  faster is available - see §7a for the mapped index that usually is faster.
 - **Constraints and triggers do not.** A trigger that decremented stock when an
   order shipped must not decrement it again while the log is replayed at
   startup - the decrement is already a record in that same log. Those belong in
   a transaction layer above.
+
+## 7a. Secondary indexes
+
+```cpp
+#include "indexes.hpp"    // storage/indexes.hpp
+
+template <auto member, std::size_t capacity = 0>              class unique_index;
+template <auto member, std::size_t capacity = 0, std::size_t keys = 0> class multi_index;
+template <auto member, std::size_t capacity = 0>              class ordered_index;
+
+template <std::size_t records, typename... index_types>
+class index_set;    // the observer §7 describes, generated from a declaration
+```
+
+`storage/indexes.hpp` is the ~200 lines every application writes by hand for
+this observer, generated from a declaration instead:
+
+```cpp
+using indexes = storage::index_set<1'000'000,
+    storage::unique_index<&customer::email_hash, 200'000>,
+    storage::ordered_index<&customer::balance>,
+    storage::multi_index<&order::buyer, /*entries*/1'000'000, /*keys*/200'000>>;
+
+storage::field_storage<spec, indexes> table;
+table.observer_state().find<&customer::email_hash>(hash);
+table.observer_state().each<&order::buyer>(who, [](record_id id) { ... });
+table.observer_state().count_range<&product::price>(100, 500);
+```
+
+Three kinds, each covering one field of one record type: `unique_index` (a
+lookup, one id per key), `multi_index` (a key to a list of ids - hashed, one
+allocator-free node arena shared by every key), `ordered_index` (sorted
+`(key, id)` pairs - a range is two binary searches). `index_set` dispatches
+between them and enforces the three rules §7 states: retract before add,
+resolve an UPDATE's post-change value, take the type from the record because
+UPDATE and DESTROY carry none.
+
+**Capacity is a template parameter, never a constructor argument.** The engine
+maps this index's arena while constructing itself, which is before any caller
+could have supplied a number - making it part of the type removes the window
+in which a set would otherwise exist unsized. An index without its own number
+takes `index_set`'s shared capacity; `multi_index` takes two, since it has two
+things to run out of - entries, and the distinct keys they group under.
+Undersizing does not corrupt anything: an insert past capacity is refused and
+counted (`failed_inserts()`), never silently dropped.
+
+**`ref<T>` and `blob_ref<tag>`** (`storage/storage.hpp`, `storage/blob.hpp`)
+are what a field points at when it is not stored inline. `ref<T>` is a
+`record_id` wearing a type - same eight bytes, so it costs nothing a raw id
+did not, but `get<customer>` no longer needs to be told it is reading a
+`ref<customer>` and a `ref<product>` handed to the wrong slot is a compile
+error rather than a foreign key silently pointed at the wrong table.
+`blob_ref<tag>` is the same idea for text or binary whose length the record
+format cannot fix in advance: it names its own record, written and read
+through `put_text` / `load_text` / `load_blob_into`, and a payload past
+`max_record_bytes` is refused rather than truncated.
+
+### The arena
+
+Every index inside an `index_set` lives in one mapped file, `<index_path>.sx`,
+carved by a bump allocator (`index_arena`) rather than owned as separate heap
+allocations. This is not a performance detail - it is what makes the next
+paragraph possible.
+
+That file is stamped by the *same* `checkpoint()` that stamps the engine's own
+index (§9), with an offset of its own: `index_arena_header::write_offset`.
+`checkpoint()` settles anything an index kept off the arena (an `ordered_index`
+batches inserts through an unsorted pending tail - see the source - and has to
+flush it first), msyncs the arena, then writes the offset. `restart()` compares
+that offset against the log position it is about to resume from:
+
+- **Agree** → the file *is* the index. Nothing is read from the log to rebuild
+  it; the arena is mapped and used as-is (`index_arena_mapped()`,
+  `index_arena_inherited()`).
+- **Disagree** - a write landed after the checkpoint, the schema changed (a
+  layout id is stamped alongside the offset and checked first), or there is no
+  arena file yet - → one pass over the *live records* rebuilds it
+  (`index_set::on_restart`), which is the same cost paying for a rebuild always
+  was, not a new one.
+
+**The stamp is cleared before the write that would invalidate it, not after.**
+The first mutation following a checkpoint clears `write_offset` to 0 and
+msyncs that one page *before* applying the write. A crash between those two
+steps leaves the file unstamped, which is the safe failure: an unstamped arena
+is always rebuilt, never trusted. The alternative ordering - write, then
+unstamp - has a window where a crash leaves a *stamped* file that no longer
+matches the log, and that is a wrong answer returned with confidence, not a
+slow one.
+
+**Measured** (`bench/app_schema_bench.cpp`, 500,000 customers / 200,000
+products / 1,000,000 orders / ~2,000,000 lines, six indexes, best of 3):
+
+| | cost |
+|---|---|
+| fill, six indexes vs. none | **+85-90%** |
+| `recover()` (replay), six indexes vs. none | **+106-320%**, run-to-run - see below |
+| `restart()`, arena rebuilt (no stamp) | one pass over live records - **0.10 s** at 3.7M records |
+| `restart()`, arena inherited (stamp agrees) | **0.000 s** - an mmap and one comparison |
+
+The replay figure's spread is real and explained, not noise glossed over: it
+was **+3,296%** before `flat_ordered_map` stopped inserting into the middle of
+a sorted vector (a bulk load moved *n²/2* elements - 320 GB of memmove at
+200,000 products) and **+323%** before each index took its own capacity
+instead of the whole set's largest. Both fixes are in; what remains is that
+maintaining six indexes costs roughly as much again as the engine itself, on
+both the write path and a replay - which is the honest answer to "do
+they ride along for free", and the reason the arena above exists: it is the
+one restart path that removes that cost rather than merely amortising it.
 
 ## 8. Durability
 
@@ -505,12 +614,22 @@ end of the file.
 
 `checkpoint()` on a clean shutdown: msync the log, msync the index, then write a
 marker - temp file, fsync, rename, fsync the parent directory. Everything the
-marker describes is durable *before* the marker exists.
+marker describes is durable *before* the marker exists. If the observer has a
+declared index set (§7a), its arena is settled and stamped with the same
+offset as part of the same call - a caller doing both never has two things to
+remember to keep in sync, because there is only the one call.
 
 `restart()` validates magic, that the index and the marker agree on
 `write_offset`, that the byte after that offset is still sparse, and the CRC of
 the log's tail. **Any disagreement falls back to a full `recover()`** - the
-checkpoint is an optimisation, never a source of truth.
+checkpoint is an optimisation, never a source of truth. The arena's stamp is
+checked separately, and can disagree while the engine's own restore does not -
+a schema change moves the arena's layout id without touching `write_offset` -
+so `restart()` succeeding is not a promise that the arena was inherited too;
+check `index_arena_inherited()` if the distinction matters to the caller. The
+other direction cannot happen: whenever the engine falls back to a full
+`recover()`, the arena is cleared and rebuilt by the same replay, never left
+stamped for a log recovery just rewrote.
 
 ## 10. Compaction
 
@@ -903,9 +1022,11 @@ placed where it degenerated. Both are fixed. See §8a.
 
 ## 15. Out of scope
 
-No query language, no planner, no joins. No secondary indexes - those live in
-user code over the observer (`bench/app_layer.hpp` is a worked example with
-unique constraints, foreign keys, triggers and staged transactions).
+No query language, no planner, no joins. Secondary indexes can be declared
+(§7a) rather than hand-written, but a join is still a loop you write -
+`bench/app_layer.hpp` and its port to declared indexes, `bench/app_schema.hpp`,
+are worked examples with unique constraints, foreign keys, triggers and staged
+transactions on top.
 
 No MVCC, no snapshots, no concurrent *writers* - one writer owns the index.
 Concurrent readers exist in two narrow forms and no others: freely while no

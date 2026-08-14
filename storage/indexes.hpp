@@ -184,9 +184,20 @@ namespace storage {
             offset = (offset + alignof(T) - 1) & ~(alignof(T) - 1);
             const std::size_t bytes = count * sizeof(T);
             if (offset + bytes > limit) { overflowed = true; return {}; }
-            std::byte* at = base + offset;
+            // The measuring arena has no memory, so the offset is advanced
+            // WITHOUT forming an address. `nullptr + offset` is undefined even
+            // when the result is thrown away, and it is the kind of undefined
+            // that costs nothing until a compiler decides base cannot be null
+            // and deletes the check below it.
+            //
+            // Found by clang's UBSan on Android, not by GCC's on this machine:
+            // -fsanitize=pointer-overflow is part of clang's `undefined` group
+            // and GCC does not implement it at all. The Linux run was clean and
+            // the code was still wrong.
+            std::span<T> out{};
+            if (base) out = std::span<T>((T*)(base + offset), count);
             offset += bytes;
-            return base ? std::span<T>((T*)at, count) : std::span<T>{};
+            return out;
         }
 
         std::size_t used() const noexcept { return offset; }

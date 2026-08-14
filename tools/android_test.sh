@@ -92,8 +92,21 @@ else
     FLAGS+=(-O2)
 fi
 
+# Discovered rather than listed, and that is the point. The list used to name
+# two files by hand, so tests/test_indexes.cpp and tests/test_refs_and_blobs.cpp
+# were added to the host build and simply never ran here - a whole layer
+# unverified on the platform, with the script still reporting "all Android
+# checks passed".
+#
+# The engine suite is every test that does NOT reach into net/ or replication/,
+# because those need libsodium and liburing and are built separately below.
+# Selecting by what a file includes rather than by name means the next storage
+# test is picked up without anyone remembering to add it.
+mapfile -t ENGINE_TESTS < <(grep -L '"\.\./net/\|"\.\./replication/' "$REPO"/tests/test_*.cpp)
+[ ${#ENGINE_TESTS[@]} -gt 0 ] || { echo "no engine test files found" >&2; exit 1; }
+echo "engine suite: ${#ENGINE_TESTS[@]} test files"
 "$CXX" "${FLAGS[@]}" -I"$REPO/build/_deps/doctest-src" \
-    "$STAGE/main.cpp" "$REPO/tests/test_storage.cpp" "$REPO/tests/test_field_storage.cpp" \
+    "$STAGE/main.cpp" "${ENGINE_TESTS[@]}" \
     -o "$STAGE/storage_tests"
 "$CXX" "${FLAGS[@]}" -I"$REPO/dist" "$REPO/tools/amalgam_smoke.cpp" -o "$STAGE/amalgam_smoke"
 "$CXX" "${FLAGS[@]}" "$REPO/embedded/platform_check.cpp" -o "$STAGE/platform_check"
@@ -130,7 +143,9 @@ for t in "${BINARIES[@]}"; do
     grep -q "EXIT=0" "$STAGE/$t.out" || status=1
 done
 
-"$ADB" shell "cd /data/local/tmp && rm -f ${BINARIES[*]} *.log *.idx *.ckp *.tmp" >/dev/null 2>&1 || true
+# *.sx is the secondary index arena. A stale one left on the device is not
+# inert: it is a file the next run may be handed and asked to believe.
+"$ADB" shell "cd /data/local/tmp && rm -f ${BINARIES[*]} *.log *.idx *.ckp *.tmp *.sx" >/dev/null 2>&1 || true
 
 echo
 [ $status -eq 0 ] && echo "all Android checks passed" || echo "SOME ANDROID CHECKS FAILED"

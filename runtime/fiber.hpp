@@ -74,6 +74,14 @@
 // free, all of UBSan) fully intact - only the stack-use-after-return
 // checks are disabled, which fiber code was never able to rely on anyway.
 
+// A legible failure rather than a page of "undeclared identifier": bionic ships
+// <ucontext.h> but not the functions in it, so the include succeeds and every
+// call fails, which reads like a broken toolchain instead of an unsupported
+// platform.
+#if defined(__ANDROID__) || defined(__APPLE__)
+#  error "runtime/fiber.hpp is Linux-only - makecontext/swapcontext left POSIX in 2008, are deprecated on macOS and absent from bionic and the iOS SDK. Nothing in storage/, replication/ or the protocol needs this file; see its header comment."
+#endif
+
 #include <ucontext.h>
 #include <cstdlib>
 #include <cstdint>

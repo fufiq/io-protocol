@@ -1,8 +1,16 @@
 #include <doctest/doctest.h>
 
 #include "../net/protocol.hpp"
-#include "../net/uring_io.hpp"
 #include "../embedded/epoll_udp.hpp"
+
+// The io_uring transport is not available everywhere the PROTOCOL is: Android
+// blocks io_uring for apps with seccomp, so a build there has epoll and nothing
+// else. Testing what exists rather than failing to compile is the point of the
+// backend split, and this is where that shows up.
+#if __has_include(<liburing.h>)
+#  define BC_HAVE_URING_BACKEND 1
+#  include "../net/uring_io.hpp"
+#endif
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -51,6 +59,7 @@ sockaddr_in loopback_addr(uint16_t port) {
 // what a backend needs to exist: io_uring needs a ring to sit on, epoll needs
 // nothing but the socket. Bundling that here is what keeps `peer` from knowing
 // which one it has.
+#ifdef BC_HAVE_URING_BACKEND
 struct uring_transport {
     static constexpr const char* name = "io_uring";
     uring_ring ring{2048};
@@ -58,6 +67,7 @@ struct uring_transport {
     uring_transport(int fd, const endpoint_config& c)
         : io(ring, fd, c.send_pool_size, c.recv_num_bufs, c.recv_buf_size) {}
 };
+#endif
 
 struct epoll_transport {
     static constexpr const char* name = "epoll";
@@ -65,7 +75,15 @@ struct epoll_transport {
     epoll_transport(int fd, const endpoint_config&) : io(fd) {}
 };
 
-template <typename transport = uring_transport,
+#ifdef BC_HAVE_URING_BACKEND
+#  define BC_TRANSPORTS uring_transport, epoll_transport
+using default_transport = uring_transport;
+#else
+#  define BC_TRANSPORTS epoll_transport
+using default_transport = epoll_transport;
+#endif
+
+template <typename transport = default_transport,
           size_t keepalive_interval_ms = 20000, size_t liveness_timeout_ms = 60000, size_t handshake_timeout_ms = 5000>
 struct peer {
     uint16_t port = 0;
@@ -139,7 +157,7 @@ const event* find_message(const std::vector<event>& events, uint64_t conn_id) {
 
 } // namespace
 
-TEST_CASE_TEMPLATE("full handshake establishes sessions on both sides, keyed by the same conn_id", tr, uring_transport, epoll_transport) {
+TEST_CASE_TEMPLATE("full handshake establishes sessions on both sides, keyed by the same conn_id", tr, BC_TRANSPORTS) {
     peer<tr> server;
     peer<tr> client;
     uint64_t conn_id = 0xAABBCCDD;
@@ -157,7 +175,7 @@ TEST_CASE_TEMPLATE("full handshake establishes sessions on both sides, keyed by 
     CHECK(server.endpoint.session_count() == 1);
 }
 
-TEST_CASE_TEMPLATE("handshake_established carries the peer's cryptographically-proven static public key", tr, uring_transport, epoll_transport) {
+TEST_CASE_TEMPLATE("handshake_established carries the peer's cryptographically-proven static public key", tr, BC_TRANSPORTS) {
     peer<tr> server;
     peer<tr> client;
     uint64_t conn_id = 42;
@@ -183,7 +201,7 @@ TEST_CASE_TEMPLATE("handshake_established carries the peer's cryptographically-p
     CHECK(client_side->peer_static == server.static_pub);
 }
 
-TEST_CASE_TEMPLATE("a single-fragment message sent fire-and-forget arrives intact", tr, uring_transport, epoll_transport) {
+TEST_CASE_TEMPLATE("a single-fragment message sent fire-and-forget arrives intact", tr, BC_TRANSPORTS) {
     peer<tr> server;
     peer<tr> client;
     uint64_t conn_id = 1;
@@ -203,7 +221,7 @@ TEST_CASE_TEMPLATE("a single-fragment message sent fire-and-forget arrives intac
     CHECK(received->data == msg);
 }
 
-TEST_CASE_TEMPLATE("queuing a message before the handshake completes still delivers it once established", tr, uring_transport, epoll_transport) {
+TEST_CASE_TEMPLATE("queuing a message before the handshake completes still delivers it once established", tr, BC_TRANSPORTS) {
     // send_message() before handshake_established used to just fail outright (send_message
     // returned false); now it queues and waits - this is the point of decoupling "produce" from
     // "network readiness."
@@ -224,7 +242,7 @@ TEST_CASE_TEMPLATE("queuing a message before the handshake completes still deliv
     CHECK(client.endpoint.outgoing_queue_depth(conn_id) == 0);
 }
 
-TEST_CASE_TEMPLATE("a multi-fragment message reassembles correctly end-to-end", tr, uring_transport, epoll_transport) {
+TEST_CASE_TEMPLATE("a multi-fragment message reassembles correctly end-to-end", tr, BC_TRANSPORTS) {
     peer<tr> server;
     peer<tr> client;
     uint64_t conn_id = 2;
@@ -245,7 +263,7 @@ TEST_CASE_TEMPLATE("a multi-fragment message reassembles correctly end-to-end", 
     CHECK(received->data == msg);
 }
 
-TEST_CASE_TEMPLATE("a reliable message completes its SACK round-trip (pending drops to zero)", tr, uring_transport, epoll_transport) {
+TEST_CASE_TEMPLATE("a reliable message completes its SACK round-trip (pending drops to zero)", tr, BC_TRANSPORTS) {
     peer<tr> server;
     peer<tr> client;
     uint64_t conn_id = 3;
@@ -269,7 +287,7 @@ TEST_CASE_TEMPLATE("a reliable message completes its SACK round-trip (pending dr
     REQUIRE(pump_until(client, server, [&] { return client.endpoint.reliable_pending_count(conn_id) == 0; }));
 }
 
-TEST_CASE_TEMPLATE("a responder under load still lets a legitimate client through via the cookie retry", tr, uring_transport, epoll_transport) {
+TEST_CASE_TEMPLATE("a responder under load still lets a legitimate client through via the cookie retry", tr, BC_TRANSPORTS) {
     // threshold=1 means the responder is "under load" starting with this
     // very client's own first handshake attempt (record_attempt runs
     // before the under_load check within the same call) - no separate
@@ -290,7 +308,7 @@ TEST_CASE_TEMPLATE("a responder under load still lets a legitimate client throug
     CHECK(server.endpoint.cookie_replies_sent_count() >= 1);
 }
 
-TEST_CASE_TEMPLATE("a tampered data packet is rejected by the full stack, not delivered as a message", tr, uring_transport, epoll_transport) {
+TEST_CASE_TEMPLATE("a tampered data packet is rejected by the full stack, not delivered as a message", tr, BC_TRANSPORTS) {
     peer<tr> server;
     peer<tr> client;
     uint64_t conn_id = 5;
@@ -322,7 +340,7 @@ TEST_CASE_TEMPLATE("a tampered data packet is rejected by the full stack, not de
     CHECK(find_message(server.events, conn_id) == nullptr);
 }
 
-TEST_CASE_TEMPLATE("the reliable congestion window grows on acks and is not exceeded under sustained sends", tr, uring_transport, epoll_transport) {
+TEST_CASE_TEMPLATE("the reliable congestion window grows on acks and is not exceeded under sustained sends", tr, BC_TRANSPORTS) {
     peer<tr> server;
     peer<tr> client;
     uint64_t conn_id = 7;
@@ -353,7 +371,7 @@ TEST_CASE_TEMPLATE("the reliable congestion window grows on acks and is not exce
     CHECK(received_count == 40);
 }
 
-TEST_CASE_TEMPLATE("an idle session receives periodic keepalives, invisible to the application", tr, uring_transport, epoll_transport) {
+TEST_CASE_TEMPLATE("an idle session receives periodic keepalives, invisible to the application", tr, BC_TRANSPORTS) {
     peer<tr> server;
     peer<tr, 20> client; // 20ms keepalive_interval_ms: short enough to observe within the test's round budget
     uint64_t conn_id = 8;
@@ -375,7 +393,7 @@ TEST_CASE_TEMPLATE("an idle session receives periodic keepalives, invisible to t
     CHECK(server.endpoint.replay_rejected_count() == 0);
 }
 
-TEST_CASE_TEMPLATE("an unresponsive peer is torn down and reported via peer_unreachable", tr, uring_transport, epoll_transport) {
+TEST_CASE_TEMPLATE("an unresponsive peer is torn down and reported via peer_unreachable", tr, BC_TRANSPORTS) {
     // keepalive_interval_ms=10, liveness_timeout_ms=50: short enough to
     // observe within the test's round budget (protocol_endpoint's own
     // requires clause needs liveness_timeout_ms > keepalive_interval_ms).
@@ -410,7 +428,7 @@ TEST_CASE_TEMPLATE("an unresponsive peer is torn down and reported via peer_unre
     CHECK(ev->peer_static == client.static_pub); // identified by the peer's proven identity, not just the now-dead conn_id
 }
 
-TEST_CASE_TEMPLATE("a pending handshake whose responder never answers times out with handshake_failed", tr, uring_transport, epoll_transport) {
+TEST_CASE_TEMPLATE("a pending handshake whose responder never answers times out with handshake_failed", tr, BC_TRANSPORTS) {
     peer<tr, 20000, 60000, 50> client; // handshake_timeout_ms=50
     uint64_t conn_id = 10;
 

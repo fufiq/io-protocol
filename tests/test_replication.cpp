@@ -19,9 +19,34 @@
 // Run:   ctest --test-dir build   (runs this and unit_tests, in both configs)
 
 #include "../replication/replication.hpp"
-#include "../net/uring_io.hpp"
+#include "../embedded/epoll_udp.hpp"
+
+// Whichever transport this platform has. The networked scenarios below do not
+// care which - that is the point of the backend split - and on Android there is
+// only one, because io_uring is blocked there by seccomp.
+#if __has_include(<liburing.h>)
+#  include "../net/uring_io.hpp"
+using test_io = protocol::uring_io;
+// One shape at every call site: io_uring needs a ring to sit on, epoll does
+// not, and no scenario below should have to know which it got.
+inline test_io make_io(uring_ring& ring, int fd) { return test_io(ring, fd); }
+#else
+using test_io = protocol::epoll_udp;
+// A stand-in so the scenarios below can go on declaring the ring their
+// io_uring counterparts sit on. epoll has nothing to sit on and ignores it;
+// keeping the declarations identical is what lets one body serve both.
+struct uring_ring { explicit uring_ring(unsigned = 0) {} };
+inline test_io make_io(auto&, int fd) { return test_io(fd); }
+#endif
 #include "../storage/field_storage.hpp"
-#include "../runtime/fiber.hpp"
+// Fibers are Linux-only (ucontext), and one scenario below uses them to show
+// that a synchronous-commit wait is trivial glue. Everything else in this file
+// is portable, and on a platform without fibers it is worth running the rest
+// rather than none of it.
+#if !defined(__ANDROID__) && !defined(__APPLE__)
+#  define BC_HAVE_FIBERS 1
+#  include "../runtime/fiber.hpp"
+#endif
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -329,7 +354,7 @@ sockaddr_in loopback_addr(uint16_t port) {
     return a;
 }
 
-void step(protocol::protocol_endpoint<protocol::uring_io>& ep, auto&& on_event) {
+void step(protocol::protocol_endpoint<test_io>& ep, auto&& on_event) {
     ep.poll_io(std::chrono::milliseconds{0});
     for (auto& ev : ep.poll_incoming()) on_event(ev);
 }
@@ -348,10 +373,10 @@ void test_disconnect_reconnect_resume() {
     uring_ring pring(2048), rring(2048);
     auto pkeys = crypto::x25519_generate();
     crypto::public_key ppub = pkeys.pub;
-    protocol::uring_io pep_io(pring, pfd);
-    protocol::protocol_endpoint<protocol::uring_io> pep(pep_io, std::move(pkeys));
-    protocol::uring_io rep_io(rring, rfd);
-    protocol::protocol_endpoint<protocol::uring_io> rep(rep_io, crypto::x25519_generate());
+    test_io pep_io(make_io(pring, pfd));
+    protocol::protocol_endpoint<test_io> pep(pep_io, std::move(pkeys));
+    test_io rep_io(make_io(rring, rfd));
+    protocol::protocol_endpoint<test_io> rep(rep_io, crypto::x25519_generate());
     pep.arm(); rep.arm();
 
     storage::storage<file_spec_p> ptable;
@@ -439,10 +464,10 @@ void test_sync_before_ack() {
     uring_ring pring(2048), rring(2048);
     auto pkeys = crypto::x25519_generate();
     crypto::public_key ppub = pkeys.pub;
-    protocol::uring_io pep_io(pring, pfd);
-    protocol::protocol_endpoint<protocol::uring_io> pep(pep_io, std::move(pkeys));
-    protocol::uring_io rep_io(rring, rfd);
-    protocol::protocol_endpoint<protocol::uring_io> rep(rep_io, crypto::x25519_generate());
+    test_io pep_io(make_io(pring, pfd));
+    protocol::protocol_endpoint<test_io> pep(pep_io, std::move(pkeys));
+    test_io rep_io(make_io(rring, rfd));
+    protocol::protocol_endpoint<test_io> rep(rep_io, crypto::x25519_generate());
     pep.arm(); rep.arm();
 
     storage::storage<file_spec_p> ptable;
@@ -532,8 +557,8 @@ void test_replica_restart_from_own_file() {
     uring_ring pring(2048);
     auto pkeys = crypto::x25519_generate();
     crypto::public_key ppub = pkeys.pub;
-    protocol::uring_io pep_io(pring, pfd);
-    protocol::protocol_endpoint<protocol::uring_io> pep(pep_io, std::move(pkeys));
+    test_io pep_io(make_io(pring, pfd));
+    protocol::protocol_endpoint<test_io> pep(pep_io, std::move(pkeys));
     pep.arm();
 
     storage::storage<file_spec_p> ptable;
@@ -549,8 +574,8 @@ void test_replica_restart_from_own_file() {
     {
         int rfd = make_bound_udp_socket(&rport);
         uring_ring rring(2048);
-        protocol::uring_io rep_io(rring, rfd);
-    protocol::protocol_endpoint<protocol::uring_io> rep(rep_io, crypto::x25519_generate());
+        test_io rep_io(make_io(rring, rfd));
+    protocol::protocol_endpoint<test_io> rep(rep_io, crypto::x25519_generate());
         rep.arm();
         storage::storage<file_spec_r> rtable;
         replication::replica_applier applier;
@@ -610,8 +635,8 @@ void test_replica_restart_from_own_file() {
 
     int rfd2 = make_bound_udp_socket(&rport);
     uring_ring rring2(2048);
-    protocol::uring_io rep2_io(rring2, rfd2);
-    protocol::protocol_endpoint<protocol::uring_io> rep2(rep2_io, crypto::x25519_generate());
+    test_io rep2_io(make_io(rring2, rfd2));
+    protocol::protocol_endpoint<test_io> rep2(rep2_io, crypto::x25519_generate());
     rep2.arm();
     replication::replica_applier applier2;
     crypto::public_key rpub2{};
@@ -673,8 +698,8 @@ struct sync_rig {
     crypto::public_key ppub;
     // The backends are members too, and declared BEFORE the endpoints that
     // hold references to them - members initialize in declaration order.
-    protocol::uring_io pio{pring, pfd}, r1io{r1ring, r1fd}, r2io{r2ring, r2fd};
-    protocol::protocol_endpoint<protocol::uring_io> pep, r1ep, r2ep;
+    test_io pio{make_io(pring, pfd)}, r1io{r1ring, r1fd}, r2io{r2ring, r2fd};
+    protocol::protocol_endpoint<test_io> pep, r1ep, r2ep;
     storage::storage<file_spec_p> ptable;
     replication::primary_shipper shipper;
     crypto::public_key r1pub{}, r2pub{};
@@ -824,6 +849,7 @@ void test_sync_commit_times_out_without_quorum() {
 
 // Same wait, but yielding a fiber instead of spinning - showing the glue is
 // trivial and that replication.hpp needs no fiber dependency of its own.
+#ifdef BC_HAVE_FIBERS
 void test_sync_commit_from_a_fiber() {
     std::remove("rt_primary.db");
     sync_rig rig(crypto::x25519_generate());
@@ -866,6 +892,7 @@ void test_sync_commit_from_a_fiber() {
     CHECK(!sched.has_pending(), "the fiber should have been reaped");
     std::remove("rt_primary.db");
 }
+#endif
 
 // A restarted replica CAN resume incrementally if the caller persisted and
 // restored the replication checkpoint - the counterpart to
@@ -933,7 +960,9 @@ int main() {
         {"replica_restart_from_own_file", test_replica_restart_from_own_file},
         {"sync_commit_reaches_quorum", test_sync_commit_reaches_quorum},
         {"sync_commit_times_out_without_quorum", test_sync_commit_times_out_without_quorum},
+#ifdef BC_HAVE_FIBERS
         {"sync_commit_from_a_fiber", test_sync_commit_from_a_fiber},
+#endif
         {"checkpoint_restore_enables_incremental_resume [storage.hpp]", test_checkpoint_restore_enables_incremental_resume<heap_engine>},
         {"checkpoint_restore_enables_incremental_resume [field]", test_checkpoint_restore_enables_incremental_resume<field_engine>},
     };

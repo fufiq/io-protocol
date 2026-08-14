@@ -3,9 +3,20 @@
 #
 #   tools/android_test.sh
 #
-# Needs an NDK and a device or emulator visible to adb. Only the ENGINE is
-# built: net/ and replication/ want io_uring and libsodium, which Android does
-# not have, so they are Linux-only and this does not pretend otherwise.
+# Needs an NDK and a device or emulator visible to adb.
+#
+# Builds and runs three suites: the storage engine, the protocol over the epoll
+# transport, and replication. The last two need libsodium - the NDK ships no
+# crypto and the protocol is mostly crypto - so they are skipped with a message
+# rather than silently when SODIUM_ANDROID is not set:
+#
+#   git clone --depth 1 -b stable https://github.com/jedisct1/libsodium
+#   cd libsodium && ANDROID_NDK_HOME=$ANDROID_NDK NDK_PLATFORM=android-24 \
+#       ./dist-build/android-x86_64.sh     # or android-armv8-a.sh
+#   export SODIUM_ANDROID=$PWD/libsodium-android-westmere
+#
+# io_uring is absent from all of it on purpose: Android blocks it for apps with
+# seccomp, so epoll is the transport there permanently rather than a fallback.
 #
 # Two flags here are not decoration, and both were found the hard way on a
 # 16 KB-page image:
@@ -71,18 +82,37 @@ FLAGS=(-std=c++23 -O2 -Wall -Wextra -static-libstdc++ -Wl,-z,max-page-size=16384
 "$CXX" "${FLAGS[@]}" -I"$REPO/dist" "$REPO/tools/amalgam_smoke.cpp" -o "$STAGE/amalgam_smoke"
 "$CXX" "${FLAGS[@]}" "$REPO/embedded/platform_check.cpp" -o "$STAGE/platform_check"
 
-"$ADB" push "$STAGE/storage_tests" "$STAGE/amalgam_smoke" "$STAGE/platform_check" /data/local/tmp/ >/dev/null
-"$ADB" shell "cd /data/local/tmp && chmod +x storage_tests amalgam_smoke platform_check"
+BINARIES=(platform_check amalgam_smoke storage_tests)
+
+# The protocol and replication suites, if there is a libsodium to link them
+# against. Skipped loudly rather than quietly: "no crypto here" and "the crypto
+# tests passed" must not look the same from the outside.
+if [ -n "${SODIUM_ANDROID:-}" ] && [ -f "$SODIUM_ANDROID/lib/libsodium.a" ]; then
+    "$CXX" "${FLAGS[@]}" -I"$SODIUM_ANDROID/include" -I"$REPO/build/_deps/doctest-src" \
+        "$STAGE/main.cpp" "$REPO/tests/test_protocol.cpp" "$SODIUM_ANDROID/lib/libsodium.a" \
+        -o "$STAGE/protocol_tests"
+    "$CXX" "${FLAGS[@]}" -I"$SODIUM_ANDROID/include" \
+        "$REPO/tests/test_replication.cpp" "$SODIUM_ANDROID/lib/libsodium.a" \
+        -o "$STAGE/replication_tests"
+    BINARIES+=(protocol_tests replication_tests)
+else
+    echo
+    echo "SKIPPING the protocol and replication suites: set SODIUM_ANDROID to a"
+    echo "libsodium built for this ABI (see the header of this script)."
+fi
+
+"$ADB" push "${BINARIES[@]/#/$STAGE/}" /data/local/tmp/ >/dev/null
+"$ADB" shell "cd /data/local/tmp && chmod +x ${BINARIES[*]}"
 
 status=0
-for t in platform_check amalgam_smoke storage_tests; do
+for t in "${BINARIES[@]}"; do
     echo
     echo "=== $t ==="
     "$ADB" shell "cd /data/local/tmp && ./$t; echo EXIT=\$?" | tee "$STAGE/$t.out"
     grep -q "EXIT=0" "$STAGE/$t.out" || status=1
 done
 
-"$ADB" shell "cd /data/local/tmp && rm -f storage_tests amalgam_smoke platform_check *.log *.idx *.ckp *.tmp" >/dev/null 2>&1 || true
+"$ADB" shell "cd /data/local/tmp && rm -f ${BINARIES[*]} *.log *.idx *.ckp *.tmp" >/dev/null 2>&1 || true
 
 echo
 [ $status -eq 0 ] && echo "all Android checks passed" || echo "SOME ANDROID CHECKS FAILED"

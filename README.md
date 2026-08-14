@@ -294,15 +294,28 @@ rather than that the calls returned zero.
 | | compiles | tests run |
 |---|---|---|
 | Linux x86-64 | yes | yes - `ctest`, Release and ASan/UBSan |
-| Android x86-64, **16 KB pages** | yes | **yes** - the engine's 87 cases, and a replica of a host primary |
+| Android x86-64, **16 KB pages** | yes | **yes** - all three suites, on an emulator |
 | Android arm64 | yes, NDK r27 clang | no device here; both CRC paths checked in the emitted code |
 | macOS / iOS | **no** - no Darwin toolchain here | no |
 
-`bench/replica_node.cpp` is the end-to-end one: the same binary is a primary
-here and a replica on the phone, both on the epoll transport, and the replica
-brought over 2,000 records with a matching checksum and offset. That is the
-engine, replication and the transport working at once on hardware that is not
-the development machine.
+```sh
+tools/android_test.sh          # engine; set SODIUM_ANDROID for the other two
+```
+
+| suite | Linux | Android |
+|---|---|---|
+| storage engine | 209 cases, 13,028 assertions | **87 cases, 6,326 assertions** |
+| protocol | 12 cases × 2 transports | **12 cases, 122 assertions** (epoll) |
+| replication | 71 checks | **68 checks** - the three missing are the one fiber scenario |
+
+The Android replication run is not a smoke test: it includes the networked
+scenarios over real UDP sockets - disconnect with writes accumulating then
+reconnect-and-resume, sync-before-ack, a replica restarting from its own
+recovered file, quorum reached, and quorum timing out.
+
+`bench/replica_node.cpp` adds the cross-machine case the suites cannot: the same
+binary is a primary here and a replica on the phone, and the replica brought over
+2,000 records with a matching checksum and offset.
 
 ```sh
 tools/android_test.sh          # needs an NDK and a device or emulator on adb

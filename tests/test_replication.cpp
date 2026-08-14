@@ -698,7 +698,7 @@ struct sync_rig {
     crypto::public_key ppub;
     // The backends are members too, and declared BEFORE the endpoints that
     // hold references to them - members initialize in declaration order.
-    test_io pio{make_io(pring, pfd)}, r1io{r1ring, r1fd}, r2io{r2ring, r2fd};
+    test_io pio{make_io(pring, pfd)}, r1io{make_io(r1ring, r1fd)}, r2io{make_io(r2ring, r2fd)};
     protocol::protocol_endpoint<test_io> pep, r1ep, r2ep;
     storage::storage<file_spec_p> ptable;
     replication::primary_shipper shipper;

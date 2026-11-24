@@ -451,3 +451,8 @@ and expect to fix something.
 not part of the supported surface** - no tests, no specification, no
 compatibility promise. They are the experiments whose measurements decided the
 design, and deleting them would delete the evidence.
+
+## License
+
+GNU General Public License v3.0 or (at your option) any later version; see [`LICENSE`](LICENSE).
+SPDX-License-Identifier: GPL-3.0-or-later
